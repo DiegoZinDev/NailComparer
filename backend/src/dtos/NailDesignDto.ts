@@ -1,13 +1,24 @@
 import type {
   FingerId,
+  MicroGemElement,
+  NailBaseLayer,
+  NailBorderKind,
+  NailBorderLayer,
   NailCategory,
   NailDesign,
+  NailDesignBlueprint,
   NailFingerDesignSpec,
   NailFingerSpecsMap,
   NailFinish,
+  NailFinishV10,
+  NailGeometryProfile,
+  NailGradientMode,
   NailPatternType,
   NailShape,
   NailStyleType,
+  OrganicMotifElement,
+  RibbonStrokeElement,
+  VectorArtElement,
 } from '../entities/NailDesign.js';
 
 export const VALID_NAIL_CATEGORIES: readonly NailCategory[] = [
@@ -58,6 +69,38 @@ export const VALID_FINGER_IDS: readonly FingerId[] = [
   'middle',
   'ring',
   'pinky',
+] as const;
+
+export const VALID_NAIL_FINISHES_V10: readonly NailFinishV10[] = [
+  'glossy_gel',
+  'jelly_translucent',
+  'chrome_mirror',
+  'pearl_glazed',
+  'cat_eye',
+  'velvet_matte',
+] as const;
+
+export const VALID_NAIL_GRADIENT_MODES: readonly NailGradientMode[] = [
+  'solid',
+  'vertical_ombre',
+  'radial_aura',
+  'cat_eye_band',
+  'pearl_chrome',
+] as const;
+
+export const VALID_NAIL_BORDER_KINDS: readonly NailBorderKind[] = [
+  'none',
+  'full_metallic_outline',
+  'cuticle_cuff',
+  'classic_french',
+  'micro_french',
+  'v_french',
+] as const;
+
+export const VALID_MICRO_GEM_KINDS: readonly MicroGemElement['kind'][] = [
+  'gold_bead',
+  'pearl',
+  'crystal',
 ] as const;
 
 export interface NailDesignDTO {
@@ -173,6 +216,304 @@ function isFiniteNumberInRange(value: unknown, min: number, max: number): value 
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return value < min ? min : value > max ? max : value;
+}
+
+function validateAndSanitizeBlueprint(
+  rawBlueprint: unknown,
+  fingerKey: string,
+  errors: string[]
+): NailDesignBlueprint | undefined {
+  if (rawBlueprint === undefined) {
+    return undefined;
+  }
+  if (!rawBlueprint || typeof rawBlueprint !== 'object' || Array.isArray(rawBlueprint)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint deve ser um objeto JSON válido.`);
+    return undefined;
+  }
+
+  const bp = rawBlueprint as Record<string, unknown>;
+  if (bp.version !== 10) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.version deve ser 10.`);
+    return undefined;
+  }
+
+  // 1. Validate geometry
+  if (!bp.geometry || typeof bp.geometry !== 'object' || Array.isArray(bp.geometry)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.geometry é obrigatório.`);
+    return undefined;
+  }
+  const geoRaw = bp.geometry as Record<string, unknown>;
+  if (!Array.isArray(geoRaw.profileHalfWidths) || geoRaw.profileHalfWidths.length !== 8) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.blueprint.geometry.profileHalfWidths deve conter exatamente 8 números.`
+    );
+    return undefined;
+  }
+  const profileHalfWidths: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    const w = geoRaw.profileHalfWidths[i];
+    if (!isFiniteNumberInRange(w, 0.01, 0.55)) {
+      errors.push(
+        `fingerSpecs.${fingerKey}.blueprint.geometry.profileHalfWidths[${i}] inválido (esperado 0.01..0.55).`
+      );
+      return undefined;
+    }
+    profileHalfWidths.push(clampNumber(w, 0.02, 0.5));
+  }
+
+  if (!isFiniteNumberInRange(geoRaw.aspectRatio, 0.5, 4.0)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.geometry.aspectRatio inválido.`);
+    return undefined;
+  }
+  if (!isFiniteNumberInRange(geoRaw.freeEdgeRatio, 0.0, 2.0)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.geometry.freeEdgeRatio inválido.`);
+    return undefined;
+  }
+  if (!isFiniteNumberInRange(geoRaw.tipRoundness, 0.0, 1.0)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.geometry.tipRoundness inválido.`);
+    return undefined;
+  }
+  if (!isValidNailShape(geoRaw.shape)) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.blueprint.geometry.shape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+    );
+    return undefined;
+  }
+
+  const geometry: NailGeometryProfile = {
+    profileHalfWidths: profileHalfWidths as NailGeometryProfile['profileHalfWidths'],
+    aspectRatio: geoRaw.aspectRatio,
+    freeEdgeRatio: clampNumber(geoRaw.freeEdgeRatio, 0.12, 1.15),
+    tipRoundness: clampNumber(geoRaw.tipRoundness, 0, 1),
+    shape: geoRaw.shape,
+  };
+
+  // 2. Validate baseLayer
+  if (!bp.baseLayer || typeof bp.baseLayer !== 'object' || Array.isArray(bp.baseLayer)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.baseLayer é obrigatório.`);
+    return undefined;
+  }
+  const baseRaw = bp.baseLayer as Record<string, unknown>;
+  if (
+    !isValidHexColor(baseRaw.baseColorHex) ||
+    !isValidHexColor(baseRaw.cuticleColorHex) ||
+    !isValidHexColor(baseRaw.midColorHex) ||
+    !isValidHexColor(baseRaw.tipColorHex)
+  ) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.blueprint.baseLayer deve conter cores hexadecimais válidas.`
+    );
+    return undefined;
+  }
+  if (
+    typeof baseRaw.gradientMode !== 'string' ||
+    !(VALID_NAIL_GRADIENT_MODES as readonly string[]).includes(baseRaw.gradientMode)
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.baseLayer.gradientMode inválido.`);
+    return undefined;
+  }
+  if (
+    typeof baseRaw.finishStyle !== 'string' ||
+    !(VALID_NAIL_FINISHES_V10 as readonly string[]).includes(baseRaw.finishStyle)
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.baseLayer.finishStyle inválido.`);
+    return undefined;
+  }
+  if (
+    !isFiniteNumberInRange(baseRaw.translucency, 0, 1) ||
+    !isFiniteNumberInRange(baseRaw.metallicBase, 0, 1) ||
+    !isFiniteNumberInRange(baseRaw.glossiness, 0, 1)
+  ) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.blueprint.baseLayer translucency/metallicBase/glossiness devem estar entre 0 e 1.`
+    );
+    return undefined;
+  }
+
+  const baseLayer: NailBaseLayer = {
+    baseColorHex: baseRaw.baseColorHex.trim().toUpperCase(),
+    gradientMode: baseRaw.gradientMode as NailGradientMode,
+    cuticleColorHex: baseRaw.cuticleColorHex.trim().toUpperCase(),
+    midColorHex: baseRaw.midColorHex.trim().toUpperCase(),
+    tipColorHex: baseRaw.tipColorHex.trim().toUpperCase(),
+    finishStyle: baseRaw.finishStyle as NailFinishV10,
+    translucency: baseRaw.translucency,
+    metallicBase: baseRaw.metallicBase,
+    glossiness: baseRaw.glossiness,
+  };
+
+  // 3. Validate borderLayer
+  if (!bp.borderLayer || typeof bp.borderLayer !== 'object' || Array.isArray(bp.borderLayer)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.borderLayer é obrigatório.`);
+    return undefined;
+  }
+  const borderRaw = bp.borderLayer as Record<string, unknown>;
+  if (
+    typeof borderRaw.kind !== 'string' ||
+    !(VALID_NAIL_BORDER_KINDS as readonly string[]).includes(borderRaw.kind)
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.borderLayer.kind inválido.`);
+    return undefined;
+  }
+  if (!isValidHexColor(borderRaw.colorHex)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.borderLayer.colorHex inválido.`);
+    return undefined;
+  }
+  if (
+    !isFiniteNumberInRange(borderRaw.thicknessNorm, 0, 0.5) ||
+    typeof borderRaw.isMetallic !== 'boolean' ||
+    typeof borderRaw.is3DRaised !== 'boolean' ||
+    !isFiniteNumberInRange(borderRaw.smileCurveDepth, 0, 0.6)
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.borderLayer contém parâmetros inválidos.`);
+    return undefined;
+  }
+
+  const borderLayer: NailBorderLayer = {
+    kind: borderRaw.kind as NailBorderKind,
+    colorHex: borderRaw.colorHex.trim().toUpperCase(),
+    thicknessNorm: clampNumber(borderRaw.thicknessNorm, 0.02, 0.28),
+    isMetallic: borderRaw.isMetallic,
+    is3DRaised: borderRaw.is3DRaised,
+    smileCurveDepth: clampNumber(borderRaw.smileCurveDepth, 0, 0.35),
+  };
+
+  // 4. Validate artElements (compact vector primitives only — max 48 elements per finger)
+  if (!Array.isArray(bp.artElements)) {
+    errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements deve ser um array.`);
+    return undefined;
+  }
+  if (bp.artElements.length > 48) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.blueprint.artElements excede o limite de 48 primitivas vetoriais.`
+    );
+    return undefined;
+  }
+
+  const artElements: VectorArtElement[] = [];
+  for (let idx = 0; idx < bp.artElements.length; idx++) {
+    const elRaw = bp.artElements[idx];
+    if (!elRaw || typeof elRaw !== 'object' || Array.isArray(elRaw)) {
+      errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] inválido.`);
+      return undefined;
+    }
+    const el = elRaw as Record<string, unknown>;
+
+    if (el.type === 'ribbon_stroke') {
+      if (!Array.isArray(el.points) || el.points.length < 2 || el.points.length > 32) {
+        errors.push(
+          `fingerSpecs.${fingerKey}.blueprint.artElements[${idx}].points deve conter entre 2 e 32 pontos.`
+        );
+        return undefined;
+      }
+      const pts: RibbonStrokeElement['points'] = [];
+      for (const pRaw of el.points) {
+        if (!pRaw || typeof pRaw !== 'object') {
+          errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}].points inválido.`);
+          return undefined;
+        }
+        const p = pRaw as Record<string, unknown>;
+        if (
+          !isFiniteNumberInRange(p.u, 0, 1) ||
+          !isFiniteNumberInRange(p.v, 0, 1) ||
+          !isFiniteNumberInRange(p.width, 0.005, 0.3)
+        ) {
+          errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] ponto fora de faixa.`);
+          return undefined;
+        }
+        pts.push({ u: p.u, v: p.v, width: clampNumber(p.width, 0.015, 0.14) });
+      }
+      if (
+        !isValidHexColor(el.colorHex) ||
+        !isValidHexColor(el.highlightHex) ||
+        typeof el.isMetallic !== 'boolean' ||
+        !isFiniteNumberInRange(el.reliefHeight, 0, 1.5)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] ribbon_stroke inválido.`);
+        return undefined;
+      }
+      artElements.push({
+        type: 'ribbon_stroke',
+        points: pts,
+        colorHex: el.colorHex.trim().toUpperCase(),
+        highlightHex: el.highlightHex.trim().toUpperCase(),
+        isMetallic: el.isMetallic,
+        reliefHeight: clampNumber(el.reliefHeight, 0.2, 1.0),
+      });
+    } else if (el.type === 'organic_motif') {
+      if (!Array.isArray(el.contour) || el.contour.length < 3 || el.contour.length > 48) {
+        errors.push(
+          `fingerSpecs.${fingerKey}.blueprint.artElements[${idx}].contour deve conter entre 3 e 48 vértices.`
+        );
+        return undefined;
+      }
+      const contour: OrganicMotifElement['contour'] = [];
+      for (const cRaw of el.contour) {
+        if (!cRaw || typeof cRaw !== 'object') {
+          errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}].contour inválido.`);
+          return undefined;
+        }
+        const c = cRaw as Record<string, unknown>;
+        if (!isFiniteNumberInRange(c.u, 0, 1) || !isFiniteNumberInRange(c.v, 0, 1)) {
+          errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] vértice fora de [0,1].`);
+          return undefined;
+        }
+        contour.push({ u: c.u, v: c.v });
+      }
+      if (
+        !isValidHexColor(el.fillColorHex) ||
+        !isValidHexColor(el.shadeColorHex) ||
+        typeof el.isMetallic !== 'boolean' ||
+        !isFiniteNumberInRange(el.reliefHeight, 0, 1.5)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] organic_motif inválido.`);
+        return undefined;
+      }
+      artElements.push({
+        type: 'organic_motif',
+        contour,
+        fillColorHex: el.fillColorHex.trim().toUpperCase(),
+        shadeColorHex: el.shadeColorHex.trim().toUpperCase(),
+        isMetallic: el.isMetallic,
+        reliefHeight: clampNumber(el.reliefHeight, 0.15, 1.0),
+      });
+    } else if (el.type === 'micro_gem') {
+      if (
+        !isFiniteNumberInRange(el.u, 0, 1) ||
+        !isFiniteNumberInRange(el.v, 0, 1) ||
+        !isFiniteNumberInRange(el.radius, 0.005, 0.15) ||
+        !isValidHexColor(el.colorHex) ||
+        typeof el.kind !== 'string' ||
+        !(VALID_MICRO_GEM_KINDS as readonly string[]).includes(el.kind)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}] micro_gem inválido.`);
+        return undefined;
+      }
+      artElements.push({
+        type: 'micro_gem',
+        u: el.u,
+        v: el.v,
+        radius: clampNumber(el.radius, 0.015, 0.065),
+        colorHex: el.colorHex.trim().toUpperCase(),
+        kind: el.kind as MicroGemElement['kind'],
+      });
+    } else {
+      errors.push(`fingerSpecs.${fingerKey}.blueprint.artElements[${idx}].type desconhecido.`);
+      return undefined;
+    }
+  }
+
+  return {
+    version: 10,
+    geometry,
+    baseLayer,
+    borderLayer,
+    artElements,
+  };
+}
+
 function parseAndValidateFingerSpecsInput(
   rawFingerSpecs: unknown,
   rawFingerSpecsJson: unknown,
@@ -253,10 +594,48 @@ function parseAndValidateFingerSpecsInput(
       );
       continue;
     }
-    sanitizedMap[key as FingerId] = {
-      ...(specObj as unknown as NailFingerDesignSpec),
+
+    if (
+      specObj.freeEdgeRatio !== undefined &&
+      !isFiniteNumberInRange(specObj.freeEdgeRatio, 0.0, 2.0)
+    ) {
+      errors.push(`fingerSpecs.${key}.freeEdgeRatio deve ser um número entre 0 e 2.`);
+      continue;
+    }
+
+    if (
+      specObj.finishStyle !== undefined &&
+      (typeof specObj.finishStyle !== 'string' ||
+        !(VALID_NAIL_FINISHES_V10 as readonly string[]).includes(specObj.finishStyle))
+    ) {
+      errors.push(
+        `fingerSpecs.${key}.finishStyle inválido. Valores aceitos: ${VALID_NAIL_FINISHES_V10.join(', ')}.`
+      );
+      continue;
+    }
+
+    const validatedBlueprint = validateAndSanitizeBlueprint(specObj.blueprint, key, errors);
+
+    // Strip legacy raster map DataURLs so finger_specs_json stays compact (~2-6 KB)
+    const {
+      uvPatchDataUrl: _uv,
+      normalMapDataUrl: _norm,
+      displacementMapDataUrl: _disp,
+      metalnessMapDataUrl: _met,
+      roughnessMapDataUrl: _rough,
+      ...cleanSpecFields
+    } = specObj;
+
+    const sanitizedSpec: NailFingerDesignSpec = {
+      ...(cleanSpecFields as unknown as NailFingerDesignSpec),
       fingerId: key as FingerId,
+      ...(specObj.freeEdgeRatio !== undefined
+        ? { freeEdgeRatio: clampNumber(specObj.freeEdgeRatio as number, 0.12, 1.15) }
+        : {}),
+      ...(validatedBlueprint !== undefined ? { blueprint: validatedBlueprint } : {}),
     };
+
+    sanitizedMap[key as FingerId] = sanitizedSpec;
   }
 
   return {

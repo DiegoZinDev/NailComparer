@@ -1,49 +1,72 @@
 import type { FingerId, NailDesign, NailFingerDesignSpec } from '../types/nail';
-import { renderProceduralNailSwatchDataUrl } from './proceduralPBRSynthesizer';
+import { buildFingerSpecsFromStudioDesign } from './perFingerVisionAnalyzer';
+import {
+  renderBlueprintNailCanvas,
+  renderProceduralNailSwatchDataUrl,
+} from './proceduralPBRSynthesizer';
 
 const PRIORITY_FINGERS: FingerId[] = ['ring', 'middle', 'index', 'thumb', 'pinky'];
+const swatchBgCache = new Map<string, string>();
 
-function pickPrimaryPatchUrl(design: NailDesign): string | null {
+function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
   if (design.fingerSpecs) {
     for (const fid of PRIORITY_FINGERS) {
       const spec = design.fingerSpecs[fid];
-      if (spec?.uvPatchDataUrl) {
-        return spec.uvPatchDataUrl;
+      if (spec?.blueprint && spec.blueprint.artElements.length > 0) {
+        return spec;
       }
     }
+    for (const fid of PRIORITY_FINGERS) {
+      const spec = design.fingerSpecs[fid];
+      if (spec) return spec;
+    }
   }
-  return design.imageDataUrl || null;
-}
-
-function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec | null {
-  if (!design.fingerSpecs) return null;
-  for (const fid of PRIORITY_FINGERS) {
-    const spec = design.fingerSpecs[fid];
-    if (spec?.uvPatchDataUrl) return spec;
-  }
-  return design.fingerSpecs.middle ?? design.fingerSpecs.ring ?? null;
+  const built = buildFingerSpecsFromStudioDesign(design);
+  return built.ring ?? built.middle;
 }
 
 /**
- * Generates a crisp circular thumbnail data URL or CSS background preview
- * matching the reconstructed nail design.
- * When `uvPatchDataUrl` is present on the design's `fingerSpecs` (or `imageDataUrl`),
- * renders the REAL reconstructed nail texture with subtle C-curve shading & gel specular highlight —
- * never generic brown placeholders!
+ * Generates a crisp circular thumbnail preview (`background`) rendered EXCLUSIVELY via the
+ * V10 clean vector PBR blueprint compiler (`renderBlueprintNailCanvas` / `renderProceduralNailSwatchDataUrl`)
+ * — ZERO raw photo patches or `uvPatchDataUrl`.
  */
 export function getSwatchBackground(design: NailDesign): string {
-  const realPatchUrl = pickPrimaryPatchUrl(design);
-  if (realPatchUrl) {
-    return [
-      'radial-gradient(ellipse 32% 62% at 34% 34%, rgba(255,255,255,0.44) 0%, rgba(255,255,255,0.08) 52%, transparent 78%)',
-      'linear-gradient(90deg, rgba(16,8,10,0.28) 0%, transparent 24%, transparent 76%, rgba(16,8,10,0.30) 100%)',
-      `url("${realPatchUrl}") center/cover no-repeat`,
-    ].join(', ');
+  const spec = pickPrimaryFingerSpec(design);
+  const bp = spec.blueprint;
+  const cacheKey = [
+    design.id,
+    spec.shape,
+    spec.baseColor,
+    spec.secondaryColor,
+    spec.accentColor,
+    spec.pattern,
+    bp?.baseLayer.gradientMode ?? '',
+    bp?.borderLayer.kind ?? '',
+    bp?.artElements.length ?? 0,
+  ].join('|');
+
+  const cached = swatchBgCache.get(cacheKey);
+  if (cached) return cached;
+
+  if (typeof document !== 'undefined') {
+    try {
+      const canvas = renderBlueprintNailCanvas(spec, 96, 96);
+      const dataUrl = canvas.toDataURL('image/png', 0.9);
+      const css = `url("${dataUrl}") center/contain no-repeat, radial-gradient(circle at 34% 30%, ${spec.baseColor}44 0%, #161114 85%)`;
+      if (swatchBgCache.size > 48) {
+        const firstKey = swatchBgCache.keys().next().value;
+        if (firstKey) swatchBgCache.delete(firstKey);
+      }
+      swatchBgCache.set(cacheKey, css);
+      return css;
+    } catch {
+      // Fallback to pure CSS gradient below if canvas unavailable
+    }
   }
 
-  const base = design.baseColor || '#D4A383';
-  const secondary = design.secondaryColor || '#FFFFFF';
-  const accent = design.accentColor || '#F3D5C0';
+  const base = spec.baseColor || '#D4A383';
+  const secondary = spec.secondaryColor || '#FFFFFF';
+  const accent = spec.accentColor || '#D4AF37';
 
   switch (design.patternType) {
     case 'french':
@@ -67,9 +90,8 @@ export function getSwatchBackground(design: NailDesign): string {
 }
 
 /**
- * Generates a high-fidelity nail silhouette swatch DataURL directly from either a `NailFingerDesignSpec`
- * or a `NailDesign`, rendering the real `uvPatchDataUrl` inside an anatomical salon nail silhouette
- * with C-curve shading and gel specular sheen when available.
+ * Generates a high-fidelity nail silhouette swatch DataURL directly from a `NailDesign`
+ * or `NailFingerDesignSpec` using the 100% vector V10 `NailDesignBlueprint` renderer.
  */
 export function generateNailSwatchDataUrl(
   input: NailDesign | NailFingerDesignSpec,
@@ -79,69 +101,19 @@ export function generateNailSwatchDataUrl(
   if ('fingerId' in input) {
     return renderProceduralNailSwatchDataUrl(input, width, height);
   }
-
   const primarySpec = pickPrimaryFingerSpec(input);
-  if (primarySpec) {
-    return renderProceduralNailSwatchDataUrl(primarySpec, width, height);
-  }
-
-  const fallbackSpec: NailFingerDesignSpec = {
-    fingerId: 'middle',
-    detectedFromPhoto: false,
-    shape: input.detectedShape ?? 'almond',
-    relativeLength: input.detectedLength ?? 1.05,
-    relativeWidth: 1.0,
-    baseColor: input.baseColor || '#D4A383',
-    secondaryColor: input.secondaryColor || '#FFFFFF',
-    accentColor: input.accentColor || '#D4AF37',
-    pattern:
-      input.patternType === 'french'
-        ? 'french_tip'
-        : input.patternType === 'chrome'
-          ? 'chrome_mirror'
-          : input.patternType === 'gold-foil' || input.patternType === 'marble'
-            ? 'gold_3d_waves'
-            : input.patternType === 'ombre' || input.patternType === 'aurora'
-              ? 'aura_gradient'
-              : 'solid_gloss',
-    strokeAnchors: [],
-    metallicIntensity: input.finish === 'chrome' || input.finish === 'glitter' ? 0.85 : 0.12,
-    glossIntensity: input.finish === 'velvet' ? 0.56 : 0.96,
-    uvPatchDataUrl: input.imageDataUrl ?? undefined,
-  };
-
-  return renderProceduralNailSwatchDataUrl(fallbackSpec, width, height);
+  return renderProceduralNailSwatchDataUrl(primarySpec, width, height);
 }
 
 /**
- * Asynchronous rasterized Canvas swatch renderer (useful when consumers require a PNG data URL
- * baked from `uvPatchDataUrl` / `imageDataUrl` rather than an inline SVG data URL).
+ * Asynchronous rasterized PNG swatch renderer backed by `renderProceduralNailSwatchDataUrl`.
  */
 export async function renderAsyncNailSwatchPng(
   input: NailDesign | NailFingerDesignSpec,
   width = 180,
   height = 260
 ): Promise<string> {
-  const dataUrl = generateNailSwatchDataUrl(input, width, height);
-  if (dataUrl.startsWith('data:image/png')) return dataUrl;
-
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(dataUrl);
-        return;
-      }
-      ctx.drawImage(img, 0, 0, width, height);
-      resolve(canvas.toDataURL('image/png', 0.92));
-    };
-    img.onerror = () => resolve(dataUrl);
-    img.src = dataUrl;
-  });
+  return generateNailSwatchDataUrl(input, width, height);
 }
 
 export function getStudioMonogram(studioName: string): string {

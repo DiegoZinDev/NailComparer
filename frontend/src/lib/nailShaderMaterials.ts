@@ -23,6 +23,15 @@ export interface DirectionalAmbientLightSample {
   lightElevationY: number;
 }
 
+export const DEFAULT_DIRECTIONAL_AMBIENT: DirectionalAmbientLightSample = {
+  r: 0.78,
+  g: 0.63,
+  b: 0.54,
+  luma: 0.66,
+  lightAzimuthX: -0.22,
+  lightElevationY: 0.58,
+};
+
 const UNDERSIDE_TEX_SIZE = 256;
 const SKIRT_TEX_SIZE = 128;
 
@@ -151,11 +160,12 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
 }
 
 /**
- * Dorsal UV-gel physical material (`V9`):
- * - Glossy wet UV clearcoat (`clearcoat: 1.0`, `clearcoatRoughness: 0.035`, `ior: 1.52`)
- * - Compatible with real 3D relief (`displacementScale: 0.00045` = 0.45mm, `displacementBias: 0`)
- * - Zero white border halo (`transparent: false` by default; opacity transitions cleanly via
- *   `setDorsalMaterialOpacity` or direct update without `transparent: true + depthWrite: true` haloing).
+ * Dorsal UV-gel physical material (`V10` 60fps mobile fast-path):
+ * - Glossy wet UV clearcoat (`clearcoat: 1.0`, `clearcoatRoughness: 0.04`, `ior: 1.52`)
+ * - ZERO `displacementMap` / `bumpMap` vertex texture fetches on mobile GPUs
+ *   (uses only `map`, `normalMap`, `roughnessMap`, `metalnessMap`)
+ * - Zero white border halo (`transparent: false`, `depthWrite: true` by default;
+ *   `applyDorsalMaterialOpacity` enables alpha blending only when `opacity < 0.99`).
  */
 export function createDorsalNailMaterial(
   envMap: THREE.Texture | null
@@ -165,14 +175,12 @@ export function createDorsalNailMaterial(
     roughness: 1.0,
     metalness: 1.0,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.035,
+    clearcoatRoughness: 0.04,
     ior: 1.52,
     specularIntensity: 1.0,
     envMap,
-    envMapIntensity: 1.45,
+    envMapIntensity: 1.4,
     normalScale: new THREE.Vector2(1.15, 1.15),
-    displacementScale: 0.00045,
-    displacementBias: 0,
     transparent: false,
     opacity: 1.0,
     alphaTest: 0.02,
@@ -465,35 +473,45 @@ export function updateUndersideMaterialTint(
   bundle.baseColor = baseColorHex;
 }
 
-// Reusable 6×6 pixel sampler for directional skin light estimation (zero per-frame canvas allocation)
+// Reusable 48×48 mini-canvas for single-readback directional skin light estimation
+const DIR_SAMPLER_SIZE = 48;
 let dirSamplerCanvas: HTMLCanvasElement | null = null;
 let dirSamplerCtx: CanvasRenderingContext2D | null = null;
 
-function samplePatchMeanRgb(
-  source: HTMLVideoElement | HTMLImageElement,
-  srcW: number,
-  srcH: number,
+function sampleRegionMeanFromImageData(
+  imageData: ImageData,
   normX: number,
   normY: number,
-  patchPx: number
-): { r: number; g: number; b: number; luma: number } | null {
-  if (!dirSamplerCtx || !dirSamplerCanvas) return null;
-  const cx = clamp01(normX) * srcW;
-  const cy = clamp01(normY) * srcH;
-  const sx = Math.max(0, Math.min(srcW - patchPx, Math.round(cx - patchPx * 0.5)));
-  const sy = Math.max(0, Math.min(srcH - patchPx, Math.round(cy - patchPx * 0.5)));
+  radiusPx: number
+): { r: number; g: number; b: number; luma: number } {
+  const { width, height, data } = imageData;
+  const cx = clamp01(normX) * (width - 1);
+  const cy = clamp01(normY) * (height - 1);
+  const minX = Math.max(0, Math.floor(cx - radiusPx));
+  const maxX = Math.min(width - 1, Math.ceil(cx + radiusPx));
+  const minY = Math.max(0, Math.floor(cy - radiusPx));
+  const maxY = Math.min(height - 1, Math.ceil(cy + radiusPx));
 
-  dirSamplerCtx.drawImage(source, sx, sy, patchPx, patchPx, 0, 0, 6, 6);
-  const { data } = dirSamplerCtx.getImageData(0, 0, 6, 6);
   let r = 0;
   let g = 0;
   let b = 0;
-  const count = data.length / 4;
-  for (let i = 0; i < data.length; i += 4) {
-    r += data[i];
-    g += data[i + 1];
-    b += data[i + 2];
+  let count = 0;
+
+  for (let y = minY; y <= maxY; y++) {
+    const rowOffset = y * width;
+    for (let x = minX; x <= maxX; x++) {
+      const idx = (rowOffset + x) * 4;
+      r += data[idx];
+      g += data[idx + 1];
+      b += data[idx + 2];
+      count += 1;
+    }
   }
+
+  if (count === 0) {
+    return { r: 0.78, g: 0.63, b: 0.54, luma: 0.66 };
+  }
+
   const nr = r / count / 255;
   const ng = g / count / 255;
   const nb = b / count / 255;
@@ -501,10 +519,111 @@ function samplePatchMeanRgb(
   return { r: nr, g: ng, b: nb, luma };
 }
 
+function computeDirectionalSampleFromPatches(
+  center: { r: number; g: number; b: number; luma: number },
+  left: { r: number; g: number; b: number; luma: number },
+  right: { r: number; g: number; b: number; luma: number },
+  prevSample: DirectionalAmbientLightSample
+): DirectionalAmbientLightSample {
+  // Differential luminance between right and left flanks estimates key light azimuth (-1 .. +1)
+  const lrDiff = right.luma - left.luma;
+  const avgLuma = Math.max(0.08, (center.luma + left.luma + right.luma) / 3);
+  const rawAzimuthX = Math.max(-1, Math.min(1, (lrDiff / avgLuma) * 2.4));
+
+  // Longitudinal brightness contrast nudges elevation (0.15 .. 0.95)
+  const centerContrast = (center.luma - (left.luma + right.luma) * 0.5) / avgLuma;
+  const rawElevationY = Math.max(0.15, Math.min(0.95, 0.55 + centerContrast * 1.4));
+
+  const alpha = 0.14;
+  return {
+    r: prevSample.r + (center.r - prevSample.r) * alpha,
+    g: prevSample.g + (center.g - prevSample.g) * alpha,
+    b: prevSample.b + (center.b - prevSample.b) * alpha,
+    luma: prevSample.luma + (center.luma - prevSample.luma) * alpha,
+    lightAzimuthX:
+      prevSample.lightAzimuthX + (rawAzimuthX - prevSample.lightAzimuthX) * alpha,
+    lightElevationY:
+      prevSample.lightElevationY + (rawElevationY - prevSample.lightElevationY) * alpha,
+  };
+}
+
 /**
- * Samples 3 compact `6×6` patches across the reference phalanx (center, left flank, right flank)
- * to estimate ambient skin color/luminance AND room directional light azimuth/elevation
- * so the 3D key light matches the real lighting direction on the user's hand.
+ * Zero-DOM/zero-WebGL-stall directional skin light estimator operating directly on an
+ * already-captured `ImageData` buffer (e.g. shared `64×64` readback from `ARCameraCanvas`
+ * + `LiveFingerCalibrator` or a `48×48` capture).
+ */
+export function sampleDirectionalLightFromImageData(
+  imageData: ImageData,
+  landmarks: NormalizedPoint[],
+  rect: { drawX: number; drawY: number; drawW: number; drawH: number },
+  cssW: number,
+  cssH: number,
+  mirrorX: boolean,
+  prevSample: DirectionalAmbientLightSample
+): DirectionalAmbientLightSample {
+  if (
+    !imageData ||
+    imageData.width <= 0 ||
+    imageData.height <= 0 ||
+    landmarks.length < 13 ||
+    cssW <= 0 ||
+    cssH <= 0
+  ) {
+    return prevSample;
+  }
+
+  // Reference middle phalanx (PIP=10 -> DIP=11) or fallback to index phalanx (PIP=6 -> DIP=7)
+  const pip = landmarks[10] ?? landmarks[6];
+  const dip = landmarks[11] ?? landmarks[7];
+  if (!pip || !dip) return prevSample;
+
+  const toBufferNorm = (lmX: number, lmY: number): { u: number; v: number } => {
+    const rawCssX = rect.drawX + lmX * rect.drawW;
+    const cssX = mirrorX ? cssW - rawCssX : rawCssX;
+    const cssY = rect.drawY + lmY * rect.drawH;
+    return {
+      u: clamp01(cssX / cssW),
+      v: clamp01(cssY / cssH),
+    };
+  };
+
+  const pPip = toBufferNorm(pip.x, pip.y);
+  const pDip = toBufferNorm(dip.x, dip.y);
+
+  const cx = (pPip.u + pDip.u) * 0.5;
+  const cy = (pPip.v + pDip.v) * 0.5;
+
+  const dx = pDip.u - pPip.u;
+  const dy = pDip.v - pPip.v;
+  const segLen = Math.max(0.015, Math.hypot(dx, dy));
+  const ux = dx / segLen;
+  const uy = dy / segLen;
+  const px = -uy;
+  const py = ux;
+  const lateralOffset = Math.max(0.008, Math.min(0.028, segLen * 0.34));
+  const radiusPx = Math.max(1, Math.round(Math.min(imageData.width, imageData.height) * 0.025));
+
+  const center = sampleRegionMeanFromImageData(imageData, cx, cy, radiusPx);
+  const left = sampleRegionMeanFromImageData(
+    imageData,
+    cx - px * lateralOffset,
+    cy - py * lateralOffset,
+    radiusPx
+  );
+  const right = sampleRegionMeanFromImageData(
+    imageData,
+    cx + px * lateralOffset,
+    cy + py * lateralOffset,
+    radiusPx
+  );
+
+  return computeDirectionalSampleFromPatches(center, left, right, prevSample);
+}
+
+/**
+ * Samples ambient skin color/luminance AND room directional light azimuth/elevation
+ * using at most **1 single `drawImage` + 1 single `getImageData`** on a compact `48×48` canvas
+ * (eliminating the 3× synchronous GPU pipeline stalls per frame).
  */
 export function sampleDirectionalSkinLight(
   source: HTMLVideoElement | HTMLImageElement,
@@ -517,73 +636,30 @@ export function sampleDirectionalSkinLight(
 
   if (!dirSamplerCanvas) {
     dirSamplerCanvas = document.createElement('canvas');
-    dirSamplerCanvas.width = 6;
-    dirSamplerCanvas.height = 6;
+    dirSamplerCanvas.width = DIR_SAMPLER_SIZE;
+    dirSamplerCanvas.height = DIR_SAMPLER_SIZE;
     dirSamplerCtx = dirSamplerCanvas.getContext('2d', { willReadFrequently: true });
   }
   if (!dirSamplerCtx) return prevSample;
 
-  // Reference middle phalanx (PIP=10 -> DIP=11) or fallback to index phalanx (PIP=6 -> DIP=7)
-  const pip = landmarks[10] ?? landmarks[6];
-  const dip = landmarks[11] ?? landmarks[7];
-  if (!pip || !dip) return prevSample;
-
-  const cx = (pip.x + dip.x) * 0.5;
-  const cy = (pip.y + dip.y) * 0.5;
-
-  // Longitudinal axis and perpendicular lateral vector across the phalanx width
-  const dx = dip.x - pip.x;
-  const dy = dip.y - pip.y;
-  const segLen = Math.max(0.015, Math.hypot(dx, dy));
-  const ux = dx / segLen;
-  const uy = dy / segLen;
-  // Lateral perpendicular in image coordinates
-  const px = -uy;
-  const py = ux;
-  const lateralOffset = Math.max(0.008, Math.min(0.024, segLen * 0.34));
-  const patchPx = Math.max(6, Math.round(Math.min(srcW, srcH) * 0.022));
-
   try {
-    const center = samplePatchMeanRgb(source, srcW, srcH, cx, cy, patchPx);
-    const left = samplePatchMeanRgb(
-      source,
-      srcW,
-      srcH,
-      cx - px * lateralOffset,
-      cy - py * lateralOffset,
-      patchPx
+    // Single 48×48 drawImage + single getImageData GPU readback
+    dirSamplerCtx.drawImage(source, 0, 0, DIR_SAMPLER_SIZE, DIR_SAMPLER_SIZE);
+    const frameImageData = dirSamplerCtx.getImageData(
+      0,
+      0,
+      DIR_SAMPLER_SIZE,
+      DIR_SAMPLER_SIZE
     );
-    const right = samplePatchMeanRgb(
-      source,
-      srcW,
-      srcH,
-      cx + px * lateralOffset,
-      cy + py * lateralOffset,
-      patchPx
+    return sampleDirectionalLightFromImageData(
+      frameImageData,
+      landmarks,
+      { drawX: 0, drawY: 0, drawW: 1, drawH: 1 },
+      1,
+      1,
+      false,
+      prevSample
     );
-
-    if (!center || !left || !right) return prevSample;
-
-    // Differential luminance between right and left flanks estimates key light azimuth (-1 .. +1)
-    const lrDiff = right.luma - left.luma;
-    const avgLuma = Math.max(0.08, (center.luma + left.luma + right.luma) / 3);
-    const rawAzimuthX = Math.max(-1, Math.min(1, (lrDiff / avgLuma) * 2.4));
-
-    // Longitudinal brightness contrast (distal vs proximal via center vs flanks) nudges elevation (0.15 .. 0.95)
-    const centerContrast = (center.luma - (left.luma + right.luma) * 0.5) / avgLuma;
-    const rawElevationY = Math.max(0.15, Math.min(0.95, 0.55 + centerContrast * 1.4));
-
-    const alpha = 0.14;
-    return {
-      r: prevSample.r + (center.r - prevSample.r) * alpha,
-      g: prevSample.g + (center.g - prevSample.g) * alpha,
-      b: prevSample.b + (center.b - prevSample.b) * alpha,
-      luma: prevSample.luma + (center.luma - prevSample.luma) * alpha,
-      lightAzimuthX:
-        prevSample.lightAzimuthX + (rawAzimuthX - prevSample.lightAzimuthX) * alpha,
-      lightElevationY:
-        prevSample.lightElevationY + (rawElevationY - prevSample.lightElevationY) * alpha,
-    };
   } catch {
     return prevSample;
   }

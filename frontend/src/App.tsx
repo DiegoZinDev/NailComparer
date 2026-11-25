@@ -14,6 +14,7 @@ import { ARCameraCanvas, type ARCameraCanvasHandle } from './components/ARCamera
 import { CapturePreviewModal } from './components/CapturePreviewModal';
 import { EditorialTitle } from './components/EditorialTitle';
 import { ImportReferenceModal } from './components/ImportReferenceModal';
+import { InstallAppModal } from './components/InstallAppModal';
 import { MagneticDesignDock } from './components/MagneticDesignDock';
 import { NailAdjustControls } from './components/NailAdjustControls';
 import { WhiteLabelModal } from './components/WhiteLabelModal';
@@ -45,7 +46,7 @@ const DEFAULT_ADJUSTMENT: NailAdjustment = {
   extensionLength: 1.0,
   scale: 1.0,
   rotationDeg: 0,
-  opacity: 0.98,
+  opacity: 1.0,
 };
 
 function applyCssVariables(config: StudioConfig): void {
@@ -99,22 +100,43 @@ export function App(): React.ReactElement {
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [cameraNotice, setCameraNotice] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [installModalOpen, setInstallModalOpen] = useState<boolean>(false);
+  const [isStandalone, setIsStandalone] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return (
+      window.matchMedia('(display-mode: standalone)').matches ||
+      Boolean((navigator as Navigator & { standalone?: boolean }).standalone)
+    );
+  });
 
-  // Capture Android/Chrome native PWA install prompt
+  // Capture Android/Chrome native PWA install prompt & track standalone status
   useEffect(() => {
+    const mediaQuery = window.matchMedia('(display-mode: standalone)');
+    const syncStandalone = () => {
+      setIsStandalone(
+        mediaQuery.matches ||
+          Boolean((navigator as Navigator & { standalone?: boolean }).standalone)
+      );
+    };
+    syncStandalone();
+
     const handleBeforeInstall = (event: Event) => {
       event.preventDefault();
       setInstallPrompt(event as BeforeInstallPromptEvent);
     };
     const handleInstalled = () => {
       setInstallPrompt(null);
+      setIsStandalone(true);
+      setInstallModalOpen(false);
     };
 
     window.addEventListener('beforeinstallprompt', handleBeforeInstall);
     window.addEventListener('appinstalled', handleInstalled);
+    mediaQuery.addEventListener?.('change', syncStandalone);
     return () => {
       window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('appinstalled', handleInstalled);
+      mediaQuery.removeEventListener?.('change', syncStandalone);
     };
   }, []);
 
@@ -239,14 +261,32 @@ export function App(): React.ReactElement {
     setMode((prev) => (prev === 'studio-demo' ? 'camera' : 'studio-demo'));
   }, []);
 
-  const handleInstallPwa = useCallback(async () => {
-    if (!installPrompt) return;
-    await installPrompt.prompt();
-    const choice = await installPrompt.userChoice;
-    if (choice.outcome === 'accepted') {
-      setInstallPrompt(null);
+  const handleTriggerNativeInstall = useCallback(async () => {
+    if (!installPrompt) {
+      setInstallModalOpen(true);
+      return;
+    }
+    try {
+      await installPrompt.prompt();
+      const choice = await installPrompt.userChoice;
+      if (choice.outcome === 'accepted') {
+        setInstallPrompt(null);
+        setInstallModalOpen(false);
+        return;
+      }
+      setInstallModalOpen(true);
+    } catch {
+      setInstallModalOpen(true);
     }
   }, [installPrompt]);
+
+  const handleInstallPwa = useCallback(async () => {
+    if (installPrompt) {
+      await handleTriggerNativeInstall();
+      return;
+    }
+    setInstallModalOpen(true);
+  }, [installPrompt, handleTriggerNativeInstall]);
 
   const arCanvasExtraProps = {
     onRequestImportClient: () => openImportModal('client'),
@@ -295,15 +335,15 @@ export function App(): React.ReactElement {
         </div>
 
         <div className="top-actions">
-          {installPrompt && (
+          {!isStandalone && (
             <motion.button
               type="button"
               whileTap={{ scale: 0.94 }}
               onClick={handleInstallPwa}
-              className="mode-toggle-btn glass-panel"
-              title="Instalar App no Android (PWA)"
+              className="install-btn mode-toggle-btn glass-panel"
+              title="Instalar App (PWA)"
             >
-              <Download size={14} />
+              <Download size={13} />
               <span>Instalar</span>
             </motion.button>
           )}
@@ -463,6 +503,13 @@ export function App(): React.ReactElement {
           onClose={() => setCapturedImage(null)}
         />
       )}
+
+      <InstallAppModal
+        open={installModalOpen}
+        hasNativePrompt={Boolean(installPrompt)}
+        onTriggerNativeInstall={handleTriggerNativeInstall}
+        onClose={() => setInstallModalOpen(false)}
+      />
     </main>
   );
 }

@@ -1,14 +1,16 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { HandTrackerController } from '../lib/handTrackingWorker';
-import { computeCoverRect } from '../lib/nailRenderer';
+import { LiveFingerCalibrator } from '../lib/liveFingerCalibrator';
+import { type ImageLayoutRect, computeCoverRect } from '../lib/nailRenderer';
 import {
   type DirectionalAmbientLightSample,
-  sampleDirectionalSkinLight,
+  sampleDirectionalLightFromImageData,
 } from '../lib/nailShaderMaterials';
 import { ThreeNailScene } from '../lib/threeNailScene';
 import type {
   ARViewMode,
   HandSkeletonFrame,
+  LiveFingerCalibration,
   NailAdjustment,
   NailDesign,
 } from '../types/nail';
@@ -39,7 +41,26 @@ const DEFAULT_AMBIENT: DirectionalAmbientLightSample = {
   lightElevationY: 0.58,
 };
 
-const AMBIENT_SAMPLE_INTERVAL_MS = 150;
+const SAMPLE_INTERVAL_MS = 350;
+const SAMPLE_SIZE = 64;
+const HAND_LOSS_RESET_MS = 1800;
+
+type ThreeNailSceneV10 = ThreeNailScene & {
+  renderHandFrame: (
+    cssW: number,
+    cssH: number,
+    dpr: number,
+    rect: ImageLayoutRect,
+    frame: HandSkeletonFrame | null,
+    design: NailDesign | null,
+    adjustment: NailAdjustment,
+    ambient: DirectionalAmbientLightSample,
+    mirrorX?: boolean,
+    deltaTimeSec?: number,
+    calibration?: LiveFingerCalibration
+  ) => void;
+  renderNow?: () => void;
+};
 
 export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCanvasProps>(
   function ARCameraCanvas(
@@ -57,20 +78,27 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     },
     ref
   ) {
-    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const viewportRef = useRef<HTMLDivElement | null>(null);
     const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
-    const threeSceneRef = useRef<ThreeNailScene | null>(null);
+    const threeSceneRef = useRef<ThreeNailSceneV10 | null>(null);
     const trackerRef = useRef<HandTrackerController | null>(null);
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const demoImgRef = useRef<HTMLImageElement | null>(null);
+
+    // Single offscreen 64x64 sampler canvas + LiveFingerCalibrator shared between width calibration & directional lighting
+    const sampleCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const sampleCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+    const calibratorRef = useRef<LiveFingerCalibrator>(new LiveFingerCalibrator());
+    const calibrationRef = useRef<LiveFingerCalibration | undefined>(undefined);
 
     const latestCameraFrameRef = useRef<HandSkeletonFrame | null>(null);
     const demoFrameRef = useRef<HandSkeletonFrame | null>(null);
     const ambientRef = useRef<DirectionalAmbientLightSample>(DEFAULT_AMBIENT);
     const lastVideoTimeRef = useRef<number>(-1);
     const lastTrackingRef = useRef<boolean>(false);
+    const lastHandSeenMsRef = useRef<number>(0);
     const lastFrameTimeRef = useRef<number>(0);
-    const lastAmbientSampleTimeRef = useRef<number>(0);
+    const lastSampleTimeRef = useRef<number>(0);
 
     // Keep latest props in refs so 60fps RAF never restarts on slider drag or design switch
     const designRef = useRef<NailDesign | null>(activeDesign);
@@ -91,11 +119,11 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     );
     const [modelReady, setModelReady] = useState(false);
 
-    // Initialize Three.js V9 PBR 3D Nail Scene once on mount
+    // Initialize Three.js V10 PBR 3D Nail Scene once on mount
     useEffect(() => {
       const glCanvas = glCanvasRef.current;
       if (!glCanvas) return;
-      const sceneEngine = new ThreeNailScene(glCanvas);
+      const sceneEngine = new ThreeNailScene(glCanvas) as ThreeNailSceneV10;
       if (sceneEngine.isReady()) {
         threeSceneRef.current = sceneEngine;
       }
@@ -105,10 +133,10 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, []);
 
-    // Initialize decoupled HandTrackerController once on mount
+    // Initialize decoupled HandTrackerController singleton (~30Hz pacing) once on mount
     useEffect(() => {
       let active = true;
-      const tracker = new HandTrackerController();
+      const tracker = new HandTrackerController({ minIntervalMs: 30 });
       trackerRef.current = tracker;
 
       void tracker.init().then((ok) => {
@@ -124,32 +152,48 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, []);
 
-    // Preload studio model hand image and extract real HandSkeletonFrame (landmarks + worldLandmarks)
+    // Detect landmarks on the directly rendered studio model <img> once both image and tracker are ready
     useEffect(() => {
+      if (!modelReady) return;
       let cancelled = false;
-      const img = new Image();
-      img.src = '/hand-demo.png';
-      img.onload = async () => {
-        if (cancelled) return;
-        demoImgRef.current = img;
+      const img = demoImgRef.current;
+      if (!img) return;
 
+      const analyzeDemoImage = async () => {
+        if (cancelled || demoFrameRef.current || !img.complete || img.naturalWidth <= 0) return;
         const tracker = trackerRef.current;
-        if (!tracker) return;
+        if (!tracker || !tracker.isReady()) return;
         const frame = await tracker.detectImage(img);
         if (!cancelled && frame) {
           demoFrameRef.current = frame;
+          lastHandSeenMsRef.current = performance.now();
+          if (modeRef.current === 'studio-demo' && !lastTrackingRef.current) {
+            lastTrackingRef.current = true;
+            onTrackingChangeRef.current?.(true);
+          }
         }
       };
 
+      if (img.complete && img.naturalWidth > 0) {
+        void analyzeDemoImage();
+      } else {
+        img.addEventListener('load', analyzeDemoImage, { once: true });
+      }
+
       return () => {
         cancelled = true;
+        img.removeEventListener('load', analyzeDemoImage);
       };
-    }, []);
+    }, [modelReady]);
 
-    // Reset tracking state when switching mode or camera facing direction
+    // Reset tracking & finger calibration when switching mode or camera facing direction
     useEffect(() => {
       latestCameraFrameRef.current = null;
       lastVideoTimeRef.current = -1;
+      lastSampleTimeRef.current = 0;
+      lastHandSeenMsRef.current = 0;
+      calibratorRef.current.reset();
+      calibrationRef.current = undefined;
       trackerRef.current?.resetTracking();
       threeSceneRef.current?.resetTracking();
 
@@ -160,7 +204,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       }
     }, [mode, facingMode]);
 
-    // Manage WebRTC camera stream with HTTPS secure-context validation & Android fallback
+    // Manage WebRTC camera stream with smooth mobile-friendly constraints & Android fallback
     useEffect(() => {
       if (mode !== 'camera') {
         setCameraState('idle');
@@ -182,9 +226,9 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             audio: false,
             video: {
               facingMode: { ideal: facingMode },
-              width: { ideal: 1280 },
-              height: { ideal: 1920 },
-              frameRate: { ideal: 60, max: 60 },
+              width: { ideal: 720, max: 1280 },
+              height: { ideal: 1280, max: 1920 },
+              frameRate: { ideal: 30, max: 60 },
             },
           },
           {
@@ -276,8 +320,8 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, facingMode, onModeChange, onCameraNotice]);
 
-    // Sync MediaPipe detection directly to incoming camera frames via requestVideoFrameCallback
-    // (with clean fallback to video.currentTime check inside the RAF loop on browsers without rVFC)
+    // Sync MediaPipe ~30Hz detection directly to incoming camera frames via requestVideoFrameCallback
+    // (with fallback to video.currentTime check inside the RAF loop on browsers without rVFC)
     useEffect(() => {
       if (mode !== 'camera') return;
       const video = videoRef.current;
@@ -317,6 +361,17 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           latestCameraFrameRef.current = detectedFrame;
 
           const hasHand = detectedFrame !== null;
+          if (hasHand) {
+            lastHandSeenMsRef.current = nowMs;
+          } else if (
+            lastHandSeenMsRef.current > 0 &&
+            nowMs - lastHandSeenMsRef.current > HAND_LOSS_RESET_MS
+          ) {
+            calibratorRef.current.reset();
+            calibrationRef.current = undefined;
+            lastHandSeenMsRef.current = 0;
+          }
+
           if (lastTrackingRef.current !== hasHand) {
             lastTrackingRef.current = hasHand;
             onTrackingChangeRef.current?.(hasHand);
@@ -338,9 +393,63 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, cameraState]);
 
-    // Main 60fps Render Loop: video/demo draw + fallback detection + throttled directional skin light + Three.js V9 render
+    // Main 60fps Zero-DrawImage Loop: WebGL 3D overlay + fallback ~30Hz tracking + shared 350ms 64x64 readback
     useEffect(() => {
       let rafId = 0;
+
+      const getSampleContext = (): CanvasRenderingContext2D | null => {
+        if (!sampleCanvasRef.current) {
+          const c = document.createElement('canvas');
+          c.width = SAMPLE_SIZE;
+          c.height = SAMPLE_SIZE;
+          sampleCanvasRef.current = c;
+          sampleCtxRef.current = c.getContext('2d', { willReadFrequently: true });
+        }
+        return sampleCtxRef.current;
+      };
+
+      const runShared64Readback = (
+        source: HTMLVideoElement | HTMLImageElement,
+        frame: HandSkeletonFrame,
+        rect: ImageLayoutRect,
+        cssW: number,
+        cssH: number,
+        mirrorX: boolean,
+        nowMs: number
+      ) => {
+        const sampleCtx = getSampleContext();
+        if (!sampleCtx) return;
+
+        try {
+          // Single 64x64 drawImage in raw unmirrored source UV space [0,1]x[0,1]:
+          // LiveFingerCalibrator maps screen coordinates via rect & mirrorX back into unmirrored source UV space,
+          // and sampleDirectionalLightFromImageData samples raw landmarks directly with rect=(0,0,1,1), mirrorX=false.
+          sampleCtx.drawImage(source, 0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
+          const imageData = sampleCtx.getImageData(0, 0, SAMPLE_SIZE, SAMPLE_SIZE);
+
+          calibrationRef.current = calibratorRef.current.updateFromFrameBuffer(
+            imageData,
+            frame.landmarks,
+            rect,
+            cssW,
+            cssH,
+            mirrorX
+          );
+
+          ambientRef.current = sampleDirectionalLightFromImageData(
+            imageData,
+            frame.landmarks,
+            { drawX: 0, drawY: 0, drawW: 1, drawH: 1 },
+            1,
+            1,
+            false,
+            ambientRef.current
+          );
+          lastSampleTimeRef.current = nowMs;
+        } catch {
+          // Ignore transient video frame readback issues
+        }
+      };
 
       const renderFrame = (nowMs: number) => {
         const prevTime = lastFrameTimeRef.current;
@@ -348,42 +457,25 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           prevTime > 0 ? Math.min(0.05, Math.max(0.001, (nowMs - prevTime) / 1000)) : 1 / 60;
         lastFrameTimeRef.current = nowMs;
 
-        const canvas = canvasRef.current;
-        if (!canvas) {
+        const viewport = viewportRef.current;
+        const glCanvas = glCanvasRef.current;
+        const threeScene = threeSceneRef.current;
+
+        if (!viewport || !glCanvas) {
           rafId = requestAnimationFrame(renderFrame);
           return;
         }
 
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const cssW = canvas.clientWidth || window.innerWidth;
-        const cssH = canvas.clientHeight || window.innerHeight;
-        const targetW = Math.round(cssW * dpr);
-        const targetH = Math.round(cssH * dpr);
+        const cssW = viewport.clientWidth || glCanvas.clientWidth || window.innerWidth;
+        const cssH = viewport.clientHeight || glCanvas.clientHeight || window.innerHeight;
 
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-          canvas.width = targetW;
-          canvas.height = targetH;
-        }
-
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          rafId = requestAnimationFrame(renderFrame);
-          return;
-        }
-
-        ctx.save();
-        ctx.scale(dpr, dpr);
-        ctx.clearRect(0, 0, cssW, cssH);
-
-        const threeScene = threeSceneRef.current;
         const tracker = trackerRef.current;
         const currentMode = modeRef.current;
         const activeDesignNow = designRef.current;
         const video = videoRef.current;
         const demoImg = demoImgRef.current;
-
-        const canSampleAmbient =
-          nowMs - lastAmbientSampleTimeRef.current >= AMBIENT_SAMPLE_INTERVAL_MS;
+        const canSample = nowMs - lastSampleTimeRef.current >= SAMPLE_INTERVAL_MS;
 
         if (
           currentMode === 'camera' &&
@@ -393,22 +485,6 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ) {
           const mirrorX = facingRef.current === 'user';
           const rect = computeCoverRect(cssW, cssH, video.videoWidth, video.videoHeight);
-
-          ctx.save();
-          if (mirrorX) {
-            ctx.translate(cssW, 0);
-            ctx.scale(-1, 1);
-            ctx.drawImage(
-              video,
-              cssW - rect.drawX - rect.drawW,
-              rect.drawY,
-              rect.drawW,
-              rect.drawH
-            );
-          } else {
-            ctx.drawImage(video, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
-          }
-          ctx.restore();
 
           // Fallback detection when requestVideoFrameCallback is unavailable
           const supportsRVFC =
@@ -424,6 +500,16 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             const detectedFrame = tracker.detectVideo(video, nowMs);
             latestCameraFrameRef.current = detectedFrame;
             const hasHand = detectedFrame !== null;
+            if (hasHand) {
+              lastHandSeenMsRef.current = nowMs;
+            } else if (
+              lastHandSeenMsRef.current > 0 &&
+              nowMs - lastHandSeenMsRef.current > HAND_LOSS_RESET_MS
+            ) {
+              calibratorRef.current.reset();
+              calibrationRef.current = undefined;
+              lastHandSeenMsRef.current = 0;
+            }
             if (lastTrackingRef.current !== hasHand) {
               lastTrackingRef.current = hasHand;
               onTrackingChangeRef.current?.(hasHand);
@@ -431,13 +517,8 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           }
 
           const cameraFrame = latestCameraFrameRef.current;
-          if (canSampleAmbient && cameraFrame) {
-            ambientRef.current = sampleDirectionalSkinLight(
-              video,
-              cameraFrame.landmarks,
-              ambientRef.current
-            );
-            lastAmbientSampleTimeRef.current = nowMs;
+          if (canSample && cameraFrame) {
+            runShared64Readback(video, cameraFrame, rect, cssW, cssH, mirrorX, nowMs);
           }
 
           if (threeScene) {
@@ -452,31 +533,29 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                 adjustmentRef.current,
                 ambientRef.current,
                 mirrorX,
-                deltaTimeSec
+                deltaTimeSec,
+                calibrationRef.current
               );
             } else {
               threeScene.clear(cssW, cssH, dpr);
             }
           }
-        } else if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
+        } else if (
+          currentMode === 'studio-demo' &&
+          demoImg &&
+          demoImg.complete &&
+          demoImg.naturalWidth > 0
+        ) {
           const rect = computeCoverRect(cssW, cssH, demoImg.naturalWidth, demoImg.naturalHeight);
-          ctx.fillStyle = '#120E10';
-          ctx.fillRect(0, 0, cssW, cssH);
-          ctx.drawImage(demoImg, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
-
           const demoFrame = demoFrameRef.current;
+
           if (demoFrame) {
             if (!lastTrackingRef.current) {
               lastTrackingRef.current = true;
               onTrackingChangeRef.current?.(true);
             }
-            if (canSampleAmbient) {
-              ambientRef.current = sampleDirectionalSkinLight(
-                demoImg,
-                demoFrame.landmarks,
-                ambientRef.current
-              );
-              lastAmbientSampleTimeRef.current = nowMs;
+            if (canSample) {
+              runShared64Readback(demoImg, demoFrame, rect, cssW, cssH, false, nowMs);
             }
           }
 
@@ -492,7 +571,8 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                 adjustmentRef.current,
                 ambientRef.current,
                 false,
-                deltaTimeSec
+                deltaTimeSec,
+                calibrationRef.current
               );
             } else {
               threeScene.clear(cssW, cssH, dpr);
@@ -502,20 +582,6 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           threeScene?.clear(cssW, cssH, dpr);
         }
 
-        // Subtle editorial vignette for floating glass HUD legibility
-        const topVig = ctx.createLinearGradient(0, 0, 0, 140);
-        topVig.addColorStop(0, 'rgba(10, 8, 9, 0.45)');
-        topVig.addColorStop(1, 'rgba(10, 8, 9, 0)');
-        ctx.fillStyle = topVig;
-        ctx.fillRect(0, 0, cssW, 140);
-
-        const botVig = ctx.createLinearGradient(0, cssH - 220, 0, cssH);
-        botVig.addColorStop(0, 'rgba(10, 8, 9, 0)');
-        botVig.addColorStop(1, 'rgba(10, 8, 9, 0.58)');
-        ctx.fillStyle = botVig;
-        ctx.fillRect(0, cssH - 220, cssW, 220);
-
-        ctx.restore();
         rafId = requestAnimationFrame(renderFrame);
       };
 
@@ -525,25 +591,72 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
 
     useImperativeHandle(ref, () => ({
       captureCompositeDataUrl(studioName: string, logoDataUrl: string | null) {
-        const srcCanvas = canvasRef.current;
-        if (!srcCanvas) return null;
+        const viewport = viewportRef.current;
+        if (!viewport) return null;
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const cssW = viewport.clientWidth || window.innerWidth;
+        const cssH = viewport.clientHeight || window.innerHeight;
+        const outW = Math.max(1, Math.round(cssW * dpr));
+        const outH = Math.max(1, Math.round(cssH * dpr));
 
         const out = document.createElement('canvas');
-        out.width = srcCanvas.width;
-        out.height = srcCanvas.height;
+        out.width = outW;
+        out.height = outH;
         const ctx = out.getContext('2d');
         if (!ctx) return null;
 
-        // Layer 1: Camera / Model Hand background
-        ctx.drawImage(srcCanvas, 0, 0);
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.fillStyle = '#120E10';
+        ctx.fillRect(0, 0, cssW, cssH);
 
-        // Layer 2: WebGL V9 3D Volumetric Nails overlay
-        const glCanvas = glCanvasRef.current;
-        if (glCanvas && glCanvas.width > 0 && glCanvas.height > 0) {
-          ctx.drawImage(glCanvas, 0, 0, out.width, out.height);
+        // Layer 1: Direct <video> (mirrored when user-facing) or Studio Model <img> matching object-fit: cover
+        const currentMode = modeRef.current;
+        const video = videoRef.current;
+        const demoImg = demoImgRef.current;
+
+        if (
+          currentMode === 'camera' &&
+          video &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0
+        ) {
+          const mirrorX = facingRef.current === 'user';
+          const rect = computeCoverRect(cssW, cssH, video.videoWidth, video.videoHeight);
+          ctx.save();
+          if (mirrorX) {
+            ctx.translate(cssW, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(
+              video,
+              cssW - rect.drawX - rect.drawW,
+              rect.drawY,
+              rect.drawW,
+              rect.drawH
+            );
+          } else {
+            ctx.drawImage(video, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
+          }
+          ctx.restore();
+        } else if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
+          const rect = computeCoverRect(cssW, cssH, demoImg.naturalWidth, demoImg.naturalHeight);
+          ctx.drawImage(demoImg, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
         }
 
-        // Layer 3: Editorial studio watermark
+        // Layer 2: Ensure WebGL framebuffer is populated even with preserveDrawingBuffer: false
+        const threeScene = threeSceneRef.current;
+        const glCanvas = glCanvasRef.current;
+        if (threeScene && typeof threeScene.renderNow === 'function') {
+          threeScene.renderNow();
+        }
+        if (glCanvas && glCanvas.width > 0 && glCanvas.height > 0) {
+          ctx.drawImage(glCanvas, 0, 0, cssW, cssH);
+        }
+
+        ctx.restore();
+
+        // Layer 3: Discreet editorial studio watermark
         const pad = Math.round(out.width * 0.045);
         const fontSize = Math.max(20, Math.round(out.width * 0.032));
         ctx.save();
@@ -592,22 +705,81 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         );
         ctx.restore();
 
-        return out.toDataURL('image/png', 0.95);
+        return out.toDataURL('image/jpeg', 0.92);
       },
     }));
 
     return (
-      <div className="ar-viewport">
+      <div ref={viewportRef} className="ar-viewport" style={{ backgroundColor: '#120E10' }}>
         <video
           ref={videoRef}
+          autoPlay
           playsInline
           muted
-          autoPlay
-          className="ar-hidden-video"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            transform: facingMode === 'user' ? 'scaleX(-1)' : 'none',
+            display: mode === 'camera' ? 'block' : 'none',
+          }}
           aria-hidden="true"
         />
-        <canvas ref={canvasRef} className="ar-canvas" />
-        <canvas ref={glCanvasRef} className="ar-webgl-overlay" aria-hidden="true" />
+
+        <img
+          ref={demoImgRef}
+          src="/hand-demo.png"
+          alt="Mão Modelo Estúdio"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            display: mode === 'studio-demo' ? 'block' : 'none',
+          }}
+        />
+
+        {/* Editorial CSS gradient vignettes replacing per-frame 2D canvas vignette draws */}
+        <div
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            height: 140,
+            background: 'linear-gradient(to bottom, rgba(10, 8, 9, 0.45), rgba(10, 8, 9, 0))',
+            pointerEvents: 'none',
+          }}
+        />
+        <div
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            bottom: 0,
+            left: 0,
+            right: 0,
+            height: 220,
+            background: 'linear-gradient(to top, rgba(10, 8, 9, 0.58), rgba(10, 8, 9, 0))',
+            pointerEvents: 'none',
+          }}
+        />
+
+        <canvas
+          ref={glCanvasRef}
+          className="ar-webgl-overlay"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            pointerEvents: 'none',
+          }}
+          aria-hidden="true"
+        />
 
         {mode === 'camera' && cameraState === 'starting' && (
           <div className="ar-camera-status glass-pill">

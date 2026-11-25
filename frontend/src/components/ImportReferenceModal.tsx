@@ -17,7 +17,7 @@ import {
   type PerFingerAnalysisResult,
   analyzeReferencePerFinger,
 } from '../lib/perFingerVisionAnalyzer';
-import { renderProceduralNailSwatchDataUrl } from '../lib/proceduralPBRSynthesizer';
+import { generateNailSwatchDataUrl } from '../lib/swatchPreview';
 import type {
   ArtisticPattern,
   FingerId,
@@ -116,17 +116,17 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     if (!fingerSpecs) return null;
     const previews = {} as Record<FingerId, string>;
     for (const id of ORDERED_FINGERS) {
-      previews[id] = renderProceduralNailSwatchDataUrl(fingerSpecs[id], 180, 260);
+      const spec = fingerSpecs[id];
+      // Ensure zero raw finger photo crop leaks into swatch generation
+      const cleanSpec: NailFingerDesignSpec = { ...spec };
+      delete (cleanSpec as { uvPatchDataUrl?: string }).uvPatchDataUrl;
+      previews[id] = generateNailSwatchDataUrl(cleanSpec, 180, 260);
     }
     return previews;
   }, [fingerSpecs]);
 
   const activeSpec = fingerSpecs ? fingerSpecs[selectedFinger] : null;
-  const activePreviewUrl = activeSpec?.uvPatchDataUrl
-    ? activeSpec.uvPatchDataUrl
-    : fingerPreviews
-      ? fingerPreviews[selectedFinger]
-      : null;
+  const activePreviewUrl = fingerPreviews ? fingerPreviews[selectedFinger] : null;
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -246,18 +246,19 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     setSaving(true);
     try {
       const middleSpec = fingerSpecs.middle ?? activeSpec;
-      const swatchDataUrl =
-        activeSpec.uvPatchDataUrl ??
-        middleSpec.uvPatchDataUrl ??
-        renderProceduralNailSwatchDataUrl(activeSpec, 180, 260);
+      const cleanActiveSpec: NailFingerDesignSpec = { ...activeSpec };
+      delete (cleanActiveSpec as { uvPatchDataUrl?: string }).uvPatchDataUrl;
+      const swatchDataUrl = generateNailSwatchDataUrl(cleanActiveSpec, 180, 260);
       const gloss = finish === 'velvet' ? 0.56 : 0.96;
 
       const finalizedSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
       for (const id of ORDERED_FINGERS) {
-        finalizedSpecs[id] = {
+        const cleanFingerSpec: NailFingerDesignSpec = {
           ...fingerSpecs[id],
           glossIntensity: gloss,
         };
+        delete (cleanFingerSpec as { uvPatchDataUrl?: string }).uvPatchDataUrl;
+        finalizedSpecs[id] = cleanFingerSpec;
       }
 
       await onCreateDesign({
@@ -404,7 +405,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 </div>
               </div>
 
-              {/* 5-Finger Real UV Patch Reconstruction Preview Strip */}
+              {/* 5-Finger Mathematical Blueprint Preview Strip */}
               {fingerSpecs && (
                 <div
                   className="v5-five-finger-section"
@@ -427,7 +428,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                       const spec = fingerSpecs[fid];
                       const isActive = fid === selectedFinger;
                       const thumbRadius = getSilhouetteBorderRadius(spec.shape);
-                      const patchSrc = spec.uvPatchDataUrl;
+                      const swatchSrc = fingerPreviews ? fingerPreviews[fid] : null;
                       return (
                         <button
                           key={fid}
@@ -446,14 +447,14 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                                 'inset 0 2px 5px rgba(255,255,255,0.28), 0 3px 8px rgba(0,0,0,0.32)',
                             }}
                           >
-                            {patchSrc && (
+                            {swatchSrc && (
                               <img
-                                src={patchSrc}
+                                src={swatchSrc}
                                 alt={FINGER_LABELS_PT[fid]}
                                 style={{
                                   width: '100%',
                                   height: '100%',
-                                  objectFit: 'cover',
+                                  objectFit: 'contain',
                                   borderRadius: thumbRadius,
                                 }}
                               />
@@ -536,6 +537,42 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                       />
                       <span>Ouro / 3D</span>
                     </label>
+                  </div>
+                  <div className="blueprint-meta-pills" aria-label="Elementos reconstruídos">
+                    <span className="blueprint-meta-pill">
+                      <span
+                        className="blueprint-color-dot"
+                        style={{
+                          background:
+                            activeSpec.blueprint?.baseLayer.baseColorHex ?? activeSpec.baseColor,
+                        }}
+                      />
+                      Base {activeSpec.blueprint?.baseLayer.baseColorHex ?? activeSpec.baseColor}
+                    </span>
+
+                    {(activeSpec.blueprint?.borderLayer.kind !== 'none' ||
+                      activeSpec.hasMetallicOutline) && (
+                      <span className="blueprint-meta-pill">
+                        {activeSpec.blueprint?.borderLayer.isMetallic || activeSpec.hasMetallicOutline
+                          ? 'Contorno Metálico'
+                          : 'Borda Francesinha'}
+                      </span>
+                    )}
+
+                    <span className="blueprint-meta-pill">
+                      {activeSpec.blueprint
+                        ? `${activeSpec.blueprint.artElements.length} vetores`
+                        : `${activeSpec.strokeAnchors.length} traços`}
+                    </span>
+
+                    <span className="blueprint-meta-pill">
+                      {activeSpec.extensionLevel ??
+                        `${(
+                          activeSpec.blueprint?.geometry.freeEdgeRatio ??
+                          activeSpec.freeEdgeRatio ??
+                          Math.max(0.15, activeSpec.relativeLength - 1)
+                        ).toFixed(2)}x along.`}
+                    </span>
                   </div>
                 </div>
               )}

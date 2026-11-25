@@ -57,12 +57,15 @@ export type NailExtensionLevel =
   | 'Alongada'
   | 'Muito Alongada (Extrema)';
 
-export type NailFinishV9 =
+export type NailFinishV10 =
   | 'glossy_gel'
   | 'jelly_translucent'
   | 'chrome_mirror'
-  | 'velvet_matte'
-  | 'cat_eye';
+  | 'pearl_glazed'
+  | 'cat_eye'
+  | 'velvet_matte';
+
+export type NailFinishV9 = NailFinishV10;
 
 export type FingerId = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
 
@@ -81,36 +84,134 @@ export interface StrokeAnchor {
   angle: number;
 }
 
+// -----------------------------------------------------------------------------
+// V10 Mathematical Nail Design Blueprint (100% Vector + Parametric Geometry, ZERO raw photo pixels)
+// -----------------------------------------------------------------------------
+
+export type NailGradientMode =
+  | 'solid'
+  | 'vertical_ombre'
+  | 'radial_aura'
+  | 'cat_eye_band'
+  | 'pearl_chrome';
+
+export type NailBorderKind =
+  | 'none'
+  | 'full_metallic_outline'
+  | 'cuticle_cuff'
+  | 'classic_french'
+  | 'micro_french'
+  | 'v_french';
+
+export interface NailGeometryProfile {
+  /** 8 normalized half-width stations at v = [0, 0.15, 0.35, 0.55, 0.72, 0.85, 0.94, 1.0] (max 0.5) */
+  profileHalfWidths: [number, number, number, number, number, number, number, number];
+  aspectRatio: number;
+  /** Free-edge extension relative to client's natural bed length (0.12 .. 1.15) */
+  freeEdgeRatio: number;
+  tipRoundness: number; // 0 .. 1
+  shape: NailShape;
+}
+
+export interface NailBaseLayer {
+  baseColorHex: string;
+  gradientMode: NailGradientMode;
+  cuticleColorHex: string;
+  midColorHex: string;
+  tipColorHex: string;
+  finishStyle: NailFinishV10;
+  translucency: number; // 0 .. 1
+  metallicBase: number; // 0 .. 1
+  glossiness: number; // 0 .. 1
+}
+
+export interface NailBorderLayer {
+  kind: NailBorderKind;
+  colorHex: string;
+  thicknessNorm: number; // 0.02 .. 0.28
+  isMetallic: boolean;
+  is3DRaised: boolean;
+  smileCurveDepth: number; // 0 .. 0.35
+}
+
+export interface RibbonStrokePoint {
+  u: number;
+  v: number;
+  width: number; // normalized width (0.015 .. 0.14)
+}
+
+export interface RibbonStrokeElement {
+  type: 'ribbon_stroke';
+  points: RibbonStrokePoint[]; // 4..10 simplified smooth control points
+  colorHex: string;
+  highlightHex: string;
+  isMetallic: boolean;
+  reliefHeight: number; // 0.2 .. 1.0
+}
+
+export interface OrganicMotifPoint {
+  u: number;
+  v: number;
+}
+
+export interface OrganicMotifElement {
+  type: 'organic_motif';
+  contour: OrganicMotifPoint[]; // 16..24 smoothed closed polygon vertices in (u, v)
+  fillColorHex: string;
+  shadeColorHex: string;
+  isMetallic: boolean;
+  reliefHeight: number; // 0.15 .. 1.0
+}
+
+export interface MicroGemElement {
+  type: 'micro_gem';
+  u: number;
+  v: number;
+  radius: number; // 0.015 .. 0.065
+  colorHex: string;
+  kind: 'gold_bead' | 'pearl' | 'crystal';
+}
+
+export type VectorArtElement =
+  | RibbonStrokeElement
+  | OrganicMotifElement
+  | MicroGemElement;
+
+export interface NailDesignBlueprint {
+  version: 10;
+  geometry: NailGeometryProfile;
+  baseLayer: NailBaseLayer;
+  borderLayer: NailBorderLayer;
+  artElements: VectorArtElement[];
+}
+
 export interface NailFingerDesignSpec {
   fingerId: FingerId;
   detectedFromPhoto: boolean;
   shape: NailShape; // 'natural' | 'oval' | 'square' | 'coffin' | 'almond' | 'stiletto'
-  relativeLength: number; // 0.85 .. 1.65 (salon scale)
-  relativeWidth: number; // 0.90 .. 1.25
+  relativeLength: number; // 1.12 .. 2.15 (1 + freeEdgeRatio)
+  relativeWidth: number; // retained for legacy DTO compatibility ONLY (NEVER overrides client live finger width!)
   baseColor: string; // dominant gel/polish base hex
   secondaryColor: string; // gradient / aura / french tip / floral petal hex
   accentColor: string; // metallic gold / pearl / chrome 3D relief hex
   pattern: ArtisticPattern;
-  strokeAnchors: StrokeAnchor[]; // normalized positions of detected strokes/reliefs on the nail
+  strokeAnchors: StrokeAnchor[];
   metallicIntensity: number; // 0 .. 1
   glossIntensity: number; // 0.5 .. 1
-  // V9 High-Fidelity Reference & Anatomical Spec fields
+  // V10 Clean Mathematical Blueprint & Anatomical Spec fields
+  blueprint?: NailDesignBlueprint;
   extensionLevel?: NailExtensionLevel;
-  extensionMm?: number; // real free-edge extension in mm (1.5 .. 12.0)
+  freeEdgeRatio?: number; // 0.12 .. 1.15 relative to client natural bed
+  extensionMm?: number; // estimated free-edge extension in mm (1.5 .. 12.0)
   tipRoundness?: number; // 0 .. 1
   aspectRatio?: number;
-  lengthMultiplier?: number; // 0.85 .. 1.65
+  lengthMultiplier?: number; // 1.12 .. 2.15
   hasMetallicOutline?: boolean;
   outlineColor?: string;
   has3DRelief?: boolean;
   reliefDescription?: string;
   artDescription?: string;
-  finishStyle?: NailFinishV9;
-  uvPatchDataUrl?: string; // canonical delighted UV texture (512x512 or 1024x1024)
-  normalMapDataUrl?: string;
-  displacementMapDataUrl?: string;
-  metalnessMapDataUrl?: string;
-  roughnessMapDataUrl?: string;
+  finishStyle?: NailFinishV10;
   isImportedReference?: boolean;
 }
 
@@ -134,10 +235,10 @@ export interface NailDesign {
 
 export interface NailAdjustment {
   shape: NailShape;
-  extensionLength: number; // Fine-tune multiplier 0.85 .. 1.15 (±15%) around reference length
+  extensionLength: number; // Fine-tune multiplier 0.85 .. 1.15 (±15%) around reference freeEdgeRatio
   scale: number; // Width/fit multiplier 0.85 .. 1.20
   rotationDeg: number; // 0 default
-  opacity: number; // 0.70 .. 1.0 realism/opacity
+  opacity: number; // 0.70 .. 1.0 (default 1.0 -> opaque fast path!)
 }
 
 export type ARViewMode = 'camera' | 'studio-demo';
@@ -176,4 +277,16 @@ export interface HandSkeletonFrame {
   worldLandmarks: Vec3[]; // 21 metric 3D world landmarks (meters)
   handedness: 'Left' | 'Right';
   timestampMs: number;
+}
+
+/**
+ * Live per-finger width calibration measured directly on the client's hand in the camera frame.
+ */
+export interface LiveFingerCalibration {
+  /** Smoothed measured finger width divided by projected 2D DIP->TIP length, per finger */
+  widthToDistalRatio: Record<FingerId, number>;
+  /** Measured screen-space width in CSS pixels (when available in current frame) */
+  widthPx: Partial<Record<FingerId, number>>;
+  /** Confidence 0..1 per finger */
+  confidence: Record<FingerId, number>;
 }

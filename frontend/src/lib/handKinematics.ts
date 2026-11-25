@@ -3,6 +3,7 @@ import type { ImageLayoutRect } from './nailRenderer';
 import type {
   FingerId,
   HandSkeletonFrame,
+  LiveFingerCalibration,
   NormalizedPoint,
   Vec3,
 } from '../types/nail';
@@ -712,13 +713,22 @@ export interface FingerMetricDimensions {
   palmThicknessMeters: number;
 }
 
+export interface FingerMetricDimensionsOptions {
+  livePoints3D?: readonly THREE.Vector3[];
+  calibration?: LiveFingerCalibration;
+  focalPx?: number;
+}
+
 /**
- * Computes real metric finger dimensions (in meters) directly from MediaPipe `worldLandmarks`,
- * bounded within safe anatomical salon limits.
+ * Computes real metric finger dimensions (in meters) directly from MediaPipe `worldLandmarks`
+ * and, when available, prioritizes the client's live calibrated finger width measured directly
+ * from the camera frame (`livePoints3D` + `calibration` + `focalPx`), bounded within safe
+ * anatomical salon limits.
  */
 export function computeFingerMetricDimensions(
   fingerId: FingerId,
-  worldLandmarks: readonly Vec3[]
+  worldLandmarks: readonly Vec3[],
+  options?: FingerMetricDimensionsOptions
 ): FingerMetricDimensions {
   const spec = FINGER_LANDMARK_INDICES[fingerId];
   const clampCfg = ANATOMICAL_METRIC_CLAMPS[fingerId];
@@ -747,10 +757,6 @@ export function computeFingerMetricDimensions(
 
   const distalLenMeters = clamp(rawDistal, clampCfg.distalMin, clampCfg.distalMax);
 
-  // Natural nail bed covers from lerp(DIP, TIP, 0.22) up to TIP (~78% of DIP->TIP),
-  // scaled at 0.72 * distalLenMeters within [8.5 mm, 17.5 mm]
-  const bedLengthMeters = clamp(distalLenMeters * 0.72, 0.0085, 0.0175);
-
   // Estimate global hand size ratio from palm landmarks to refine nail width proportionally
   let palmScaleRatio = 1.0;
   if (wrist && middleMcp && indexMcp && pinkyMcp) {
@@ -771,6 +777,73 @@ export function computeFingerMetricDimensions(
     }
   }
 
+  const palmThicknessMeters = clamp(0.022 * palmScaleRatio, 0.015, 0.032);
+
+  // Priority 1: Live camera anatomical calibration (client's real finger width & bed length)
+  const livePoints3D = options?.livePoints3D;
+  const calibration = options?.calibration;
+  const focalPx = options?.focalPx;
+  const liveDip3D = livePoints3D?.[spec.dip];
+  const liveTip3D = livePoints3D?.[spec.tip];
+
+  if (
+    liveDip3D &&
+    liveTip3D &&
+    calibration &&
+    focalPx !== undefined &&
+    Number.isFinite(focalPx) &&
+    focalPx > 10
+  ) {
+    const rawLiveDistal3D = liveTip3D.distanceTo(liveDip3D);
+    if (Number.isFinite(rawLiveDistal3D) && rawLiveDistal3D > 0.005 && rawLiveDistal3D < 0.065) {
+      const liveDistal3D = clamp(rawLiveDistal3D, clampCfg.distalMin, clampCfg.distalMax);
+      // Cuticle at lerp(DIP, TIP, 0.20) -> TIP covers ~78% of DIP->TIP distal phalanx
+      const bedLengthMeters = clamp(liveDistal3D * 0.78, 0.0085, 0.020);
+
+      const calibratedRatio = clamp(
+        calibration.widthToDistalRatio[fingerId] ?? clampCfg.widthToDistalRatio,
+        0.42,
+        fingerId === 'thumb' ? 0.82 : 0.78
+      );
+      const ratioWidthMeters = calibratedRatio * liveDistal3D;
+
+      const measuredWidthPx = calibration.widthPx[fingerId];
+      const conf = calibration.confidence[fingerId] ?? 0;
+
+      let fingerWidthMeters = ratioWidthMeters;
+      if (
+        measuredWidthPx !== undefined &&
+        Number.isFinite(measuredWidthPx) &&
+        measuredWidthPx > 2 &&
+        conf > 0.15
+      ) {
+        const fingerDepthZ = Math.abs(liveDip3D.z * 0.65 + liveTip3D.z * 0.35);
+        if (fingerDepthZ > 0.05) {
+          const pxWidthMeters = (measuredWidthPx / focalPx) * fingerDepthZ;
+          // Blend direct perspective width with pitch-invariant calibrated ratio
+          const pxWeight = clamp(0.45 + 0.35 * conf, 0.45, 0.8);
+          fingerWidthMeters = pxWidthMeters * pxWeight + ratioWidthMeters * (1 - pxWeight);
+        }
+      }
+
+      const nailWidthMeters = clamp(fingerWidthMeters * 0.85, 0.0072, 0.021);
+      const phalanxRadiusMeters = clamp(fingerWidthMeters * 0.50, 0.0044, 0.0125);
+
+      return {
+        distalLenMeters: liveDistal3D,
+        bedLengthMeters,
+        nailWidthMeters,
+        phalanxRadiusMeters,
+        palmThicknessMeters,
+      };
+    }
+  }
+
+  // Fallback (legacy / unit tests without live camera calibration): worldLandmarks metrics
+  // Natural nail bed covers from lerp(DIP, TIP, 0.22) up to TIP (~78% of DIP->TIP),
+  // scaled at 0.72 * distalLenMeters within [8.5 mm, 17.5 mm]
+  const bedLengthMeters = clamp(distalLenMeters * 0.72, 0.0085, 0.0175);
+
   const widthFromDistal = distalLenMeters * clampCfg.widthToDistalRatio;
   const widthFromPalm = clampCfg.widthFallback * palmScaleRatio;
   const nailWidthMeters = clamp(
@@ -784,8 +857,6 @@ export function computeFingerMetricDimensions(
     0.0048,
     0.0135
   );
-
-  const palmThicknessMeters = clamp(0.022 * palmScaleRatio, 0.015, 0.032);
 
   return {
     distalLenMeters,
