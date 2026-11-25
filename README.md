@@ -103,6 +103,31 @@ A versão **V10** consolida o provador para uso comercial em celulares reais e h
 
 ---
 
+## 2.3 Arquitetura V11 (`feat/v11-deep-per-finger-3d-reconstruction`) — Reconstrução Profunda Unha-por-Unha com Auto-Verificação Visual, Acessórios 3D Reais & Gemini Free Tier (R$ 0,00)
+
+A versão **V11** preserva 100% da performance 60fps da V10 e corrige definitivamente os 4 gargalos visuais/ópticos identificados em produção:
+
+### Pilar 1 — Correção Visual 3D, Cromado Espelhado Real & Acessórios 3D Geométricos
+- **Fim da Borda Branca (`nailShaderMaterials.ts`)**: `createCuticleContactSkirtMaterial()` removeu `THREE.MultiplyBlending` e o preenchimento `#FFFFFF` (que geravam pixels brancos sobre `<canvas>` WebGL transparente), passando a usar `THREE.NormalBlending` com micro-sombra quente translúcida (`rgba(36, 15, 11, <= 0.30)`) restrita à dobra proximal da cutícula.
+- **Fim da Malha "Garrafa de Leite" (`nail3DGeometry.ts`)**: `evalNailHalfWidth` ignora perfis ruidosos de pixels crus (`profileHalfWidths`), operando exclusivamente sobre equações paramétricas lisas e monotônicas de salão para os 6 formatos (`natural`, `oval`, `almond`, `coffin`, `square`, `stiletto`) no grid leve `20×24`, e exporta `evaluateNailSurfacePointAndNormal(u, v, shape, opts)` para ancoragem exata de acessórios 3D.
+- **HDRI Studio Room de Alto Contraste & Acabamentos Ópticos (`nailShaderMaterials.ts`)**: Ambiente PMREM de estúdio com janelas HDR (`intensity 3.8–4.5`) contra painéis escuros `#0C0A0E` e rebatedor quente inferior, somado a `applyFinishTypeToDorsalMaterial` para `mirror_chrome` (`metalness >= 0.92`, `roughness <= 0.09`), `glazed_pearl`, `solid_gloss_gel`, `jelly_translucent`, `cat_eye_magnetic`, `velvet_matte` e `glitter_suspension`.
+- **Acessórios 3D Reais Instanciados + Sets de 5 ou 10 Dedos (`threeNailScene.ts`)**: 4 `THREE.InstancedMesh` dedicados (`metalStudInstancedMesh`, `pearlInstancedMesh`, `rhinestoneInstancedMesh`, `clearDropInstancedMesh`, `renderOrder = 3`) posicionam studs metálicos, pérolas, strass e gotas 3D reais sobre `evaluateNailSurfacePointAndNormal(u, v)` com cor por instância (`setColorAt`), além de suporte nativo a sets distintos de **Mão Esquerda e Mão Direita (`handSpecsBySide`)**.
+
+### Pilar 2 & 3 — Pipeline Profundo Unha-por-Unha, Render 3D Offscreen & Loop Fechado de Auto-Verificação (R$ 0,00)
+- **Serverless Gratuita Vercel + Espelho Express (`frontend/api/reconstruct-nail.ts` + `backend/src/services/NailReconstructionService.ts` + `VisionController.ts`)**: Usa **Google Gemini API Free Tier** (`gemini-2.5-flash` com fallback automático para `gemini-2.5-flash-lite` + backoff exponencial em HTTP `429`) em 3 ações estruturadas:
+  1. `analyze_global`: mapeia iluminação do ambiente, 1 ou 2 mãos (5 ou 10 dedos), grupos idênticos e *filha única*.
+  2. `analyze_finger`: recebe foto global + recorte verticalizado `384×512` de cada unha com regra explícita de desambiguação óptica para cromados/espelhados (impedindo reflexos escuros de virarem listras falsas) e gera o contrato técnico `Nail3DManufacturingSpec`.
+  3. `verify_and_refine`: recebe imagem comparativa **Lado a Lado (`768×512` — Referência Real | Render 3D Offscreen)** gerada por [`OffscreenNailRenderSession`](frontend/src/lib/offscreenNailRenderer.ts), atribuindo `fidelityScore` (`0–100`) e refinando automaticamente até `2` rodadas sempre que `< 92%`.
+- **Orquestrador Client-Side & Compilador PBR (`deepNailReconstructor.ts` + `proceduralPBRSynthesizer.ts` + `swatchPreview.ts`)**: Executa os 4 estágios com progresso vivo, botão **Cancelar**, renderização de anéis de engaste AO sob acessórios 3D e swatches baseados nos snapshots 3D reais (`preview3DDataUrl`). Sem chave configurada, cai graciosamente no modo offline paramétrico limpo.
+
+### Pilar 4 — UX de Progresso Profundo, Comparativo Lado a Lado & Ativação em 30 Segundos (R$ 0,00)
+- **Importação & Configurações (`ImportReferenceModal.tsx`, `WhiteLabelModal.tsx`, `MagneticDesignDock.tsx`, `offlineStore.ts`)**: Stepper vivo dedo-a-dedo, comparativo **Referência Real vs Molde 3D**, abas `Mão Dir. / Mão Esq.` para sets de 10 dedos, selo de fidelidade `%` no modal e no dock, e persistência completa de `manufacturingSpec` + `handSpecsBySide` no `IndexedDB` e `SQLite`.
+- **Como ativar a Visão 3D Profunda gratuitamente em 30 segundos (R$ 0,00, sem cartão de crédito):**
+  1. Acesse [aistudio.google.com/apikey](https://aistudio.google.com/apikey) e clique em **Create API key**.
+  2. Cole a chave **na Vercel** em *Project Settings → Environment Variables* como `GEMINI_API_KEY` (e faça redeploy) **OU** cole diretamente dentro do app em **Configurações (ícone de engrenagem) → Visão 3D Profunda (Google AI Studio — R$ 0,00)** para ativar na hora sem redeploy.
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:

@@ -61,6 +61,11 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
         aria-pressed={isActive}
       >
         <span className="dock-swatch-circle" style={{ background: swatchBg }} />
+        {typeof design.fidelityScore === 'number' && design.fidelityScore >= 70 && (
+          <span className="dock-fidelity-pill" aria-label={`Fidelidade ${design.fidelityScore}%`}>
+            {design.fidelityScore}%
+          </span>
+        )}
         {isActive && (
           <motion.span
             layoutId="dockActiveRing"

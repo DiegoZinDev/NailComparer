@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { NormalizedPoint } from '../types/nail';
+import type { Nail3DFinishType, NormalizedPoint } from '../types/nail';
 
 export interface UndersideMaterialBundle {
   material: THREE.MeshPhysicalMaterial;
@@ -12,6 +12,14 @@ export interface UndersideMaterialBundle {
 export interface CuticleSkirtMaterialBundle {
   material: THREE.MeshBasicMaterial;
   texture: THREE.CanvasTexture;
+}
+
+export interface Accessory3DMaterialSet {
+  metalStud: THREE.MeshPhysicalMaterial;
+  pearl: THREE.MeshPhysicalMaterial;
+  rhinestone: THREE.MeshPhysicalMaterial;
+  clearDrop: THREE.MeshPhysicalMaterial;
+  dispose: () => void;
 }
 
 export interface DirectionalAmbientLightSample {
@@ -35,8 +43,12 @@ export const DEFAULT_DIRECTIONAL_AMBIENT: DirectionalAmbientLightSample = {
 const UNDERSIDE_TEX_SIZE = 256;
 const SKIRT_TEX_SIZE = 128;
 
+function clamp(value: number, min: number, max: number): number {
+  return value < min ? min : value > max ? max : value;
+}
+
 function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
+  return clamp(value, 0, 1);
 }
 
 function parseHexToRgb(hex: string): { r: number; g: number; b: number } {
@@ -67,18 +79,18 @@ function rgbCss(r: number, g: number, b: number, a = 1): string {
 }
 
 /**
- * Generates an HDR-dynamic Studio Room Environment Map via `THREE.PMREMGenerator`
- * featuring natural sky-gradient rectangular windows, dual softbox diffusers,
- * a crisp high-intensity specular strip for liquid UV-gel catchlights,
- * a warm skin-toned lower bounce card, and soft ambient room fill.
- * Cleans up all temporary scene geometries, materials, and the PMREM generator.
+ * Generates a high-contrast HDR Studio Room Environment Map via `THREE.PMREMGenerator`
+ * featuring dark architectural contrast walls (`#120F12` / `#0C0A0E`),
+ * two high-intensity bright light windows/strips (`intensity 3.8–4.5`),
+ * crisp specular catchlights, and a warm golden/skin lower bounce card (`#6E4C3C`)
+ * so `mirror_chrome` and metallic 3D accessories exhibit true liquid-mirror reflections.
  */
 export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Texture {
   const pmrem = new THREE.PMREMGenerator(renderer);
   pmrem.compileEquirectangularShader();
 
   const envScene = new THREE.Scene();
-  envScene.background = new THREE.Color(0x1e181b);
+  envScene.background = new THREE.Color(0x120f12);
 
   const disposables: Array<{ dispose: () => void }> = [];
 
@@ -114,7 +126,6 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
     disposables.push(geo, mat);
   };
 
-  // 1) Rectangular natural daylight windows with subtle sky gradient
   const makeWindowCanvas = (topHex: string, bottomHex: string) => {
     const c = document.createElement('canvas');
     c.width = 64;
@@ -123,7 +134,7 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
     if (ctx) {
       const grad = ctx.createLinearGradient(0, 0, 0, c.height);
       grad.addColorStop(0, topHex);
-      grad.addColorStop(0.55, '#F5F7FA');
+      grad.addColorStop(0.5, '#FFFFFF');
       grad.addColorStop(1, bottomHex);
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, c.width, c.height);
@@ -131,25 +142,30 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
     return c;
   };
 
-  const skyWindowCanvas = makeWindowCanvas('#C8DDF5', '#F7ECE4');
-  addPanel(9, 13, [-7.5, 4.5, 5.5], skyWindowCanvas, 1.55);
-  addPanel(7, 11, [7.8, 3.8, 4.8], skyWindowCanvas, 1.35);
+  // 1) Alternating dark architectural baffles (#0C0A0E) to carve sharp dark reflections into chrome
+  const darkPanelColor = new THREE.Color(0x0c0a0e);
+  addPanel(12, 16, [-9.5, 0.5, 0.2], darkPanelColor);
+  addPanel(12, 16, [9.5, 0.5, 0.2], darkPanelColor);
+  addPanel(18, 12, [0, 1.5, -9.2], darkPanelColor);
+  addPanel(10, 6, [0, 8.8, 0.5], darkPanelColor);
 
-  // 2) Dual salon softbox diffusers (overhead key + front-fill diffuser)
-  addPanel(13, 6.5, [-1.2, 7.2, 4.2], new THREE.Color(2.25, 2.16, 2.08));
-  addPanel(8, 5.5, [4.2, 5.8, -3.5], new THREE.Color(1.45, 1.48, 1.58));
+  // 2) Two high-intensity bright studio daylight windows/strips (intensity 3.8 .. 4.5)
+  const skyWindowCanvas = makeWindowCanvas('#DCEBFF', '#FFF3E8');
+  addPanel(6.2, 12.5, [-6.4, 4.4, 5.6], skyWindowCanvas, 4.2);
+  addPanel(5.4, 11.0, [6.8, 3.8, 5.0], skyWindowCanvas, 3.8);
 
-  // 3) Crisp thin specular light strip for razor-sharp liquid UV-gel catchlights along the C-curve
-  addPanel(14, 0.75, [0.4, 4.8, 6.8], new THREE.Color(3.6, 3.55, 3.48));
-  addPanel(0.85, 11, [-5.6, 2.2, 6.2], new THREE.Color(2.9, 2.95, 3.1));
+  // 3) Overhead salon softbox + razor-sharp HDR catchlight strips for liquid chrome highlights
+  addPanel(11, 4.2, [-0.8, 7.6, 4.2], new THREE.Color(3.9, 3.82, 3.72));
+  addPanel(13, 0.85, [0.3, 4.9, 6.8], new THREE.Color(4.5, 4.45, 4.38));
+  addPanel(0.95, 11.5, [-4.8, 2.0, 6.4], new THREE.Color(4.1, 4.18, 4.35));
 
-  // 4) Warm skin-toned lower bounce reflector card
-  addPanel(18, 18, [0, -7.2, 1.0], new THREE.Color(0.72, 0.48, 0.41));
+  // 4) Secondary cool studio rim strip (rear-right)
+  addPanel(5.0, 4.0, [4.6, 5.6, -4.4], new THREE.Color(2.2, 2.28, 2.45));
 
-  // 5) Soft enveloping room fill behind camera / walls
-  addPanel(16, 12, [0, 0.5, -9.0], new THREE.Color(0.46, 0.41, 0.43));
+  // 5) Warm golden/skin lower bounce reflector card (#6E4C3C)
+  addPanel(18, 18, [0, -7.2, 1.2], new THREE.Color(0x6e4c3c));
 
-  const envRT = pmrem.fromScene(envScene, 0.032);
+  const envRT = pmrem.fromScene(envScene, 0.028);
 
   for (const item of disposables) {
     item.dispose();
@@ -160,7 +176,7 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
 }
 
 /**
- * Dorsal UV-gel physical material (`V10` 60fps mobile fast-path):
+ * Dorsal UV-gel physical material (`V11` 60fps mobile fast-path):
  * - Glossy wet UV clearcoat (`clearcoat: 1.0`, `clearcoatRoughness: 0.04`, `ior: 1.52`)
  * - ZERO `displacementMap` / `bumpMap` vertex texture fetches on mobile GPUs
  *   (uses only `map`, `normalMap`, `roughnessMap`, `metalnessMap`)
@@ -191,6 +207,180 @@ export function createDorsalNailMaterial(
 }
 
 /**
+ * Applies physical optical parameters calibrated per `Nail3DFinishType` onto the dorsal nail material.
+ * Preserves existing `transparent`/`depthWrite`/`opacity` state controlled by `applyDorsalMaterialOpacity`.
+ */
+export function applyFinishTypeToDorsalMaterial(
+  material: THREE.MeshPhysicalMaterial,
+  finishType: Nail3DFinishType,
+  overrides?: { metalness?: number; roughness?: number; clearcoat?: number }
+): void {
+  const oMetal =
+    overrides?.metalness !== undefined ? clamp01(overrides.metalness) : undefined;
+  const oRough =
+    overrides?.roughness !== undefined ? clamp(overrides.roughness, 0.02, 0.9) : undefined;
+  const oClear =
+    overrides?.clearcoat !== undefined ? clamp01(overrides.clearcoat) : undefined;
+
+  switch (finishType) {
+    case 'mirror_chrome':
+      material.metalness = oMetal ?? 0.96;
+      material.roughness = oRough ?? 0.06;
+      material.clearcoat = oClear ?? 1.0;
+      material.clearcoatRoughness = 0.02;
+      material.ior = 1.52;
+      material.iridescence = 0.08;
+      material.iridescenceIOR = 1.3;
+      material.envMapIntensity = 2.35;
+      break;
+
+    case 'glazed_pearl':
+      material.metalness = oMetal ?? 0.38;
+      material.roughness = oRough ?? 0.10;
+      material.clearcoat = oClear ?? 1.0;
+      material.clearcoatRoughness = 0.03;
+      material.ior = 1.52;
+      material.iridescence = 0.65;
+      material.iridescenceIOR = 1.38;
+      material.envMapIntensity = 1.85;
+      break;
+
+    case 'jelly_translucent':
+      material.metalness = 0.0;
+      material.roughness = 0.06;
+      material.clearcoat = 1.0;
+      material.clearcoatRoughness = 0.02;
+      material.ior = 1.50;
+      material.iridescence = 0.0;
+      material.envMapIntensity = 1.60;
+      break;
+
+    case 'cat_eye_magnetic':
+      material.metalness = oMetal ?? 0.62;
+      material.roughness = oRough ?? 0.14;
+      material.clearcoat = oClear ?? 1.0;
+      material.clearcoatRoughness = 0.04;
+      material.ior = 1.52;
+      material.iridescence = 0.25;
+      material.iridescenceIOR = 1.33;
+      material.envMapIntensity = 1.95;
+      break;
+
+    case 'velvet_matte':
+      material.metalness = 0.04;
+      material.roughness = oRough ?? 0.44;
+      material.clearcoat = 0.12;
+      material.clearcoatRoughness = 0.45;
+      material.ior = 1.48;
+      material.iridescence = 0.0;
+      material.envMapIntensity = 0.85;
+      break;
+
+    case 'glitter_suspension':
+      material.metalness = 0.28;
+      material.roughness = 0.10;
+      material.clearcoat = 1.0;
+      material.clearcoatRoughness = 0.03;
+      material.ior = 1.52;
+      material.iridescence = 0.30;
+      material.iridescenceIOR = 1.35;
+      material.envMapIntensity = 1.85;
+      break;
+
+    case 'solid_gloss_gel':
+    default:
+      material.metalness = oMetal ?? 0.0;
+      material.roughness = oRough ?? 0.08;
+      material.clearcoat = oClear ?? 1.0;
+      material.clearcoatRoughness = 0.03;
+      material.ior = 1.52;
+      material.iridescence = 0.0;
+      material.envMapIntensity = 1.55;
+      break;
+  }
+
+  material.needsUpdate = true;
+}
+
+/**
+ * Creates shared physically-based materials for true 3D nail accessories
+ * (`metalStud`, `pearl`, `rhinestone`, `clearDrop`), each authored with `color: 0xffffff`
+ * so `InstancedMesh.setColorAt()` drives exact per-accessory coloration without allocations.
+ */
+export function createAccessory3DMaterials(
+  envMap: THREE.Texture | null
+): Accessory3DMaterialSet {
+  const metalStud = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(0xffffff),
+    metalness: 0.98,
+    roughness: 0.05,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.02,
+    ior: 1.52,
+    envMap,
+    envMapIntensity: 2.5,
+    side: THREE.FrontSide,
+  });
+
+  const pearl = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(0xffffff),
+    metalness: 0.08,
+    roughness: 0.12,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.04,
+    iridescence: 0.75,
+    iridescenceIOR: 1.38,
+    ior: 1.52,
+    envMap,
+    envMapIntensity: 1.9,
+    side: THREE.FrontSide,
+  });
+
+  const rhinestone = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(0xffffff),
+    metalness: 0.25,
+    roughness: 0.03,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.01,
+    ior: 2.1,
+    iridescence: 0.45,
+    iridescenceIOR: 1.45,
+    specularIntensity: 1.0,
+    envMap,
+    envMapIntensity: 2.8,
+    side: THREE.FrontSide,
+  });
+
+  const clearDrop = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color(0xffffff),
+    metalness: 0.0,
+    roughness: 0.03,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.02,
+    ior: 1.52,
+    transparent: true,
+    opacity: 0.72,
+    depthWrite: false,
+    envMap,
+    envMapIntensity: 2.1,
+    side: THREE.FrontSide,
+  });
+
+  return {
+    metalStud,
+    pearl,
+    rhinestone,
+    clearDrop,
+    dispose: () => {
+      metalStud.dispose();
+      pearl.dispose();
+      rhinestone.dispose();
+      clearDrop.dispose();
+    },
+  };
+}
+
+/**
  * Helper to adjust dorsal nail opacity without white edge halos:
  * keeps `transparent: false` + `depthWrite: true` when opaque (`>= 0.99`),
  * enabling smooth alpha blending only when genuinely translucent (`< 0.99`).
@@ -210,10 +400,11 @@ export function applyDorsalMaterialOpacity(
 }
 
 /**
- * Conformal Cuticle & Sulcus Contact AO Shadow Material (`V9`):
- * Generates a subtle warm rosy-brown radial/U-groove shadow texture ONCE
- * with `MultiplyBlending`, `transparent: true`, `depthWrite: false`,
- * `premultipliedAlpha: false`, `side: THREE.FrontSide` to organically fuse the nail plate into skin.
+ * Conformal Cuticle & Sulcus Contact AO Shadow Material (`V11`):
+ * Uses pure `NormalBlending` on a completely transparent canvas (`rgba(0,0,0,0)`),
+ * drawing ONLY a subtle translucent warm micro-shadow (`rgba(36, 15, 11, alpha)`, `alpha <= 0.30`)
+ * along the proximal cuticle fold (`v ∈ [0, 0.14]`) with soft lateral sulcus feathering.
+ * Zero white pixels anywhere in the texture — completely eliminating any white edge halo.
  */
 export function createCuticleContactSkirtMaterial(): CuticleSkirtMaterialBundle {
   const size = SKIRT_TEX_SIZE;
@@ -223,58 +414,54 @@ export function createCuticleContactSkirtMaterial(): CuticleSkirtMaterialBundle 
   const ctx = canvas.getContext('2d');
 
   if (ctx) {
-    // Neutral white base for MultiplyBlending (1.0 = no darkening, lower = subtle warm skin shadow)
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, size, size);
+    ctx.clearRect(0, 0, size, size);
 
-    const img = ctx.getImageData(0, 0, size, size);
+    const img = ctx.createImageData(size, size);
     const data = img.data;
 
     for (let y = 0; y < size; y++) {
-      // Canvas top (y = 0) corresponds to UV v = 1 (end of nail bed, v_nail = 0.58)
-      // Canvas bottom (y = size - 1) corresponds to UV v = 0 (proximal skin outside cuticle, v_nail = -0.04)
+      // Canvas top (y = 0) corresponds to UV v = 1 (distal bed end)
+      // Canvas bottom (y = size - 1) corresponds to UV v = 0 (proximal cuticle edge)
       const vNorm = 1 - y / (size - 1);
 
-      // Cuticle lunula band peaks near v_nail ≈ 0.02 (vNorm ≈ 0.097) and fades softly to 0 at edges
-      const cuticleCenter = 0.10;
-      const cuticleDist = (vNorm - cuticleCenter) / 0.14;
-      const cuticleShadow = Math.exp(-cuticleDist * cuticleDist * 2.2) * 0.42;
+      // Strictly restricted to proximal cuticle fold v ∈ [0, 0.14] + whisper-soft sulcus fade
+      const proximalFadeIn = smoothFalloff(vNorm, 0.0, 0.035);
+      const cuticleEnvelope =
+        vNorm <= 0.14
+          ? proximalFadeIn * (1 - smoothFalloff(vNorm, 0.08, 0.14))
+          : 0;
 
-      // Lateral sulcus groove shadow runs softly along v_nail ∈ [0, 0.58] and feathers out at distal bed end
-      const bedEnvelope =
-        smoothFalloff(vNorm, 0.02, 0.18) * (1 - smoothFalloff(vNorm, 0.72, 1.0));
+      const lateralSulcusEnv =
+        vNorm <= 0.24
+          ? smoothFalloff(vNorm, 0.02, 0.07) * (1 - smoothFalloff(vNorm, 0.12, 0.24))
+          : 0;
 
       for (let x = 0; x < size; x++) {
         const u = x / (size - 1);
-        const s = Math.abs(u * 2 - 1); // 0 at center, 1 at outer skirt rim
+        const s = Math.abs(u * 2 - 1); // 0 center .. 1 outer skirt rim
 
-        // Sulcus shadow concentrates along inner lateral fold (s ∈ [0.68, 0.96]) and fades cleanly to 0 at rim s=1
-        const lateralDist = (s - 0.84) / 0.12;
-        const lateralRidge =
-          Math.exp(-lateralDist * lateralDist * 2.4) * (1 - smoothFalloff(s, 0.92, 1.0));
-        const lateralShadow = lateralRidge * bedEnvelope * 0.34;
+        const lateralFeather = 1 - smoothFalloff(s, 0.72, 1.0);
+        const sulcusBand =
+          Math.exp(-Math.pow((s - 0.80) / 0.10, 2) * 2.0) *
+          (1 - smoothFalloff(s, 0.88, 1.0));
 
-        // Combine cuticle & lateral groove occlusion, feathering cleanly to zero at outer boundary
-        const outerEdgeFeather =
-          1 - smoothFalloff(s, 0.90, 1.0) * 0.85;
-        const proximalFeather = smoothFalloff(vNorm, 0.0, 0.09);
-        const shadow = clamp01(
-          (cuticleShadow * (1 - smoothFalloff(s, 0.84, 1.0)) + lateralShadow) *
-            outerEdgeFeather *
-            proximalFeather
-        );
-
-        // Warm rosy-brown AO tint (darker in B/G than R so skin shadow never turns muddy gray)
-        const r = Math.round(255 * (1 - shadow * 0.42));
-        const g = Math.round(255 * (1 - shadow * 0.64));
-        const b = Math.round(255 * (1 - shadow * 0.68));
-        const a = Math.round(255 * clamp01(shadow * 1.45));
+        const rawAlpha =
+          cuticleEnvelope * lateralFeather * 0.28 +
+          lateralSulcusEnv * sulcusBand * 0.12;
+        const alpha = clamp(rawAlpha, 0, 0.30);
 
         const idx = (y * size + x) * 4;
-        data[idx] = r;
-        data[idx + 1] = g;
-        data[idx + 2] = b;
-        data[idx + 3] = a;
+        if (alpha <= 0.002) {
+          data[idx] = 0;
+          data[idx + 1] = 0;
+          data[idx + 2] = 0;
+          data[idx + 3] = 0;
+        } else {
+          data[idx] = 36;
+          data[idx + 1] = 15;
+          data[idx + 2] = 11;
+          data[idx + 3] = Math.round(alpha * 255);
+        }
       }
     }
 
@@ -289,7 +476,7 @@ export function createCuticleContactSkirtMaterial(): CuticleSkirtMaterialBundle 
 
   const material = new THREE.MeshBasicMaterial({
     map: texture,
-    blending: THREE.MultiplyBlending,
+    blending: THREE.NormalBlending,
     transparent: true,
     depthWrite: false,
     depthTest: true,

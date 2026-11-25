@@ -3,6 +3,7 @@ import type {
   FingerId,
   NailDesign,
   NailFingerDesignSpec,
+  NailHandSpecsBySide,
   NailShape,
   StudioConfig,
 } from '../types/nail';
@@ -285,6 +286,24 @@ export function apiDesignToLocal(raw: Record<string, unknown>): NailDesign {
     raw.fingerSpecs ?? raw.finger_specs ?? raw.finger_specs_json
   );
 
+  const rawHandSpecs = raw.handSpecsBySide ?? raw.hand_specs_by_side;
+  const handSpecsBySide: NailHandSpecsBySide | undefined =
+    rawHandSpecs && typeof rawHandSpecs === 'object' && !Array.isArray(rawHandSpecs)
+      ? (rawHandSpecs as NailHandSpecsBySide)
+      : undefined;
+
+  const rawFidelity = raw.fidelityScore ?? raw.fidelity_score;
+  const parsedFidelity =
+    typeof rawFidelity === 'number'
+      ? rawFidelity
+      : typeof rawFidelity === 'string' && rawFidelity !== ''
+        ? Number(rawFidelity)
+        : NaN;
+  const fidelityScore =
+    Number.isFinite(parsedFidelity) && parsedFidelity >= 0 && parsedFidelity <= 100
+      ? Math.round(parsedFidelity)
+      : undefined;
+
   const rawIsCustom = raw.isCustomReference ?? raw.isCustom ?? raw.is_custom_reference;
   const isCustom = isStudioCatalog
     ? false
@@ -321,7 +340,9 @@ export function apiDesignToLocal(raw: Record<string, unknown>): NailDesign {
     isStudioCatalog,
     detectedShape,
     detectedLength,
+    fidelityScore,
     fingerSpecs,
+    handSpecsBySide,
     createdAt:
       typeof raw.createdAt === 'string'
         ? raw.createdAt
@@ -351,12 +372,14 @@ export function localDesignToApi(
     imageDataUrl: design.imageDataUrl ?? null,
     defaultScale: 1.0,
     defaultRotation: 0,
-    defaultOpacity: 0.98,
+    defaultOpacity: 1.0,
     isCustomReference,
     isStudioCatalog,
     detectedShape: design.detectedShape ?? null,
     detectedLength: design.detectedLength ?? null,
+    fidelityScore: design.fidelityScore ?? null,
     fingerSpecs: design.fingerSpecs ?? null,
+    handSpecsBySide: design.handSpecsBySide ?? null,
   };
 }
 
@@ -436,6 +459,8 @@ export async function loadNailDesigns(): Promise<{ designs: NailDesign[]; status
               ? {
                   ...mapped,
                   fingerSpecs: mapped.fingerSpecs ?? localMatch.fingerSpecs,
+                  handSpecsBySide: mapped.handSpecsBySide ?? localMatch.handSpecsBySide,
+                  fidelityScore: mapped.fidelityScore ?? localMatch.fidelityScore,
                   detectedShape: mapped.detectedShape ?? localMatch.detectedShape,
                   detectedLength: mapped.detectedLength ?? localMatch.detectedLength,
                   secondaryColor: mapped.secondaryColor ?? localMatch.secondaryColor,
@@ -500,6 +525,8 @@ export async function createNailDesign(
         finish: mapped.finish ?? localItem.finish,
         secondaryColor: mapped.secondaryColor ?? localItem.secondaryColor,
         fingerSpecs: mapped.fingerSpecs ?? localItem.fingerSpecs,
+        handSpecsBySide: mapped.handSpecsBySide ?? localItem.handSpecsBySide,
+        fidelityScore: mapped.fidelityScore ?? localItem.fidelityScore,
         detectedShape: mapped.detectedShape ?? localItem.detectedShape,
         detectedLength: mapped.detectedLength ?? localItem.detectedLength,
         isStudioCatalog: mapped.isStudioCatalog ?? localItem.isStudioCatalog,

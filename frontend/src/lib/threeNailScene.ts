@@ -9,17 +9,25 @@ import {
   projectHandToPerspectiveMeters,
 } from './handKinematics';
 import {
-  type NailProfileStations,
+  type VolumetricNailGeometryOptions,
+  createClearDropGeometry,
   createCuticleContactSkirtGeometry,
+  createMetalStudGeometry,
+  createPearlDomeGeometry,
+  createRhinestoneGeometry,
   createVolumetricNailGeometry,
   evalNailHalfWidth,
+  evaluateNailSurfacePointAndNormal,
 } from './nail3DGeometry';
 import type { ImageLayoutRect } from './nailRenderer';
 import {
+  type Accessory3DMaterialSet,
   type CuticleSkirtMaterialBundle,
   type DirectionalAmbientLightSample,
   type UndersideMaterialBundle,
   applyDorsalMaterialOpacity,
+  applyFinishTypeToDorsalMaterial,
+  createAccessory3DMaterials,
   createCuticleContactSkirtMaterial,
   createDorsalNailMaterial,
   createStudioRoomEnvMap,
@@ -56,6 +64,7 @@ const PERSPECTIVE_FAR = 10.0;
  */
 const PHALANX_INSTANCE_COUNT = ORDERED_FINGERS.length * 3; // 15
 const JOINT_INSTANCE_COUNT = ORDERED_FINGERS.length * 4; // 20
+const MAX_ACCESSORY_INSTANCES = 60;
 
 /**
  * 7-point perimeter polygon for the volumetric closed palm/metacarpal occluder:
@@ -94,15 +103,14 @@ interface FingerRig {
 }
 
 /**
- * Three.js V10 Photorealistic Volumetric AR 3D Nail Scene Engine (60fps Mobile Radical Fast-Path):
+ * Three.js V11 Photorealistic Volumetric AR 3D Nail Scene Engine (60fps Mobile Radical Fast-Path):
  * - `preserveDrawingBuffer: false` + mobile DPR cap `<= 1.25` (desktop `<= 1.5`) + `renderNow()` on capture
- * - Entire volumetric hand occluder collapsed from 36 meshes into **3 draw calls**:
+ * - Entire volumetric hand occluder collapsed into **3 draw calls**:
  *   1× `InstancedMesh` (15 phalanges) + 1× `InstancedMesh` (20 joints/pulps) + 1× closed `palmOccluderMesh`
- *   (Total <= 13 draw calls/frame across the entire hand: 3 occluders + 5 nails + 5 skirts)
+ * - Up to 4 instanced 3D accessory pools (`metalStud`, `pearl`, `rhinestone`, `clearDrop`, `renderOrder = 3`)
+ *   anchored mathematically on the curved dorsal surface via `evaluateNailSurfacePointAndNormal`
+ * - Supports 5-finger or 10-finger (`Left` / `Right` via `handSpecsBySide`) sets seamlessly
  * - ZERO `bumpMap` / `displacementMap` / `displacementScale`, opaque dorsal fast-path when `opacity >= 0.99`
- * - Client-native anatomical fit: `nailWidthMeters` driven strictly by `computeFingerMetricDimensions`
- *   (never overridden by reference `relativeWidth`), dynamic `bedFraction = 1 / (1 + effectiveFreeEdge)`,
- *   and PCHIP `profileHalfWidths[8]` silhouettes anchored tightly on `lerp(DIP, TIP, 0.20)`
  */
 export class ThreeNailScene {
   private renderer: THREE.WebGLRenderer | null = null;
@@ -120,7 +128,7 @@ export class ThreeNailScene {
     () => new THREE.Vector3()
   );
 
-  // Cached geometries outside RAF (keyed by shape + tipRoundness + quantized bedFraction + profileHalfWidths)
+  // Cached geometries outside RAF (keyed by shape + tipRoundness + quantized bedFraction/cCurve/apex)
   private nailGeometries = new Map<string, THREE.BufferGeometry>();
   private skirtGeometries = new Map<string, THREE.BufferGeometry>();
 
@@ -138,11 +146,23 @@ export class ThreeNailScene {
   private palmPositionAttr: THREE.BufferAttribute;
   private palmOccluderMesh: THREE.Mesh;
 
+  // V11 Pre-allocated InstancedMesh pools for true 3D nail accessories (max +4 draw calls)
+  private accessoryMaterials: Accessory3DMaterialSet;
+  private metalStudGeo: THREE.BufferGeometry;
+  private pearlDomeGeo: THREE.BufferGeometry;
+  private rhinestoneGeo: THREE.BufferGeometry;
+  private clearDropGeo: THREE.BufferGeometry;
+  private metalStudInstancedMesh: THREE.InstancedMesh;
+  private pearlInstancedMesh: THREE.InstancedMesh;
+  private rhinestoneInstancedMesh: THREE.InstancedMesh;
+  private clearDropInstancedMesh: THREE.InstancedMesh;
+
   private fingerRigs = new Map<FingerId, FingerRig>();
   private ready = false;
 
   // Design & PBR bundle cache — zero texture synthesis inside RAF
   private lastDesignRef: NailDesign | null = null;
+  private lastActiveHandSide: 'Left' | 'Right' = 'Right';
   private activeDesignKey = '';
   private cachedFingerSpecs: Record<FingerId, NailFingerDesignSpec> | null = null;
   private cachedPBRBundles = new Map<FingerId, ProceduralPBRBundle>();
@@ -165,12 +185,25 @@ export class ThreeNailScene {
   private tmpRodCenter = new THREE.Vector3();
   private tmpRodQuat = new THREE.Quaternion();
   private tmpUpY = new THREE.Vector3(0, 1, 0);
+  private tmpUnitZ = new THREE.Vector3(0, 0, 1);
   private tmpPulpPos = new THREE.Vector3();
   private tmpPalmEdgeA = new THREE.Vector3();
   private tmpPalmEdgeB = new THREE.Vector3();
   private tmpPalmNormal = new THREE.Vector3();
   private tmpPalmCenter = new THREE.Vector3();
   private tmpPalmCross = new THREE.Vector3();
+
+  // Reusable scratch objects for 3D accessory surface anchoring
+  private tmpSurfaceEval = {
+    position: new THREE.Vector3(),
+    normal: new THREE.Vector3(),
+  };
+  private tmpSurfaceOpts: VolumetricNailGeometryOptions = {};
+  private tmpAccWorldPos = new THREE.Vector3();
+  private tmpAccWorldNormal = new THREE.Vector3();
+  private tmpAccQuat = new THREE.Quaternion();
+  private tmpAccScale = new THREE.Vector3();
+  private tmpAccColor = new THREE.Color(0xffffff);
 
   constructor(canvas: HTMLCanvasElement) {
     this.scene = new THREE.Scene();
@@ -271,6 +304,51 @@ export class ThreeNailScene {
     this.palmOccluderMesh.visible = false;
     this.scene.add(this.palmOccluderMesh);
 
+    // V11 3D Accessory Geometries & Material Set (initialized before renderer try/catch; envMap assigned once ready)
+    this.metalStudGeo = createMetalStudGeometry();
+    this.pearlDomeGeo = createPearlDomeGeometry();
+    this.rhinestoneGeo = createRhinestoneGeometry();
+    this.clearDropGeo = createClearDropGeometry();
+    this.accessoryMaterials = createAccessory3DMaterials(null);
+
+    const initAccessoryInstancedMesh = (
+      geo: THREE.BufferGeometry,
+      mat: THREE.MeshPhysicalMaterial
+    ): THREE.InstancedMesh => {
+      const mesh = new THREE.InstancedMesh(geo, mat, MAX_ACCESSORY_INSTANCES);
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      mesh.count = 0;
+      mesh.renderOrder = 3;
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      // Pre-allocate instanceColor buffer outside RAF
+      for (let i = 0; i < MAX_ACCESSORY_INSTANCES; i++) {
+        mesh.setColorAt(i, this.tmpAccColor);
+      }
+      if (mesh.instanceColor) {
+        mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+      }
+      this.scene.add(mesh);
+      return mesh;
+    };
+
+    this.metalStudInstancedMesh = initAccessoryInstancedMesh(
+      this.metalStudGeo,
+      this.accessoryMaterials.metalStud
+    );
+    this.pearlInstancedMesh = initAccessoryInstancedMesh(
+      this.pearlDomeGeo,
+      this.accessoryMaterials.pearl
+    );
+    this.rhinestoneInstancedMesh = initAccessoryInstancedMesh(
+      this.rhinestoneGeo,
+      this.accessoryMaterials.rhinestone
+    );
+    this.clearDropInstancedMesh = initAccessoryInstancedMesh(
+      this.clearDropGeo,
+      this.accessoryMaterials.clearDrop
+    );
+
     this.resetOccluderInstances();
 
     try {
@@ -292,6 +370,15 @@ export class ThreeNailScene {
 
       this.envMap = createStudioRoomEnvMap(renderer);
       this.scene.environment = this.envMap;
+
+      this.accessoryMaterials.metalStud.envMap = this.envMap;
+      this.accessoryMaterials.metalStud.needsUpdate = true;
+      this.accessoryMaterials.pearl.envMap = this.envMap;
+      this.accessoryMaterials.pearl.needsUpdate = true;
+      this.accessoryMaterials.rhinestone.envMap = this.envMap;
+      this.accessoryMaterials.rhinestone.needsUpdate = true;
+      this.accessoryMaterials.clearDrop.envMap = this.envMap;
+      this.accessoryMaterials.clearDrop.needsUpdate = true;
 
       const defaultBedFraction = 0.68;
       const defaultNailGeo = this.getOrCreateNailGeometry('almond', defaultBedFraction, 0.5);
@@ -358,23 +445,25 @@ export class ThreeNailScene {
     shape: NailShape,
     bedFraction: number,
     tipRoundness?: number,
-    profileHalfWidths?: NailProfileStations
+    cCurveDepth?: number,
+    apexHeight?: number
   ): THREE.BufferGeometry {
     const quantizedBed = clamp(quantizeStep(bedFraction, 0.02), 0.44, 0.90);
     const roundedQ =
       tipRoundness !== undefined ? clamp(quantizeStep(tipRoundness, 0.05), 0, 1) : 0.5;
-    const profileKey =
-      profileHalfWidths && profileHalfWidths.length === 8
-        ? profileHalfWidths.map((v) => v.toFixed(2)).join(',')
-        : 'std';
-    const key = `${shape}:${quantizedBed.toFixed(2)}:${roundedQ.toFixed(2)}:${profileKey}`;
+    const cCurveQ =
+      cCurveDepth !== undefined ? clamp(quantizeStep(cCurveDepth, 0.01), 0.16, 0.28) : 0.22;
+    const apexQ =
+      apexHeight !== undefined ? clamp(quantizeStep(apexHeight, 0.005), 0.06, 0.11) : 0.085;
+    const key = `${shape}:${quantizedBed.toFixed(2)}:${roundedQ.toFixed(2)}:${cCurveQ.toFixed(2)}:${apexQ.toFixed(3)}`;
 
     let geo = this.nailGeometries.get(key);
     if (!geo) {
       geo = createVolumetricNailGeometry(shape, {
         tipRoundness: roundedQ,
         bedFraction: quantizedBed,
-        profileHalfWidths,
+        cCurveDepth: cCurveQ,
+        apexHeight: apexQ,
       });
       this.nailGeometries.set(key, geo);
     }
@@ -383,13 +472,17 @@ export class ThreeNailScene {
 
   private getOrCreateSkirtGeometry(
     shape: NailShape,
-    bedFraction: number
+    bedFraction: number,
+    cCurveDepth = 0.22,
+    apexHeight = 0.085
   ): THREE.BufferGeometry {
     const quantizedBed = clamp(quantizeStep(bedFraction, 0.02), 0.44, 0.90);
-    const key = `${shape}:${quantizedBed.toFixed(2)}`;
+    const cCurveQ = clamp(quantizeStep(cCurveDepth, 0.01), 0.16, 0.28);
+    const apexQ = clamp(quantizeStep(apexHeight, 0.005), 0.06, 0.11);
+    const key = `${shape}:${quantizedBed.toFixed(2)}:${cCurveQ.toFixed(2)}:${apexQ.toFixed(3)}`;
     let geo = this.skirtGeometries.get(key);
     if (!geo) {
-      geo = createCuticleContactSkirtGeometry(shape, quantizedBed);
+      geo = createCuticleContactSkirtGeometry(shape, quantizedBed, cCurveQ, apexQ);
       this.skirtGeometries.set(key, geo);
     }
     return geo;
@@ -430,6 +523,17 @@ export class ThreeNailScene {
     this.jointInstancedMesh.instanceMatrix.needsUpdate = true;
   }
 
+  private hideAccessories(): void {
+    this.metalStudInstancedMesh.count = 0;
+    this.metalStudInstancedMesh.visible = false;
+    this.pearlInstancedMesh.count = 0;
+    this.pearlInstancedMesh.visible = false;
+    this.rhinestoneInstancedMesh.count = 0;
+    this.rhinestoneInstancedMesh.visible = false;
+    this.clearDropInstancedMesh.count = 0;
+    this.clearDropInstancedMesh.visible = false;
+  }
+
   private hideRig(rig: FingerRig): void {
     rig.nailMesh.visible = false;
     rig.cuticleSkirtMesh.visible = false;
@@ -450,6 +554,7 @@ export class ThreeNailScene {
     this.palmOccluderMesh.visible = false;
     this.phalanxInstancedMesh.visible = false;
     this.jointInstancedMesh.visible = false;
+    this.hideAccessories();
     for (const rig of this.fingerRigs.values()) {
       rig.nailMesh.visible = false;
       rig.cuticleSkirtMesh.visible = false;
@@ -464,33 +569,52 @@ export class ThreeNailScene {
     this.renderer.clear();
   }
 
-  private computeDesignKey(design: NailDesign): string {
+  private resolveActiveFingerSpecMap(
+    design: NailDesign,
+    handedness: 'Left' | 'Right'
+  ): Record<FingerId, NailFingerDesignSpec> {
+    const sideSpecs = design.handSpecsBySide?.[handedness];
+    if (sideSpecs) {
+      const mergedDesign: NailDesign = {
+        ...design,
+        fingerSpecs: sideSpecs,
+      };
+      return buildFingerSpecsFromStudioDesign(mergedDesign);
+    }
+    return buildFingerSpecsFromStudioDesign(design);
+  }
+
+  private computeDesignKey(design: NailDesign, activeHandSide: 'Left' | 'Right'): string {
+    const sideSpecs = design.handSpecsBySide?.[activeHandSide];
+    const resolvedSpecs = sideSpecs ?? design.fingerSpecs;
     let fingerSpecsPart = '';
-    if (design.fingerSpecs) {
-      const specs = design.fingerSpecs;
+    if (resolvedSpecs) {
       fingerSpecsPart = ORDERED_FINGERS.map((id) => {
-        const s = specs[id];
+        const s = resolvedSpecs[id];
         if (!s) return '';
-        return `${id}:${s.shape}:${(s.freeEdgeRatio ?? 0).toFixed(2)}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}`;
+        const mSpec = s.manufacturingSpec;
+        const mSig = mSpec
+          ? `:${mSpec.finishType}:${mSpec.trueBaseColorHex}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.cCurveDepth.toFixed(2)}:${mSpec.apexHeight.toFixed(3)}:${mSpec.strokes3D.length}:${mSpec.accessories3D.length}`
+          : '';
+        return `${id}:${s.shape}:${(s.freeEdgeRatio ?? 0).toFixed(2)}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}${mSig}`;
       }).join('~');
     }
-    return `${design.id}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ? design.imageDataUrl.length : 0}|${fingerSpecsPart}`;
+    const sideKey = design.handSpecsBySide ? activeHandSide : 'any';
+    return `${design.id}|${sideKey}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ? design.imageDataUrl.length : 0}|${fingerSpecsPart}`;
   }
 
   private paintMetallicOutlineOnBundle(
     bundle: ProceduralPBRBundle,
     shape: NailShape,
     outlineColor: string,
-    bedFraction: number,
-    profileHalfWidths?: NailProfileStations
+    bedFraction: number
   ): void {
     const traceSilhouette = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
       const steps = 40;
       ctx.beginPath();
       for (let i = 0; i <= steps; i++) {
         const v = 0.05 + (i / steps) * 0.935;
-        const hw =
-          evalNailHalfWidth(v, shape, { bedFraction, profileHalfWidths }) * 0.91;
+        const hw = evalNailHalfWidth(v, shape, { bedFraction }) * 0.91;
         const u = 0.5 - hw * 0.96;
         const x = u * w;
         const y = (1 - v) * h;
@@ -499,8 +623,7 @@ export class ThreeNailScene {
       }
       for (let i = steps; i >= 0; i--) {
         const v = 0.05 + (i / steps) * 0.935;
-        const hw =
-          evalNailHalfWidth(v, shape, { bedFraction, profileHalfWidths }) * 0.91;
+        const hw = evalNailHalfWidth(v, shape, { bedFraction }) * 0.91;
         const u = 0.5 + hw * 0.96;
         const x = u * w;
         const y = (1 - v) * h;
@@ -565,19 +688,35 @@ export class ThreeNailScene {
     }
   }
 
-  private ensureDesignPBRCache(design: NailDesign): void {
-    if (design === this.lastDesignRef && this.cachedFingerSpecs) {
+  private ensureDesignPBRCache(
+    design: NailDesign,
+    activeHandSide: 'Left' | 'Right'
+  ): void {
+    const hasSideMap = Boolean(design.handSpecsBySide);
+    if (
+      design === this.lastDesignRef &&
+      this.cachedFingerSpecs &&
+      (!hasSideMap || activeHandSide === this.lastActiveHandSide)
+    ) {
       return;
     }
-    const key = this.computeDesignKey(design);
-    if (key === this.activeDesignKey && this.cachedFingerSpecs) {
+
+    const key = this.computeDesignKey(design, activeHandSide);
+    if (
+      key === this.activeDesignKey &&
+      this.cachedFingerSpecs &&
+      (!hasSideMap || activeHandSide === this.lastActiveHandSide)
+    ) {
       this.lastDesignRef = design;
+      this.lastActiveHandSide = activeHandSide;
       return;
     }
 
     this.lastDesignRef = design;
+    this.lastActiveHandSide = activeHandSide;
     this.activeDesignKey = key;
-    const specs = buildFingerSpecsFromStudioDesign(design);
+
+    const specs = this.resolveActiveFingerSpecMap(design, activeHandSide);
     this.cachedFingerSpecs = specs;
     this.cachedPBRBundles.clear();
 
@@ -585,9 +724,10 @@ export class ThreeNailScene {
       const spec = specs[id];
       const bundle = synthesizeProceduralPBRBundle(spec);
 
-      if (spec.hasMetallicOutline && spec.outlineColor && !spec.blueprint) {
+      if (spec.hasMetallicOutline && spec.outlineColor && !spec.blueprint && !spec.manufacturingSpec) {
         const freeEdge = clamp(
-          spec.freeEdgeRatio ?? Math.max(0.15, (spec.lengthMultiplier ?? spec.relativeLength ?? 1.35) - 1.0),
+          spec.freeEdgeRatio ??
+            Math.max(0.15, (spec.lengthMultiplier ?? spec.relativeLength ?? 1.35) - 1.0),
           0.12,
           1.15
         );
@@ -605,42 +745,72 @@ export class ThreeNailScene {
       const rig = this.fingerRigs.get(id);
       if (!rig) continue;
 
-      if (rig.currentSpecHash !== bundle.specHash) {
+      const mSpec = spec.manufacturingSpec;
+      const mSig = mSpec
+        ? `|m11:${mSpec.finishType}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.clearcoat.toFixed(2)}:${mSpec.strokes3D.length}`
+        : '';
+      const fullRigHash = `${bundle.specHash}${mSig}`;
+
+      if (rig.currentSpecHash !== fullRigHash) {
         rig.dorsalMaterial.map = bundle.map;
         rig.dorsalMaterial.normalMap = bundle.normalMap;
         rig.dorsalMaterial.roughnessMap = bundle.roughnessMap;
         rig.dorsalMaterial.metalnessMap = bundle.metalnessMap;
         rig.dorsalMaterial.alphaMap = bundle.alphaMap;
 
-        const isRelief =
-          Boolean(spec.has3DRelief) ||
-          spec.pattern === 'gold_3d_waves' ||
-          spec.pattern === 'floral_accent' ||
-          Boolean(spec.hasMetallicOutline);
-        const isChrome =
-          spec.pattern === 'chrome_mirror' || spec.finishStyle === 'chrome_mirror';
-        const isVelvet =
-          spec.finishStyle === 'velvet_matte' ||
-          (!spec.finishStyle && spec.glossIntensity < 0.65);
+        if (mSpec) {
+          applyFinishTypeToDorsalMaterial(rig.dorsalMaterial, mSpec.finishType, {
+            metalness: mSpec.metalness,
+            roughness: mSpec.roughness,
+            clearcoat: mSpec.clearcoat,
+          });
+          const hasReliefStrokes =
+            mSpec.strokes3D.some((st) => st.reliefHeight > 0.05) || mSpec.borderIs3DRaised;
+          if (mSpec.finishType === 'mirror_chrome') {
+            const chromeNormal = hasReliefStrokes ? 1.1 : 0.35;
+            rig.dorsalMaterial.normalScale.set(chromeNormal, chromeNormal);
+          } else {
+            const nScale = hasReliefStrokes ? 1.35 : 0.95;
+            rig.dorsalMaterial.normalScale.set(nScale, nScale);
+          }
+          rig.dorsalMaterial.needsUpdate = true;
+        } else {
+          const isRelief =
+            Boolean(spec.has3DRelief) ||
+            spec.pattern === 'gold_3d_waves' ||
+            spec.pattern === 'floral_accent' ||
+            Boolean(spec.hasMetallicOutline);
+          const isChrome =
+            spec.pattern === 'chrome_mirror' || spec.finishStyle === 'chrome_mirror';
+          const isVelvet =
+            spec.finishStyle === 'velvet_matte' ||
+            (!spec.finishStyle && spec.glossIntensity < 0.65);
 
-        const nScale = isRelief ? 1.45 : isChrome ? 0.85 : 1.05;
-        rig.dorsalMaterial.normalScale.set(nScale, nScale);
-        rig.dorsalMaterial.clearcoat = isVelvet ? 0.42 : 1.0;
-        rig.dorsalMaterial.clearcoatRoughness = isVelvet
-          ? 0.34
-          : isChrome
-            ? 0.025
-            : 0.035;
-        rig.dorsalMaterial.envMapIntensity = isChrome
-          ? 1.9
-          : isVelvet
-            ? 0.9
-            : 1.45;
-        rig.dorsalMaterial.needsUpdate = true;
-        rig.currentSpecHash = bundle.specHash;
+          const nScale = isRelief ? 1.45 : isChrome ? 0.35 : 1.05;
+          rig.dorsalMaterial.normalScale.set(nScale, nScale);
+          rig.dorsalMaterial.metalness = 1.0;
+          rig.dorsalMaterial.roughness = 1.0;
+          rig.dorsalMaterial.iridescence = spec.finishStyle === 'pearl_glazed' ? 0.55 : 0.0;
+          rig.dorsalMaterial.clearcoat = isVelvet ? 0.42 : 1.0;
+          rig.dorsalMaterial.clearcoatRoughness = isVelvet
+            ? 0.34
+            : isChrome
+              ? 0.02
+              : 0.035;
+          rig.dorsalMaterial.envMapIntensity = isChrome
+            ? 2.25
+            : isVelvet
+              ? 0.9
+              : 1.5;
+          rig.dorsalMaterial.needsUpdate = true;
+        }
+
+        rig.currentSpecHash = fullRigHash;
       }
 
-      updateUndersideMaterialTint(rig.undersideBundle, spec.baseColor || '#E6D5C8');
+      const undersideBase =
+        mSpec?.trueBaseColorHex || spec.baseColor || '#E6D5C8';
+      updateUndersideMaterialTint(rig.undersideBundle, undersideBase);
     }
   }
 
@@ -762,6 +932,17 @@ export class ThreeNailScene {
     this.palmOccluderMesh.visible = true;
   }
 
+  private finalizeAccessoryMesh(mesh: THREE.InstancedMesh, count: number): void {
+    mesh.count = count;
+    mesh.visible = count > 0;
+    if (count > 0) {
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) {
+        mesh.instanceColor.needsUpdate = true;
+      }
+    }
+  }
+
   public renderHandFrame(
     cssW: number,
     cssH: number,
@@ -809,8 +990,8 @@ export class ThreeNailScene {
     const points3D = projection.points3D;
     const focalPx = projection.focalPx;
 
-    // 3. Cached off-RAF PBR texture synthesis & material binding
-    this.ensureDesignPBRCache(design);
+    // 3. Cached off-RAF PBR texture synthesis & material binding (supports 5 or 10 fingers by handedness)
+    this.ensureDesignPBRCache(design, filtered.handedness);
 
     // 4. Directional Room Lighting & Adaptive Skin-Tone Fill
     const lumExposure = clamp(0.74 + ambient.luma * 0.78, 0.72, 1.32);
@@ -844,7 +1025,12 @@ export class ThreeNailScene {
     let refPalmThicknessMeters = 0.022;
     let visibleFingers = 0;
 
-    // 5. Per-finger independent anatomical basis, real client metrics, nail + skirt + instanced occluders
+    let metalCount = 0;
+    let pearlCount = 0;
+    let rhinestoneCount = 0;
+    let clearDropCount = 0;
+
+    // 5. Per-finger independent anatomical basis, real client metrics, nail + skirt + occluders + 3D accessories
     for (const fingerId of ORDERED_FINGERS) {
       const rig = this.fingerRigs.get(fingerId);
       if (!rig) continue;
@@ -862,19 +1048,26 @@ export class ThreeNailScene {
 
       visibleFingers += 1;
 
-      const spec = this.cachedFingerSpecs?.[fingerId];
+      const sideSpec =
+        design.handSpecsBySide?.[filtered.handedness]?.[fingerId] ??
+        design.fingerSpecs?.[fingerId];
+      const spec = sideSpec ?? this.cachedFingerSpecs?.[fingerId];
+      const mSpec = spec?.manufacturingSpec;
+
       const designPrimaryShape =
-        design.detectedShape ?? this.cachedFingerSpecs?.middle?.shape ?? spec?.shape;
+        design.detectedShape ??
+        this.cachedFingerSpecs?.middle?.shape ??
+        mSpec?.shape ??
+        spec?.shape;
       const userOverrodeShape =
         designPrimaryShape !== undefined && adjustment.shape !== designPrimaryShape;
       const activeShape: NailShape = userOverrodeShape
         ? adjustment.shape
-        : spec?.shape ?? adjustment.shape;
-      const tipRoundness = spec?.blueprint?.geometry.tipRoundness ?? spec?.tipRoundness;
-      const profileHalfWidths =
-        !userOverrodeShape && spec?.blueprint?.geometry.shape === activeShape
-          ? spec?.blueprint?.geometry.profileHalfWidths
-          : undefined;
+        : mSpec?.shape ?? spec?.shape ?? adjustment.shape;
+      const tipRoundness =
+        mSpec?.tipRoundness ?? spec?.blueprint?.geometry.tipRoundness ?? spec?.tipRoundness;
+      const cCurveDepth = clamp(mSpec?.cCurveDepth ?? 0.22, 0.16, 0.28);
+      const apexHeight = clamp(mSpec?.apexHeight ?? 0.085, 0.06, 0.11);
 
       // Client-native real metric dimensions (live camera scanline calibration prioritized)
       const dims = computeFingerMetricDimensions(fingerId, filtered.worldLandmarks, {
@@ -892,6 +1085,7 @@ export class ThreeNailScene {
 
       // Real nail bed (v <= bedFraction) + proportional reference free-edge extension
       const rawBaseFreeEdge =
+        mSpec?.freeEdgeRatio ??
         spec?.blueprint?.geometry.freeEdgeRatio ??
         spec?.freeEdgeRatio ??
         Math.max(0.15, (spec?.lengthMultiplier ?? spec?.relativeLength ?? 1.35) - 1.0);
@@ -902,18 +1096,24 @@ export class ThreeNailScene {
       const bedFraction = clamp(1 / (1 + effectiveFreeEdge), 0.44, 0.90);
       const quantizedBedFraction = clamp(quantizeStep(bedFraction, 0.02), 0.44, 0.90);
 
-      // Cached per-finger parametric geometry & conformal cuticle contact skirt
+      // Cached per-finger clean parametric geometry & conformal cuticle contact skirt
       const nailGeo = this.getOrCreateNailGeometry(
         activeShape,
         quantizedBedFraction,
         tipRoundness,
-        profileHalfWidths
+        cCurveDepth,
+        apexHeight
       );
       if (rig.nailMesh.geometry !== nailGeo) {
         rig.nailMesh.geometry = nailGeo;
       }
 
-      const skirtGeo = this.getOrCreateSkirtGeometry(activeShape, quantizedBedFraction);
+      const skirtGeo = this.getOrCreateSkirtGeometry(
+        activeShape,
+        quantizedBedFraction,
+        cCurveDepth,
+        apexHeight
+      );
       if (rig.cuticleSkirtMesh.geometry !== skirtGeo) {
         rig.cuticleSkirtMesh.geometry = skirtGeo;
       }
@@ -953,6 +1153,99 @@ export class ThreeNailScene {
       rig.nailMesh.quaternion.copy(this.tmpNailQuat);
       rig.nailMesh.scale.set(nailWMeters, totalLenMeters, nailDepthMeters);
       rig.nailMesh.visible = true;
+      rig.nailMesh.updateMatrixWorld();
+
+      // Anchor true 3D geometric accessories (studs, caviar, pearls, rhinestones, drops) onto curved plate
+      const accessories = mSpec?.accessories3D;
+      if (accessories && accessories.length > 0 && adjustment.opacity > 0.25) {
+        this.tmpSurfaceOpts.bedFraction = quantizedBedFraction;
+        this.tmpSurfaceOpts.tipRoundness = tipRoundness;
+        this.tmpSurfaceOpts.cCurveDepth = cCurveDepth;
+        this.tmpSurfaceOpts.apexHeight = apexHeight;
+
+        const invScaleX = 1 / Math.max(1e-6, nailWMeters);
+        const invScaleY = 1 / Math.max(1e-6, totalLenMeters);
+        const invScaleZ = 1 / Math.max(1e-6, nailDepthMeters);
+
+        for (let aIdx = 0; aIdx < accessories.length; aIdx++) {
+          const acc = accessories[aIdx];
+          evaluateNailSurfacePointAndNormal(
+            acc.u,
+            acc.v,
+            activeShape,
+            this.tmpSurfaceOpts,
+            this.tmpSurfaceEval
+          );
+
+          // Local -> World position using nailMesh world matrix
+          this.tmpAccWorldPos
+            .copy(this.tmpSurfaceEval.position)
+            .applyMatrix4(rig.nailMesh.matrixWorld);
+
+          // Local surface normal -> World unit normal: normalize(nLocal * invScale) rotated by nailMesh.quaternion
+          this.tmpAccWorldNormal
+            .set(
+              this.tmpSurfaceEval.normal.x * invScaleX,
+              this.tmpSurfaceEval.normal.y * invScaleY,
+              this.tmpSurfaceEval.normal.z * invScaleZ
+            )
+            .normalize()
+            .applyQuaternion(rig.nailMesh.quaternion)
+            .normalize();
+
+          const rWorld = clamp(
+            acc.radiusNorm * nailWMeters * 0.5,
+            0.00035,
+            nailWMeters * 0.24
+          );
+          const heightFactor = acc.kind === 'metal_stud_flat' ? 0.55 : acc.heightRatio * 1.4;
+          const hWorld = rWorld * heightFactor;
+
+          // Seat slightly embedded (0.22 * hWorld) along surface normal so zero gaps/floating occur
+          this.tmpAccWorldPos.addScaledVector(this.tmpAccWorldNormal, hWorld * 0.22);
+          this.tmpAccQuat.setFromUnitVectors(this.tmpUnitZ, this.tmpAccWorldNormal);
+          this.tmpAccScale.set(rWorld, rWorld, hWorld);
+          this.tmpInstanceMatrix.compose(
+            this.tmpAccWorldPos,
+            this.tmpAccQuat,
+            this.tmpAccScale
+          );
+          this.tmpAccColor.set(acc.colorHex || '#FFFFFF');
+
+          if (
+            acc.kind === 'metal_stud_sphere' ||
+            acc.kind === 'metal_stud_flat' ||
+            acc.kind === 'caviar_bead'
+          ) {
+            if (metalCount < MAX_ACCESSORY_INSTANCES) {
+              this.metalStudInstancedMesh.setMatrixAt(metalCount, this.tmpInstanceMatrix);
+              this.metalStudInstancedMesh.setColorAt(metalCount, this.tmpAccColor);
+              metalCount += 1;
+            }
+          } else if (acc.kind === 'pearl_dome') {
+            if (pearlCount < MAX_ACCESSORY_INSTANCES) {
+              this.pearlInstancedMesh.setMatrixAt(pearlCount, this.tmpInstanceMatrix);
+              this.pearlInstancedMesh.setColorAt(pearlCount, this.tmpAccColor);
+              pearlCount += 1;
+            }
+          } else if (acc.kind === 'rhinestone') {
+            if (rhinestoneCount < MAX_ACCESSORY_INSTANCES) {
+              this.rhinestoneInstancedMesh.setMatrixAt(
+                rhinestoneCount,
+                this.tmpInstanceMatrix
+              );
+              this.rhinestoneInstancedMesh.setColorAt(rhinestoneCount, this.tmpAccColor);
+              rhinestoneCount += 1;
+            }
+          } else if (acc.kind === '3d_drop_clear') {
+            if (clearDropCount < MAX_ACCESSORY_INSTANCES) {
+              this.clearDropInstancedMesh.setMatrixAt(clearDropCount, this.tmpInstanceMatrix);
+              this.clearDropInstancedMesh.setColorAt(clearDropCount, this.tmpAccColor);
+              clearDropCount += 1;
+            }
+          }
+        }
+      }
 
       // Conformal Cuticle & Lateral Sulcus AO Contact Skirt aligned 1:1 with nail plate
       const skirtOpacity = clamp((this.tmpAxisZ.z + 0.05) / 0.25, 0, 1);
@@ -988,6 +1281,11 @@ export class ThreeNailScene {
       this.setJointInstance(jBase + 3, this.tmpPulpPos, distalRadius * 0.96);
     }
 
+    this.finalizeAccessoryMesh(this.metalStudInstancedMesh, metalCount);
+    this.finalizeAccessoryMesh(this.pearlInstancedMesh, pearlCount);
+    this.finalizeAccessoryMesh(this.rhinestoneInstancedMesh, rhinestoneCount);
+    this.finalizeAccessoryMesh(this.clearDropInstancedMesh, clearDropCount);
+
     const hasVisibleFingers = visibleFingers > 0;
     this.phalanxInstancedMesh.visible = hasVisibleFingers;
     this.jointInstancedMesh.visible = hasVisibleFingers;
@@ -1016,6 +1314,16 @@ export class ThreeNailScene {
       rig.undersideBundle.dispose();
     }
     this.fingerRigs.clear();
+
+    this.metalStudInstancedMesh.dispose();
+    this.pearlInstancedMesh.dispose();
+    this.rhinestoneInstancedMesh.dispose();
+    this.clearDropInstancedMesh.dispose();
+    this.metalStudGeo.dispose();
+    this.pearlDomeGeo.dispose();
+    this.rhinestoneGeo.dispose();
+    this.clearDropGeo.dispose();
+    this.accessoryMaterials.dispose();
 
     this.phalanxInstancedMesh.dispose();
     this.jointInstancedMesh.dispose();
