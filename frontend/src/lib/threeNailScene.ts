@@ -758,7 +758,20 @@ export class ThreeNailScene {
         rig.dorsalMaterial.metalnessMap = bundle.metalnessMap;
         rig.dorsalMaterial.alphaMap = bundle.alphaMap;
 
-        if (mSpec) {
+        if (spec.trueUvDataUrl) {
+          rig.dorsalMaterial.metalness = 1.0;
+          rig.dorsalMaterial.roughness = 1.0;
+          rig.dorsalMaterial.clearcoat = 1.0;
+          rig.dorsalMaterial.clearcoatRoughness = 0.03;
+          rig.dorsalMaterial.iridescence = 0.12;
+          rig.dorsalMaterial.envMapIntensity = 1.9;
+          rig.dorsalMaterial.normalScale.set(1.15, 1.15);
+          rig.dorsalMaterial.transparent = true;
+          rig.dorsalMaterial.alphaTest = 0;
+          rig.dorsalMaterial.premultipliedAlpha = false;
+          rig.dorsalMaterial.depthWrite = true;
+          rig.dorsalMaterial.needsUpdate = true;
+        } else if (mSpec) {
           applyFinishTypeToDorsalMaterial(rig.dorsalMaterial, mSpec.finishType, {
             metalness: mSpec.metalness,
             roughness: mSpec.roughness,
@@ -1023,6 +1036,7 @@ export class ThreeNailScene {
     const undersideTransparent = undersideOpacity < 0.99;
 
     let refPalmThicknessMeters = 0.022;
+    let middleWidthMeters = 0.0125;
     let visibleFingers = 0;
 
     let metalCount = 0;
@@ -1077,10 +1091,19 @@ export class ThreeNailScene {
       });
       if (fingerId === 'middle') {
         refPalmThicknessMeters = dims.palmThicknessMeters;
+        middleWidthMeters = dims.nailWidthMeters;
       }
 
+      // V12 Pinky anti-collapse floor: guarantees all 5 fingers stay stable & well-proportioned
+      const safeNailWidthMeters =
+        fingerId === 'pinky'
+          ? Math.max(dims.nailWidthMeters, Math.max(0.0082, middleWidthMeters * 0.68))
+          : dims.nailWidthMeters;
+      const safeBedLengthMeters =
+        fingerId === 'pinky' ? Math.max(dims.bedLengthMeters, 0.0078) : dims.bedLengthMeters;
+
       // Client owns 100% of nail width; reference `relativeWidth` NEVER overrides client finger width
-      const nailWMeters = dims.nailWidthMeters * fineWidthMult;
+      const nailWMeters = safeNailWidthMeters * fineWidthMult;
       const nailDepthMeters = nailWMeters;
 
       // Real nail bed (v <= bedFraction) + proportional reference free-edge extension
@@ -1092,7 +1115,7 @@ export class ThreeNailScene {
       const baseFreeEdge = clamp(rawBaseFreeEdge, 0.12, 1.15);
       const effectiveFreeEdge = clamp(baseFreeEdge * fineExtMult, 0.10, 1.25);
 
-      const totalLenMeters = dims.bedLengthMeters * (1 + effectiveFreeEdge);
+      const totalLenMeters = safeBedLengthMeters * (1 + effectiveFreeEdge);
       const bedFraction = clamp(1 / (1 + effectiveFreeEdge), 0.44, 0.90);
       const quantizedBedFraction = clamp(quantizeStep(bedFraction, 0.02), 0.44, 0.90);
 
