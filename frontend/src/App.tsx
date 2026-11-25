@@ -168,6 +168,8 @@ export function App(): React.ReactElement {
     const res = await createNailDesign(draft);
     const created: NailDesign = {
       ...res.design,
+      fingerSpecs: draft.fingerSpecs ?? res.design.fingerSpecs,
+      secondaryColor: draft.secondaryColor ?? res.design.secondaryColor,
       detectedShape: draft.detectedShape ?? res.design.detectedShape,
       detectedLength: draft.detectedLength ?? res.design.detectedLength,
     };

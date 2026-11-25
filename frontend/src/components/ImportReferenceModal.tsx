@@ -1,26 +1,31 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Camera,
   Check,
   Loader2,
-  Move,
-  RotateCcw,
+  Palette,
   Sparkles,
   Upload,
+  Wand2,
   X,
-  ZoomIn,
 } from 'lucide-react';
 import {
-  DEFAULT_LOUPE_ADJUSTMENT,
-  MAX_LOUPE_ZOOM,
-  MIN_LOUPE_ZOOM,
-  type LoupeAdjustment,
-  type NailExtractionResult,
-  analyzeReferencePhoto,
-  renderLoupeNailTexture,
-} from '../lib/nail3DReconstructor';
-import type { NailDesign, NailShape } from '../types/nail';
+  FINGER_LABELS_PT,
+  ORDERED_FINGERS,
+  PATTERN_LABELS_PT,
+  type PerFingerAnalysisResult,
+  analyzeReferencePerFinger,
+} from '../lib/perFingerVisionAnalyzer';
+import { renderProceduralNailSwatchDataUrl } from '../lib/proceduralPBRSynthesizer';
+import type {
+  ArtisticPattern,
+  FingerId,
+  NailDesign,
+  NailFingerDesignSpec,
+  NailPatternType,
+  NailShape,
+} from '../types/nail';
 
 const SHAPE_LABELS: Record<NailShape, string> = {
   natural: 'Natural',
@@ -29,6 +34,33 @@ const SHAPE_LABELS: Record<NailShape, string> = {
   coffin: 'Bailarina',
   stiletto: 'Stiletto',
 };
+
+const PATTERN_OPTIONS: Array<{ id: ArtisticPattern; label: string }> = [
+  { id: 'solid_gloss', label: 'Gel Brilho' },
+  { id: 'french_tip', label: 'Francesinha' },
+  { id: 'aura_gradient', label: 'Aura Blush' },
+  { id: 'gold_3d_waves', label: 'Ondas 3D Ouro' },
+  { id: 'chrome_mirror', label: 'Cromado' },
+  { id: 'floral_accent', label: 'Floral 3D' },
+];
+
+function mapArtisticToDesignPattern(pattern: ArtisticPattern): NailPatternType {
+  switch (pattern) {
+    case 'french_tip':
+      return 'french';
+    case 'chrome_mirror':
+      return 'chrome';
+    case 'gold_3d_waves':
+      return 'gold-foil';
+    case 'aura_gradient':
+      return 'ombre';
+    case 'floral_accent':
+      return 'marble';
+    case 'solid_gloss':
+    default:
+      return 'solid';
+  }
+}
 
 interface ImportReferenceModalProps {
   open: boolean;
@@ -42,38 +74,15 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   onCreateDesign,
 }) => {
   const [name, setName] = useState('');
-  const [extraction, setExtraction] = useState<NailExtractionResult | null>(null);
-  const [selectedNailIdx, setSelectedNailIdx] = useState(0);
-  const [loupeAdjust, setLoupeAdjust] = useState<LoupeAdjustment>(DEFAULT_LOUPE_ADJUSTMENT);
+  const [analysis, setAnalysis] = useState<PerFingerAnalysisResult | null>(null);
+  const [fingerSpecs, setFingerSpecs] = useState<Record<FingerId, NailFingerDesignSpec> | null>(
+    null
+  );
+  const [selectedFinger, setSelectedFinger] = useState<FingerId>('ring');
   const [finish, setFinish] = useState<NailDesign['finish']>('glossy');
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const dragRef = useRef<{
-    active: boolean;
-    startX: number;
-    startY: number;
-    origOffsetX: number;
-    origOffsetY: number;
-  }>({ active: false, startX: 0, startY: 0, origOffsetX: 0, origOffsetY: 0 });
-  const pinchRef = useRef<{ dist: number; origZoom: number } | null>(null);
-
-  const activeTarget = useMemo(() => {
-    if (!extraction || extraction.detectedNails.length === 0) return null;
-    return extraction.detectedNails[selectedNailIdx] ?? extraction.detectedNails[0];
-  }, [extraction, selectedNailIdx]);
-
-  const previewDataUrl = useMemo(() => {
-    if (!extraction || !activeTarget) return null;
-    return renderLoupeNailTexture(
-      extraction.sourceImage,
-      activeTarget.frame,
-      loupeAdjust,
-      260,
-      390
-    );
-  }, [extraction, activeTarget, loupeAdjust]);
 
   useEffect(() => {
     if (!open) {
@@ -81,126 +90,162 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     }
   }, [open]);
 
+  const fingerPreviews = useMemo(() => {
+    if (!fingerSpecs) return null;
+    const previews = {} as Record<FingerId, string>;
+    for (const id of ORDERED_FINGERS) {
+      previews[id] = renderProceduralNailSwatchDataUrl(fingerSpecs[id], 180, 260);
+    }
+    return previews;
+  }, [fingerSpecs]);
+
+  const activeSpec = fingerSpecs ? fingerSpecs[selectedFinger] : null;
+  const activePreviewUrl = fingerPreviews ? fingerPreviews[selectedFinger] : null;
+
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setError(null);
     setAnalyzing(true);
     try {
-      const result = await analyzeReferencePhoto(file);
-      setExtraction(result);
-      setSelectedNailIdx(result.initialIndex);
-      setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
+      const result = await analyzeReferencePerFinger(file);
+      setAnalysis(result);
+      setFingerSpecs(result.fingerSpecs);
+
+      // Focus initial inspection on the richest accent finger (usually ring or middle)
+      const richFinger =
+        ORDERED_FINGERS.find(
+          (id) =>
+            result.fingerSpecs[id].pattern === 'gold_3d_waves' ||
+            result.fingerSpecs[id].pattern === 'floral_accent'
+        ) ??
+        result.detectedFingerIds[0] ??
+        'middle';
+      setSelectedFinger(richFinger);
+
+      if (result.primaryPattern === 'chrome_mirror') {
+        setFinish('chrome');
+      } else if (result.primaryPattern === 'gold_3d_waves') {
+        setFinish('glitter');
+      } else {
+        setFinish('glossy');
+      }
+
       if (!name.trim()) {
         const cleanFile = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
-        setName(cleanFile.slice(0, 26) || 'Referência da Cliente');
+        setName(
+          cleanFile.length > 2
+            ? cleanFile.slice(0, 26)
+            : `${PATTERN_LABELS_PT[result.primaryPattern]} 3D`
+        );
       }
     } catch {
-      setError('Não foi possível analisar esta foto. Tente outra imagem da galeria.');
+      setError('Não foi possível reconstruir esta referência. Tente outra foto.');
     } finally {
       setAnalyzing(false);
       e.target.value = '';
     }
   };
 
-  const handleSelectFinger = (index: number) => {
-    setSelectedNailIdx(index);
-    setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
+  const updateSelectedFinger = (patch: Partial<NailFingerDesignSpec>) => {
+    setFingerSpecs((prev) => {
+      if (!prev) return prev;
+      const current = prev[selectedFinger];
+      const nextPattern = patch.pattern ?? current.pattern;
+      const updatedAnchors =
+        patch.pattern &&
+        (patch.pattern === 'gold_3d_waves' || patch.pattern === 'floral_accent') &&
+        current.strokeAnchors.length === 0
+          ? [
+              { u: 0.34, v: 0.36, radius: 0.16, angle: 0.35 },
+              { u: 0.62, v: 0.58, radius: 0.18, angle: -0.3 },
+              { u: 0.48, v: 0.78, radius: 0.14, angle: 0.2 },
+            ]
+          : current.strokeAnchors;
+
+      return {
+        ...prev,
+        [selectedFinger]: {
+          ...current,
+          ...patch,
+          strokeAnchors: updatedAnchors,
+          metallicIntensity:
+            nextPattern === 'chrome_mirror'
+              ? 0.92
+              : nextPattern === 'gold_3d_waves'
+                ? 0.88
+                : nextPattern === 'floral_accent'
+                  ? 0.45
+                  : 0.1,
+        },
+      };
+    });
+  };
+
+  const applySelectedToAllFingers = () => {
+    setFingerSpecs((prev) => {
+      if (!prev) return prev;
+      const source = prev[selectedFinger];
+      const next = {} as Record<FingerId, NailFingerDesignSpec>;
+      for (const id of ORDERED_FINGERS) {
+        next[id] = {
+          ...prev[id],
+          pattern: source.pattern,
+          baseColor: source.baseColor,
+          secondaryColor: source.secondaryColor,
+          accentColor: source.accentColor,
+          shape: source.shape,
+          strokeAnchors: source.strokeAnchors,
+          metallicIntensity: source.metallicIntensity,
+        };
+      }
+      return next;
+    });
   };
 
   const resetAndClose = () => {
     setName('');
-    setExtraction(null);
-    setSelectedNailIdx(0);
-    setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
+    setAnalysis(null);
+    setFingerSpecs(null);
+    setSelectedFinger('ring');
     setError(null);
     onClose();
   };
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!activeTarget) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    dragRef.current = {
-      active: true,
-      startX: e.clientX,
-      startY: e.clientY,
-      origOffsetX: loupeAdjust.offsetX,
-      origOffsetY: loupeAdjust.offsetY,
-    };
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current.active || pinchRef.current) return;
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    setLoupeAdjust((prev) => ({
-      ...prev,
-      offsetX: Math.max(-2.2, Math.min(2.2, dragRef.current.origOffsetX + dx / 130)),
-      offsetY: Math.max(-2.2, Math.min(2.2, dragRef.current.origOffsetY + dy / 190)),
-    }));
-  };
-
-  const handlePointerUp = () => {
-    dragRef.current.active = false;
-  };
-
-  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (e.touches.length === 2) {
-      const dist = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      pinchRef.current = { dist, origZoom: loupeAdjust.zoom };
-      dragRef.current.active = false;
-    }
-  };
-
-  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (e.touches.length === 2 && pinchRef.current) {
-      const dist = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      const ratio = dist / Math.max(10, pinchRef.current.dist);
-      const nextZoom = Math.max(
-        MIN_LOUPE_ZOOM,
-        Math.min(MAX_LOUPE_ZOOM, pinchRef.current.origZoom * ratio)
-      );
-      setLoupeAdjust((prev) => ({ ...prev, zoom: Number(nextZoom.toFixed(2)) }));
-    }
-  };
-
-  const handleTouchEnd = () => {
-    pinchRef.current = null;
-  };
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!extraction || !activeTarget) {
-      setError('Selecione ou fotografe uma referência da cliente primeiro.');
+    if (!fingerSpecs || !activeSpec) {
+      setError('Envie ou fotografe uma referência primeiro para reconstruir os 5 dedos.');
       return;
     }
     setSaving(true);
     try {
-      const finalTexture = renderLoupeNailTexture(
-        extraction.sourceImage,
-        activeTarget.frame,
-        loupeAdjust,
-        320,
-        480
-      );
+      const middleSpec = fingerSpecs.middle ?? activeSpec;
+      const swatchDataUrl = renderProceduralNailSwatchDataUrl(activeSpec, 180, 260);
+      const gloss = finish === 'velvet' ? 0.56 : 0.96;
+
+      const finalizedSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
+      for (const id of ORDERED_FINGERS) {
+        finalizedSpecs[id] = {
+          ...fingerSpecs[id],
+          glossIntensity: gloss,
+        };
+      }
+
       await onCreateDesign({
-        name: name.trim() || 'Referência da Cliente',
+        name: name.trim() || `${PATTERN_LABELS_PT[middleSpec.pattern]} 3D`,
         category: 'Cliente',
-        patternType: 'solid',
-        baseColor: activeTarget.dominantColor || '#D4A383',
-        secondaryColor: '#FFFFFF',
-        accentColor: '#F3D5C0',
+        patternType: mapArtisticToDesignPattern(middleSpec.pattern),
+        baseColor: middleSpec.baseColor,
+        secondaryColor: middleSpec.secondaryColor,
+        accentColor: middleSpec.accentColor,
         finish,
-        imageDataUrl: finalTexture,
+        // Clean vector swatch preview only (NEVER raw cropped photo bitmap!)
+        imageDataUrl: swatchDataUrl,
         isCustom: true,
-        detectedShape: activeTarget.detectedShape,
-        detectedLength: activeTarget.detectedLength,
+        detectedShape: middleSpec.shape,
+        detectedLength: middleSpec.relativeLength,
+        fingerSpecs: finalizedSpecs,
       });
       resetAndClose();
     } finally {
@@ -233,9 +278,9 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
           >
             <div className="modal-header">
               <div>
-                <span className="modal-eyebrow">Nail Loupe Extractor • Zoom 4.5x</span>
+                <span className="modal-eyebrow">Procedural 3D Vision • 1024×1024 PBR</span>
                 <h2 id="import-title" className="modal-title">
-                  Importar Referência
+                  Reconstruir Referência 3D
                 </h2>
               </div>
               <button
@@ -250,52 +295,37 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
             <form onSubmit={handleSubmit} className="modal-body">
               <div className="import-preview-stage">
-                <div
-                  className={`nail-crop-preview is-loupe is-interactive ${activeTarget ? 'has-texture' : ''}`}
-                  onPointerDown={handlePointerDown}
-                  onPointerMove={handlePointerMove}
-                  onPointerUp={handlePointerUp}
-                  onPointerCancel={handlePointerUp}
-                  onTouchStart={handleTouchStart}
-                  onTouchMove={handleTouchMove}
-                  onTouchEnd={handleTouchEnd}
-                  title={
-                    activeTarget
-                      ? 'Arraste ou faça pinça (2x–8x) para isolar exatamente a arte da unha'
-                      : undefined
-                  }
-                >
+                <div className={`nail-crop-preview is-loupe ${activePreviewUrl ? 'has-texture' : ''}`}>
                   {analyzing ? (
                     <div className="nail-crop-placeholder">
                       <Loader2 size={22} className="spin-icon" />
-                      <span>Focando unha...</span>
+                      <span>Reconstruindo 5 dedos...</span>
                     </div>
-                  ) : previewDataUrl ? (
-                    <img src={previewDataUrl} alt="Lupa da placa da unha" draggable={false} />
+                  ) : activePreviewUrl ? (
+                    <img
+                      src={activePreviewUrl}
+                      alt={`Prévia procedural ${FINGER_LABELS_PT[selectedFinger]}`}
+                      draggable={false}
+                    />
                   ) : (
                     <div className="nail-crop-placeholder">
                       <Sparkles size={22} />
-                      <span>Lupa da Unha</span>
+                      <span>Vetor 3D Limpo</span>
                     </div>
                   )}
                   <div className="nail-crop-gloss" aria-hidden="true" />
-                  {activeTarget && (
-                    <>
-                      <div className="loupe-zoom-pill" aria-hidden="true">
-                        <ZoomIn size={10} />
-                        <span>{loupeAdjust.zoom.toFixed(1)}x</span>
-                      </div>
-                      <div className="nail-crop-drag-badge" aria-hidden="true">
-                        <Move size={11} />
-                      </div>
-                    </>
+                  {activeSpec && (
+                    <div className="loupe-zoom-pill" aria-hidden="true">
+                      <Wand2 size={10} />
+                      <span>{PATTERN_LABELS_PT[activeSpec.pattern]}</span>
+                    </div>
                   )}
                 </div>
 
                 <div className="import-upload-buttons">
                   <label className="upload-action-btn">
                     <Upload size={16} />
-                    <span>{analyzing ? 'Detectando unhas...' : 'Foto da Galeria'}</span>
+                    <span>{analyzing ? 'Analisando mão...' : 'Foto da Galeria'}</span>
                     <input
                       type="file"
                       accept="image/*"
@@ -316,32 +346,51 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                     />
                   </label>
 
-                  {extraction && activeTarget && (
+                  {analysis && activeSpec && (
                     <div className="extractor-status-note">
-                      {extraction.method === 'mediapipe'
-                        ? `Lupa 3D focada em ${activeTarget.fingerName} (${loupeAdjust.zoom.toFixed(1)}x) • Formato detectado: ${SHAPE_LABELS[activeTarget.detectedShape]} (${activeTarget.detectedLength.toFixed(2)}x).`
-                        : `Close focado (${loupeAdjust.zoom.toFixed(1)}x). Arraste ou dê zoom dentro da unha.`}
+                      {analysis.method === 'mediapipe'
+                        ? `${analysis.detectedFingerIds.length} dedos detectados na foto • ${SHAPE_LABELS[activeSpec.shape]} (${activeSpec.relativeLength.toFixed(2)}x) • Arte vetorial 1024px pronta.`
+                        : `Close-up macro reconstruído com harmonia nos 5 dedos • ${SHAPE_LABELS[activeSpec.shape]}.`}
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* 1-Tap Quick Finger Extraction Switcher (Unha 1, Unha 2, Unha 3...) */}
-              {extraction && extraction.detectedNails.length > 1 && (
-                <div className="finger-extract-strip" role="group" aria-label="Unhas detectadas na foto">
-                  <span className="field-label">Extração Rápida por Dedo (1 toque)</span>
-                  <div className="finger-extract-row">
-                    {extraction.detectedNails.map((target, idx) => {
-                      const isActive = idx === selectedNailIdx;
+              {/* 5-Finger Procedural Reconstruction Preview Strip */}
+              {fingerSpecs && fingerPreviews && (
+                <div className="v5-five-finger-section" role="group" aria-label="Reconstrução dos 5 dedos">
+                  <div className="v5-section-head">
+                    <span className="field-label">Reconstrução 5 Dedos (toque para editar)</span>
+                    <button
+                      type="button"
+                      className="text-link-btn"
+                      onClick={applySelectedToAllFingers}
+                    >
+                      Uniformizar nos 5
+                    </button>
+                  </div>
+
+                  <div className="v5-five-finger-grid">
+                    {ORDERED_FINGERS.map((fid) => {
+                      const spec = fingerSpecs[fid];
+                      const isActive = fid === selectedFinger;
                       return (
                         <button
-                          key={target.id}
+                          key={fid}
                           type="button"
-                          onClick={() => handleSelectFinger(idx)}
-                          className={`finger-extract-btn ${isActive ? 'is-active' : ''}`}
+                          onClick={() => setSelectedFinger(fid)}
+                          className={`v5-finger-card ${isActive ? 'is-active' : ''}`}
                         >
-                          <img src={target.thumbDataUrl} alt={target.shortLabel} />
-                          <span>{target.shortLabel}</span>
+                          <div className="v5-finger-thumb">
+                            <img src={fingerPreviews[fid]} alt={FINGER_LABELS_PT[fid]} />
+                          </div>
+                          <span className="v5-finger-name">{FINGER_LABELS_PT[fid]}</span>
+                          <span className="v5-finger-badge">{PATTERN_LABELS_PT[spec.pattern]}</span>
+                          <div className="v5-palette-dots" aria-hidden="true">
+                            <span style={{ background: spec.baseColor }} />
+                            <span style={{ background: spec.secondaryColor }} />
+                            <span style={{ background: spec.accentColor }} />
+                          </div>
                         </button>
                       );
                     })}
@@ -349,87 +398,80 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 </div>
               )}
 
-              {activeTarget && (
+              {/* Per-Finger Quick Customizer */}
+              {activeSpec && (
                 <div className="extractor-refine-box">
                   <div className="extractor-refine-head">
-                    <span>Lupa de Precisão (2x – 8x)</span>
-                    <button
-                      type="button"
-                      className="icon-text-btn"
-                      onClick={() => setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT)}
-                    >
-                      <RotateCcw size={12} />
-                      <span>Resetar 4.5x</span>
-                    </button>
+                    <span>
+                      <Palette size={12} style={{ verticalAlign: 'middle', marginRight: 5 }} />
+                      {FINGER_LABELS_PT[selectedFinger]} • {SHAPE_LABELS[activeSpec.shape]} ({activeSpec.relativeLength.toFixed(2)}x)
+                    </span>
+                    <span className="v5-source-pill">
+                      {activeSpec.detectedFromPhoto ? 'Extraído da Foto' : 'Harmonia Automática'}
+                    </span>
                   </div>
-                  <div className="extractor-refine-sliders">
-                    <label className="slider-row">
-                      <div className="slider-meta">
-                        <span>Zoom Lupa</span>
-                        <span className="slider-val">{loupeAdjust.zoom.toFixed(1)}x</span>
-                      </div>
+
+                  <div className="shape-selector">
+                    {PATTERN_OPTIONS.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => updateSelectedFinger({ pattern: p.id })}
+                        className={`shape-chip ${activeSpec.pattern === p.id ? 'is-active' : ''}`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="v5-color-trio">
+                    <label className="v5-color-swatch-edit">
                       <input
-                        type="range"
-                        min={MIN_LOUPE_ZOOM}
-                        max={MAX_LOUPE_ZOOM}
-                        step={0.1}
-                        value={loupeAdjust.zoom}
-                        onChange={(e) =>
-                          setLoupeAdjust((prev) => ({
-                            ...prev,
-                            zoom: parseFloat(e.target.value),
-                          }))
-                        }
-                        className="luxury-range"
+                        type="color"
+                        value={activeSpec.baseColor}
+                        onChange={(e) => updateSelectedFinger({ baseColor: e.target.value })}
                       />
+                      <span>Base</span>
                     </label>
-                    <label className="slider-row">
-                      <div className="slider-meta">
-                        <span>Ângulo</span>
-                        <span className="slider-val">
-                          {loupeAdjust.rotationDeg > 0
-                            ? `+${loupeAdjust.rotationDeg}°`
-                            : `${loupeAdjust.rotationDeg}°`}
-                        </span>
-                      </div>
+                    <label className="v5-color-swatch-edit">
                       <input
-                        type="range"
-                        min={-45}
-                        max={45}
-                        step={1}
-                        value={loupeAdjust.rotationDeg}
-                        onChange={(e) =>
-                          setLoupeAdjust((prev) => ({
-                            ...prev,
-                            rotationDeg: parseInt(e.target.value, 10),
-                          }))
-                        }
-                        className="luxury-range"
+                        type="color"
+                        value={activeSpec.secondaryColor}
+                        onChange={(e) => updateSelectedFinger({ secondaryColor: e.target.value })}
                       />
+                      <span>Aura / Ponta</span>
+                    </label>
+                    <label className="v5-color-swatch-edit">
+                      <input
+                        type="color"
+                        value={activeSpec.accentColor}
+                        onChange={(e) => updateSelectedFinger({ accentColor: e.target.value })}
+                      />
+                      <span>Ouro / 3D</span>
                     </label>
                   </div>
                 </div>
               )}
 
               <label className="field-group">
-                <span className="field-label">Nome da Referência</span>
+                <span className="field-label">Nome do Set 3D</span>
                 <input
                   type="text"
                   value={name}
                   maxLength={32}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="Ex: Vermelha com Fio Dourado 3D"
+                  placeholder="Ex: Aura Blush com Ondas Ouro 3D"
                   className="glass-input"
                 />
               </label>
 
               <div className="field-group">
-                <span className="field-label">Acabamento 3D no Shader WebGL</span>
+                <span className="field-label">Acabamento PBR WebGL</span>
                 <div className="shape-selector">
                   {(
                     [
                       { id: 'glossy', label: 'Gel Brilho' },
-                      { id: 'chrome', label: 'Metálico / Cromado' },
+                      { id: 'chrome', label: 'Cromado Espelho' },
                       { id: 'velvet', label: 'Veludo Fosco' },
                     ] as const
                   ).map((item) => (
@@ -454,10 +496,10 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 <button
                   type="submit"
                   className="btn-primary"
-                  disabled={!activeTarget || analyzing || saving}
+                  disabled={!fingerSpecs || analyzing || saving}
                 >
                   <Check size={16} />
-                  <span>{saving ? 'Aplicando em 3D...' : 'Aplicar na Mão 3D'}</span>
+                  <span>{saving ? 'Aplicando Set 3D...' : 'Aplicar Set 3D na Mão'}</span>
                 </button>
               </div>
             </form>

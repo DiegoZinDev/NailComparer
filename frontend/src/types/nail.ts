@@ -50,6 +50,38 @@ export type NailPatternType =
 
 export type NailShape = 'natural' | 'almond' | 'square' | 'coffin' | 'stiletto';
 
+export type FingerId = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
+
+export type ArtisticPattern =
+  | 'solid_gloss'
+  | 'chrome_mirror'
+  | 'gold_3d_waves'
+  | 'aura_gradient'
+  | 'french_tip'
+  | 'floral_accent';
+
+export interface StrokeAnchor {
+  u: number;
+  v: number;
+  radius: number;
+  angle: number;
+}
+
+export interface NailFingerDesignSpec {
+  fingerId: FingerId;
+  detectedFromPhoto: boolean;
+  shape: NailShape; // 'natural' | 'square' | 'coffin' | 'almond' | 'stiletto'
+  relativeLength: number; // 0.85 .. 1.65
+  relativeWidth: number; // 0.90 .. 1.25
+  baseColor: string; // dominant gel/polish base hex
+  secondaryColor: string; // gradient / aura / french tip hex
+  accentColor: string; // metallic gold / pearl / chrome 3D relief hex
+  pattern: ArtisticPattern;
+  strokeAnchors: StrokeAnchor[]; // normalized positions of detected strokes/reliefs on the nail
+  metallicIntensity: number; // 0 .. 1
+  glossIntensity: number; // 0.5 .. 1
+}
+
 export interface NailDesign {
   id: string;
   name: string;
@@ -63,6 +95,7 @@ export interface NailDesign {
   isCustom?: boolean;
   detectedShape?: NailShape;
   detectedLength?: number;
+  fingerSpecs?: Record<FingerId, NailFingerDesignSpec>;
   createdAt?: string;
 }
 
@@ -89,13 +122,14 @@ export interface Vec3 {
 }
 
 export interface FingerPose {
-  id: 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
+  id: FingerId;
   tip: NormalizedPoint;
   dip: NormalizedPoint;
   pip?: NormalizedPoint;
   mcp?: NormalizedPoint;
   wrist?: NormalizedPoint;
   palmNormal?: Vec3;
+  handedness?: 'Left' | 'Right';
   widthScale: number;
   lengthScale: number;
 }

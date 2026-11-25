@@ -270,8 +270,22 @@ export async function loadNailDesigns(): Promise<{ designs: NailDesign[]; status
     if (res.ok) {
       const remoteRaw = (await res.json()) as Record<string, unknown>[];
       if (Array.isArray(remoteRaw) && remoteRaw.length > 0) {
-        const remote = remoteRaw.map(mapDesignFromApi);
         const local = (await idbGetDesigns()) ?? [];
+        const localById = new Map(local.map((d) => [String(d.id), d]));
+        const remote = remoteRaw.map((raw) => {
+          const mapped = mapDesignFromApi(raw);
+          const localMatch = localById.get(String(mapped.id));
+          return localMatch
+            ? {
+                ...mapped,
+                fingerSpecs: localMatch.fingerSpecs ?? mapped.fingerSpecs,
+                detectedShape: localMatch.detectedShape ?? mapped.detectedShape,
+                detectedLength: localMatch.detectedLength ?? mapped.detectedLength,
+                secondaryColor: localMatch.secondaryColor ?? mapped.secondaryColor,
+                finish: localMatch.finish ?? mapped.finish,
+              }
+            : mapped;
+        });
         const remoteIds = new Set(remote.map((d) => String(d.id)));
         const localUnsynced = local.filter((d) => d.isCustom && !remoteIds.has(String(d.id)));
         const merged = [...localUnsynced, ...remote];
@@ -308,7 +322,7 @@ export async function createNailDesign(
       styleType: localItem.imageDataUrl ? 'image' : 'procedural',
       baseColor: localItem.baseColor || '#EBD8CE',
       accentColor: localItem.accentColor || localItem.secondaryColor || '#FFFFFF',
-      patternType: localItem.imageDataUrl ? 'custom-photo' : localItem.patternType,
+      patternType: localItem.patternType || 'solid',
       imageDataUrl: localItem.imageDataUrl ?? null,
       defaultScale: 1.0,
       defaultRotation: 0,
@@ -329,6 +343,10 @@ export async function createNailDesign(
         ...localItem,
         ...mapDesignFromApi(saved),
         finish: localItem.finish,
+        secondaryColor: localItem.secondaryColor,
+        fingerSpecs: localItem.fingerSpecs,
+        detectedShape: localItem.detectedShape,
+        detectedLength: localItem.detectedLength,
       };
       const updated = [syncedItem, ...current.filter((d) => d.id !== localItem.id)];
       await idbSaveAllDesigns(updated);
