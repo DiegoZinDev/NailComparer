@@ -1,32 +1,22 @@
 import React, { useMemo, useRef } from 'react';
 import { motion, useMotionValue, useSpring, useTransform } from 'framer-motion';
-import { Camera, Plus, Trash2 } from 'lucide-react';
+import { Camera, Plus, Sparkles, Trash2 } from 'lucide-react';
 import { getSwatchBackground } from '../lib/swatchPreview';
-import type { DockTab, NailDesign, NailShape } from '../types/nail';
+import type { DockTab, NailDesign } from '../types/nail';
 
 const TABS: Array<{ id: DockTab; label: string }> = [
   { id: 'client', label: 'Referência da Cliente' },
   { id: 'studio', label: 'Catálogo do Estúdio' },
 ];
 
-const QUICK_SHAPES: Array<{ id: NailShape; label: string }> = [
-  { id: 'natural', label: 'Natural' },
-  { id: 'almond', label: 'Amendoada' },
-  { id: 'coffin', label: 'Bailarina' },
-  { id: 'square', label: 'Quadrada' },
-  { id: 'stiletto', label: 'Stiletto' },
-];
-
 interface MagneticDesignDockProps {
   designs: NailDesign[];
   activeTab: DockTab;
   onTabChange: (tab: DockTab) => void;
-  activeShape: NailShape;
-  onShapeChange: (shape: NailShape) => void;
-  activeDesignId: string;
+  activeDesignId: string | null;
   onSelectDesign: (design: NailDesign) => void;
-  onOpenImport: () => void;
-  onDeleteCustom?: (id: string) => void;
+  onOpenImport: (mode: DockTab) => void;
+  onDeleteDesign?: (id: string) => void;
 }
 
 interface DockItemProps {
@@ -82,7 +72,7 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
       <span className={`dock-item-label ${isActive ? 'is-active' : ''}`}>
         {design.name}
       </span>
-      {design.isCustom && onDelete && isActive && (
+      {onDelete && (
         <button
           type="button"
           className="dock-delete-mini"
@@ -90,10 +80,15 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
             e.stopPropagation();
             onDelete();
           }}
-          title="Remover referência"
+          title={
+            design.isStudioCatalog || design.category === 'Estudio'
+              ? 'Remover modelo do catálogo'
+              : 'Remover referência'
+          }
           aria-label={`Remover ${design.name}`}
+          style={{ opacity: isActive ? 1 : 0.72 }}
         >
-          <Trash2 size={11} />
+          <Trash2 size={10} />
         </button>
       )}
     </div>
@@ -104,41 +99,24 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
   designs,
   activeTab,
   onTabChange,
-  activeShape,
-  onShapeChange,
   activeDesignId,
   onSelectDesign,
   onOpenImport,
-  onDeleteCustom,
+  onDeleteDesign,
 }) => {
   const mouseX = useMotionValue<number>(Infinity);
 
   const visibleDesigns = useMemo(() => {
     if (activeTab === 'client') {
-      return designs.filter((d) => d.isCustom || d.category === 'Cliente');
+      return designs.filter((d) => Boolean(d.isCustom && !d.isStudioCatalog && d.category !== 'Estudio'));
     }
-    return designs.filter((d) => !d.isCustom && d.category !== 'Cliente');
+    return designs.filter((d) => Boolean(d.isStudioCatalog || d.category === 'Estudio'));
   }, [designs, activeTab]);
+
+  const isStudioTab = activeTab === 'studio';
 
   return (
     <div className="dock-container">
-      {/* Discreet 1-Tap Anatomical Shape & Extension Selector above the dock */}
-      <div className="quick-shape-strip" role="group" aria-label="Formato do alongamento">
-        {QUICK_SHAPES.map((shape) => {
-          const isSelected = shape.id === activeShape;
-          return (
-            <button
-              key={shape.id}
-              type="button"
-              onClick={() => onShapeChange(shape.id)}
-              className={`quick-shape-pill ${isSelected ? 'is-active' : ''}`}
-            >
-              {shape.label}
-            </button>
-          );
-        })}
-      </div>
-
       {/* Clean 2-Tab Switcher (Referência da Cliente / Catálogo do Estúdio) */}
       <div className="dock-tabs-bar" role="tablist" aria-label="Origem das artes">
         {TABS.map((tab) => {
@@ -165,7 +143,7 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
         })}
       </div>
 
-      {/* Floating Luxury Dock with Prominent + Importar Referência CTA */}
+      {/* Floating Luxury Dock with Contextual Action CTA */}
       <div
         className="magnetic-dock glass-panel"
         onMouseMove={(e) => mouseX.set(e.clientX)}
@@ -178,16 +156,20 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
         <motion.button
           type="button"
           whileTap={{ scale: 0.95 }}
-          onClick={onOpenImport}
+          onClick={() => onOpenImport(activeTab)}
           className="dock-import-hero-btn"
-          aria-label="Importar foto de referência da cliente"
+          aria-label={
+            isStudioTab
+              ? 'Cadastrar modelo no catálogo do estúdio'
+              : 'Importar foto de referência da cliente'
+          }
         >
           <span className="dock-import-hero-icon">
             <Plus size={16} strokeWidth={2.5} />
           </span>
           <span className="dock-import-hero-copy">
-            <strong>Importar</strong>
-            <small>Referência</small>
+            <strong>{isStudioTab ? 'Cadastrar' : 'Importar'}</strong>
+            <small>{isStudioTab ? 'Modelo' : 'Referência'}</small>
           </span>
         </motion.button>
 
@@ -195,9 +177,17 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
 
         <div className="dock-scroll-track">
           {visibleDesigns.length === 0 ? (
-            <button type="button" onClick={onOpenImport} className="dock-empty-cta">
-              <Camera size={15} />
-              <span>Toque para extrair a unha da foto da cliente</span>
+            <button
+              type="button"
+              onClick={() => onOpenImport(activeTab)}
+              className="dock-empty-cta"
+            >
+              {isStudioTab ? <Sparkles size={15} /> : <Camera size={15} />}
+              <span>
+                {isStudioTab
+                  ? 'Cadastrar Modelo no Catálogo do Estúdio'
+                  : 'Importar Foto de Referência da Cliente'}
+              </span>
             </button>
           ) : (
             visibleDesigns.map((design) => (
@@ -207,11 +197,7 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
                 isActive={design.id === activeDesignId}
                 mouseX={mouseX}
                 onSelect={() => onSelectDesign(design)}
-                onDelete={
-                  design.isCustom && onDeleteCustom
-                    ? () => onDeleteCustom(design.id)
-                    : undefined
-                }
+                onDelete={onDeleteDesign ? () => onDeleteDesign(design.id) : undefined}
               />
             ))
           )}

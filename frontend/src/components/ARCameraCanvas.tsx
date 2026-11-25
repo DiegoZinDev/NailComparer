@@ -1,16 +1,17 @@
 import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { HandTrackerController } from '../lib/handTrackingWorker';
+import { computeCoverRect } from '../lib/nailRenderer';
 import {
-  DEMO_HAND_POSES,
-  MEDIAPIPE_FINGER_PAIRS,
-  computeCoverRect,
-} from '../lib/nailRenderer';
-import {
-  type AmbientLightSample,
-  ThreeNailScene,
-  sampleFingerSkinAmbient,
-} from '../lib/threeNailScene';
-import type { ARViewMode, FingerPose, NailAdjustment, NailDesign, Vec3 } from '../types/nail';
+  type DirectionalAmbientLightSample,
+  sampleDirectionalSkinLight,
+} from '../lib/nailShaderMaterials';
+import { ThreeNailScene } from '../lib/threeNailScene';
+import type {
+  ARViewMode,
+  HandSkeletonFrame,
+  NailAdjustment,
+  NailDesign,
+} from '../types/nail';
 
 export interface ARCameraCanvasHandle {
   captureCompositeDataUrl: (studioName: string, logoDataUrl: string | null) => string | null;
@@ -20,59 +21,25 @@ interface ARCameraCanvasProps {
   mode: ARViewMode;
   onModeChange: (mode: ARViewMode) => void;
   facingMode: 'environment' | 'user';
-  activeDesign: NailDesign;
+  activeDesign: NailDesign | null;
   adjustment: NailAdjustment;
   compareClean: boolean;
   onTrackingChange?: (detected: boolean) => void;
   onCameraNotice?: (message: string | null) => void;
+  onRequestImportClient?: () => void;
+  onRequestImportStudio?: () => void;
 }
 
-const DEFAULT_AMBIENT: AmbientLightSample = { r: 0.78, g: 0.63, b: 0.54, luma: 0.66 };
-const AMBIENT_SAMPLE_INTERVAL_MS = 120;
-const AMBIENT_SAMPLE_MIN_FRAMES = 4;
-
-const FINGER_MCP_IDX: Record<FingerPose['id'], number> = {
-  thumb: 1,
-  index: 5,
-  middle: 9,
-  ring: 13,
-  pinky: 17,
+const DEFAULT_AMBIENT: DirectionalAmbientLightSample = {
+  r: 0.78,
+  g: 0.63,
+  b: 0.54,
+  luma: 0.66,
+  lightAzimuthX: -0.22,
+  lightElevationY: 0.58,
 };
 
-function computePalmNormal(
-  wrist: { x: number; y: number; z?: number },
-  indexMcp: { x: number; y: number; z?: number },
-  pinkyMcp: { x: number; y: number; z?: number }
-): Vec3 {
-  const ax = indexMcp.x - wrist.x;
-  const ay = indexMcp.y - wrist.y;
-  const az = (indexMcp.z ?? 0) - (wrist.z ?? 0);
-
-  const bx = pinkyMcp.x - wrist.x;
-  const by = pinkyMcp.y - wrist.y;
-  const bz = (pinkyMcp.z ?? 0) - (wrist.z ?? 0);
-
-  const cx = ay * bz - az * by;
-  const cy = az * bx - ax * bz;
-  const cz = ax * by - ay * bx;
-  const len = Math.hypot(cx, cy, cz) || 1;
-
-  return { x: cx / len, y: cy / len, z: cz / len };
-}
-
-const DEMO_3D_HAND_POSES: FingerPose[] = DEMO_HAND_POSES.map((p) => {
-  const dx = p.tip.x - p.dip.x;
-  const dy = p.tip.y - p.dip.y;
-  return {
-    ...p,
-    tip: { ...p.tip, z: 0 },
-    dip: { ...p.dip, z: 0 },
-    pip: p.pip ?? { x: p.dip.x - dx * 1.15, y: p.dip.y - dy * 1.15, z: 0 },
-    // MediaPipe -Z faces camera; handedness 'Right' with mirrorX=false preserves -Z -> +Z dorsal in Three.js
-    palmNormal: { x: 0, y: 0, z: -1 },
-    handedness: 'Right',
-  };
-});
+const AMBIENT_SAMPLE_INTERVAL_MS = 150;
 
 export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCanvasProps>(
   function ARCameraCanvas(
@@ -85,25 +52,28 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       compareClean,
       onTrackingChange,
       onCameraNotice,
+      onRequestImportClient,
+      onRequestImportStudio,
     },
     ref
   ) {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
     const threeSceneRef = useRef<ThreeNailScene | null>(null);
+    const trackerRef = useRef<HandTrackerController | null>(null);
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const demoImgRef = useRef<HTMLImageElement | null>(null);
-    const landmarkerRef = useRef<HandLandmarker | null>(null);
-    const latestPosesRef = useRef<FingerPose[] | null>(null);
-    const ambientRef = useRef<AmbientLightSample>(DEFAULT_AMBIENT);
+
+    const latestCameraFrameRef = useRef<HandSkeletonFrame | null>(null);
+    const demoFrameRef = useRef<HandSkeletonFrame | null>(null);
+    const ambientRef = useRef<DirectionalAmbientLightSample>(DEFAULT_AMBIENT);
     const lastVideoTimeRef = useRef<number>(-1);
     const lastTrackingRef = useRef<boolean>(false);
     const lastFrameTimeRef = useRef<number>(0);
     const lastAmbientSampleTimeRef = useRef<number>(0);
-    const ambientFrameCounterRef = useRef<number>(AMBIENT_SAMPLE_MIN_FRAMES);
 
-    // Keep latest props in refs so 60fps RAF never restarts on slider drag
-    const designRef = useRef(activeDesign);
+    // Keep latest props in refs so 60fps RAF never restarts on slider drag or design switch
+    const designRef = useRef<NailDesign | null>(activeDesign);
     designRef.current = activeDesign;
     const adjustmentRef = useRef(adjustment);
     adjustmentRef.current = adjustment;
@@ -113,13 +83,15 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     modeRef.current = mode;
     const facingRef = useRef(facingMode);
     facingRef.current = facingMode;
+    const onTrackingChangeRef = useRef(onTrackingChange);
+    onTrackingChangeRef.current = onTrackingChange;
 
     const [cameraState, setCameraState] = useState<'idle' | 'starting' | 'ready' | 'unavailable'>(
       'idle'
     );
     const [modelReady, setModelReady] = useState(false);
 
-    // Initialize Three.js PBR 3D Nail Scene once on mount
+    // Initialize Three.js V9 PBR 3D Nail Scene once on mount
     useEffect(() => {
       const glCanvas = glCanvasRef.current;
       if (!glCanvas) return;
@@ -133,56 +105,60 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, []);
 
-    // Preload studio model hand image
+    // Initialize decoupled HandTrackerController once on mount
     useEffect(() => {
-      const img = new Image();
-      img.src = '/hand-demo.png';
-      img.onload = () => {
-        demoImgRef.current = img;
+      let active = true;
+      const tracker = new HandTrackerController();
+      trackerRef.current = tracker;
+
+      void tracker.init().then((ok) => {
+        if (active) {
+          setModelReady(ok);
+        }
+      });
+
+      return () => {
+        active = false;
+        tracker.dispose();
+        trackerRef.current = null;
       };
     }, []);
 
-    // Initialize MediaPipe HandLandmarker lazily when camera mode is requested
+    // Preload studio model hand image and extract real HandSkeletonFrame (landmarks + worldLandmarks)
     useEffect(() => {
-      if (mode !== 'camera' || landmarkerRef.current) return;
       let cancelled = false;
+      const img = new Image();
+      img.src = '/hand-demo.png';
+      img.onload = async () => {
+        if (cancelled) return;
+        demoImgRef.current = img;
 
-      async function initLandmarker() {
-        try {
-          const vision = await FilesetResolver.forVisionTasks(
-            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
-          );
-          if (cancelled) return;
-          const handLandmarker = await HandLandmarker.createFromOptions(vision, {
-            baseOptions: {
-              modelAssetPath:
-                'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-              delegate: 'GPU',
-            },
-            runningMode: 'VIDEO',
-            numHands: 1,
-            minHandDetectionConfidence: 0.45,
-            minHandPresenceConfidence: 0.45,
-            minTrackingConfidence: 0.45,
-          });
-          if (cancelled) {
-            handLandmarker.close();
-            return;
-          }
-          landmarkerRef.current = handLandmarker;
-          setModelReady(true);
-        } catch {
-          if (!cancelled) {
-            setModelReady(false);
-          }
+        const tracker = trackerRef.current;
+        if (!tracker) return;
+        const frame = await tracker.detectImage(img);
+        if (!cancelled && frame) {
+          demoFrameRef.current = frame;
         }
-      }
+      };
 
-      void initLandmarker();
       return () => {
         cancelled = true;
       };
-    }, [mode]);
+    }, []);
+
+    // Reset tracking state when switching mode or camera facing direction
+    useEffect(() => {
+      latestCameraFrameRef.current = null;
+      lastVideoTimeRef.current = -1;
+      trackerRef.current?.resetTracking();
+      threeSceneRef.current?.resetTracking();
+
+      const hasDemoFrame = mode === 'studio-demo' && demoFrameRef.current !== null;
+      if (lastTrackingRef.current !== hasDemoFrame) {
+        lastTrackingRef.current = hasDemoFrame;
+        onTrackingChangeRef.current?.(hasDemoFrame);
+      }
+    }, [mode, facingMode]);
 
     // Manage WebRTC camera stream with HTTPS secure-context validation & Android fallback
     useEffect(() => {
@@ -300,7 +276,69 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, facingMode, onModeChange, onCameraNotice]);
 
-    // Main 60fps background draw + MediaPipe 3D tracking + Throttled Ambient Skin Lighting + Three.js PBR 3D render
+    // Sync MediaPipe detection directly to incoming camera frames via requestVideoFrameCallback
+    // (with clean fallback to video.currentTime check inside the RAF loop on browsers without rVFC)
+    useEffect(() => {
+      if (mode !== 'camera') return;
+      const video = videoRef.current;
+      if (!video) return;
+
+      type VideoWithRVFC = HTMLVideoElement & {
+        requestVideoFrameCallback?: (
+          callback: (now: number, metadata: { mediaTime: number }) => void
+        ) => number;
+        cancelVideoFrameCallback?: (handle: number) => void;
+      };
+
+      const v = video as VideoWithRVFC;
+      if (typeof v.requestVideoFrameCallback !== 'function') {
+        return;
+      }
+
+      let cancelled = false;
+      let vfcHandle = 0;
+
+      const onVideoFrame = (nowMs: number, metadata: { mediaTime: number }) => {
+        if (cancelled) return;
+
+        const tracker = trackerRef.current;
+        if (
+          tracker &&
+          tracker.isReady() &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0
+        ) {
+          lastVideoTimeRef.current = video.currentTime;
+          const tsMs =
+            Number.isFinite(metadata.mediaTime) && metadata.mediaTime > 0
+              ? metadata.mediaTime * 1000
+              : nowMs;
+          const detectedFrame = tracker.detectVideo(video, tsMs);
+          latestCameraFrameRef.current = detectedFrame;
+
+          const hasHand = detectedFrame !== null;
+          if (lastTrackingRef.current !== hasHand) {
+            lastTrackingRef.current = hasHand;
+            onTrackingChangeRef.current?.(hasHand);
+          }
+        }
+
+        if (!cancelled && typeof v.requestVideoFrameCallback === 'function') {
+          vfcHandle = v.requestVideoFrameCallback(onVideoFrame);
+        }
+      };
+
+      vfcHandle = v.requestVideoFrameCallback(onVideoFrame);
+
+      return () => {
+        cancelled = true;
+        if (typeof v.cancelVideoFrameCallback === 'function' && vfcHandle) {
+          v.cancelVideoFrameCallback(vfcHandle);
+        }
+      };
+    }, [mode, cameraState]);
+
+    // Main 60fps Render Loop: video/demo draw + fallback detection + throttled directional skin light + Three.js V9 render
     useEffect(() => {
       let rafId = 0;
 
@@ -338,13 +376,13 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.clearRect(0, 0, cssW, cssH);
 
         const threeScene = threeSceneRef.current;
+        const tracker = trackerRef.current;
         const currentMode = modeRef.current;
+        const activeDesignNow = designRef.current;
         const video = videoRef.current;
         const demoImg = demoImgRef.current;
 
-        ambientFrameCounterRef.current += 1;
         const canSampleAmbient =
-          ambientFrameCounterRef.current >= AMBIENT_SAMPLE_MIN_FRAMES &&
           nowMs - lastAmbientSampleTimeRef.current >= AMBIENT_SAMPLE_INTERVAL_MS;
 
         if (
@@ -372,95 +410,53 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           }
           ctx.restore();
 
-          // Decoupled MediaPipe inference: strictly ONLY when video.currentTime advances
-          const landmarker = landmarkerRef.current;
-          if (landmarker && video.currentTime !== lastVideoTimeRef.current) {
+          // Fallback detection when requestVideoFrameCallback is unavailable
+          const supportsRVFC =
+            typeof (video as HTMLVideoElement & { requestVideoFrameCallback?: unknown })
+              .requestVideoFrameCallback === 'function';
+          if (
+            !supportsRVFC &&
+            tracker &&
+            tracker.isReady() &&
+            video.currentTime !== lastVideoTimeRef.current
+          ) {
             lastVideoTimeRef.current = video.currentTime;
-            try {
-              const result = landmarker.detectForVideo(video, nowMs);
-              const hand = result.landmarks?.[0];
-              const rawHandedness = result.handednesses?.[0]?.[0]?.categoryName;
-              const handedness: FingerPose['handedness'] =
-                rawHandedness === 'Left' ? 'Left' : 'Right';
-
-              if (hand && hand.length >= 21) {
-                const wrist = hand[0];
-                const indexMcp = hand[5];
-                const pinkyMcp = hand[17];
-                const palmNormal = computePalmNormal(wrist, indexMcp, pinkyMcp);
-
-                latestPosesRef.current = MEDIAPIPE_FINGER_PAIRS.map((cfg) => {
-                  const tip = hand[cfg.tipIdx];
-                  const dip = hand[cfg.dipIdx];
-                  const pip = hand[cfg.pipIdx];
-                  const mcp = hand[FINGER_MCP_IDX[cfg.id]];
-                  const segLen = Math.hypot(
-                    (tip.x - dip.x) * rect.drawW,
-                    (tip.y - dip.y) * rect.drawH
-                  );
-                  const baseSeg = Math.hypot(
-                    (dip.x - pip.x) * rect.drawW,
-                    (dip.y - pip.y) * rect.drawH
-                  );
-                  const refLen = Math.max(segLen, baseSeg * 0.72, 16);
-                  const widthNorm = (refLen * cfg.widthFactor) / rect.drawW;
-                  const lenNorm = (refLen * cfg.lengthFactor) / rect.drawH;
-
-                  return {
-                    id: cfg.id,
-                    tip: { x: tip.x, y: tip.y, z: tip.z },
-                    dip: { x: dip.x, y: dip.y, z: dip.z },
-                    pip: { x: pip.x, y: pip.y, z: pip.z },
-                    mcp: { x: mcp.x, y: mcp.y, z: mcp.z },
-                    wrist: { x: wrist.x, y: wrist.y, z: wrist.z },
-                    palmNormal,
-                    handedness,
-                    widthScale: widthNorm,
-                    lengthScale: lenNorm,
-                  };
-                });
-
-                if (!lastTrackingRef.current) {
-                  lastTrackingRef.current = true;
-                  onTrackingChange?.(true);
-                }
-              } else {
-                latestPosesRef.current = null;
-                if (lastTrackingRef.current) {
-                  lastTrackingRef.current = false;
-                  onTrackingChange?.(false);
-                }
-              }
-            } catch {
-              // Ignore transient frame inference errors
+            const detectedFrame = tracker.detectVideo(video, nowMs);
+            latestCameraFrameRef.current = detectedFrame;
+            const hasHand = detectedFrame !== null;
+            if (lastTrackingRef.current !== hasHand) {
+              lastTrackingRef.current = hasHand;
+              onTrackingChangeRef.current?.(hasHand);
             }
           }
 
-          if (canSampleAmbient && latestPosesRef.current) {
-            ambientRef.current = sampleFingerSkinAmbient(
+          const cameraFrame = latestCameraFrameRef.current;
+          if (canSampleAmbient && cameraFrame) {
+            ambientRef.current = sampleDirectionalSkinLight(
               video,
-              latestPosesRef.current,
+              cameraFrame.landmarks,
               ambientRef.current
             );
             lastAmbientSampleTimeRef.current = nowMs;
-            ambientFrameCounterRef.current = 0;
           }
 
-          if (!compareCleanRef.current && latestPosesRef.current && threeScene) {
-            threeScene.renderNails(
-              cssW,
-              cssH,
-              dpr,
-              rect,
-              latestPosesRef.current,
-              designRef.current,
-              adjustmentRef.current,
-              ambientRef.current,
-              mirrorX,
-              deltaTimeSec
-            );
-          } else {
-            threeScene?.clear(cssW, cssH, dpr);
+          if (threeScene) {
+            if (!compareCleanRef.current && cameraFrame && activeDesignNow) {
+              threeScene.renderHandFrame(
+                cssW,
+                cssH,
+                dpr,
+                rect,
+                cameraFrame,
+                activeDesignNow,
+                adjustmentRef.current,
+                ambientRef.current,
+                mirrorX,
+                deltaTimeSec
+              );
+            } else {
+              threeScene.clear(cssW, cssH, dpr);
+            }
           }
         } else if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
           const rect = computeCoverRect(cssW, cssH, demoImg.naturalWidth, demoImg.naturalHeight);
@@ -468,31 +464,39 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           ctx.fillRect(0, 0, cssW, cssH);
           ctx.drawImage(demoImg, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
 
-          if (canSampleAmbient) {
-            ambientRef.current = sampleFingerSkinAmbient(
-              demoImg,
-              DEMO_3D_HAND_POSES,
-              ambientRef.current
-            );
-            lastAmbientSampleTimeRef.current = nowMs;
-            ambientFrameCounterRef.current = 0;
+          const demoFrame = demoFrameRef.current;
+          if (demoFrame) {
+            if (!lastTrackingRef.current) {
+              lastTrackingRef.current = true;
+              onTrackingChangeRef.current?.(true);
+            }
+            if (canSampleAmbient) {
+              ambientRef.current = sampleDirectionalSkinLight(
+                demoImg,
+                demoFrame.landmarks,
+                ambientRef.current
+              );
+              lastAmbientSampleTimeRef.current = nowMs;
+            }
           }
 
-          if (!compareCleanRef.current && threeScene) {
-            threeScene.renderNails(
-              cssW,
-              cssH,
-              dpr,
-              rect,
-              DEMO_3D_HAND_POSES,
-              designRef.current,
-              adjustmentRef.current,
-              ambientRef.current,
-              false,
-              deltaTimeSec
-            );
-          } else {
-            threeScene?.clear(cssW, cssH, dpr);
+          if (threeScene) {
+            if (!compareCleanRef.current && demoFrame && activeDesignNow) {
+              threeScene.renderHandFrame(
+                cssW,
+                cssH,
+                dpr,
+                rect,
+                demoFrame,
+                activeDesignNow,
+                adjustmentRef.current,
+                ambientRef.current,
+                false,
+                deltaTimeSec
+              );
+            } else {
+              threeScene.clear(cssW, cssH, dpr);
+            }
           }
         } else {
           threeScene?.clear(cssW, cssH, dpr);
@@ -517,7 +521,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
 
       rafId = requestAnimationFrame(renderFrame);
       return () => cancelAnimationFrame(rafId);
-    }, [onTrackingChange]);
+    }, []);
 
     useImperativeHandle(ref, () => ({
       captureCompositeDataUrl(studioName: string, logoDataUrl: string | null) {
@@ -533,7 +537,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         // Layer 1: Camera / Model Hand background
         ctx.drawImage(srcCanvas, 0, 0);
 
-        // Layer 2: WebGL 3D Cylindrical Nails overlay
+        // Layer 2: WebGL V9 3D Volumetric Nails overlay
         const glCanvas = glCanvasRef.current;
         if (glCanvas && glCanvas.width > 0 && glCanvas.height > 0) {
           ctx.drawImage(glCanvas, 0, 0, out.width, out.height);
@@ -578,10 +582,11 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.font = `600 ${fontSize}px "Cormorant Garamond", Georgia, serif`;
         ctx.fillText(studioName, out.width - pad, out.height - pad - fontSize * 0.65);
 
+        const designLabel = designRef.current?.name ?? 'Mão Natural';
         ctx.fillStyle = 'rgba(255, 248, 244, 0.68)';
         ctx.font = `500 ${Math.round(fontSize * 0.48)}px "Plus Jakarta Sans", sans-serif`;
         ctx.fillText(
-          `${designRef.current.name} • Provador AR 3D`,
+          `${designLabel} • Provador AR 3D`,
           out.width - pad,
           out.height - pad
         );
@@ -607,6 +612,56 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         {mode === 'camera' && cameraState === 'starting' && (
           <div className="ar-camera-status glass-pill">
             Iniciando câmera {modelReady ? 'e motor 3D WebGL...' : 'HD...'}
+          </div>
+        )}
+
+        {activeDesign === null && (
+          <div
+            className="glass-panel"
+            style={{
+              position: 'absolute',
+              top: 'calc(76px + var(--safe-top))',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 14,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              padding: '8px 14px',
+              borderRadius: '999px',
+              maxWidth: 'calc(100vw - 28px)',
+            }}
+          >
+            <span
+              style={{
+                fontSize: '0.74rem',
+                fontWeight: 500,
+                color: 'var(--glass-text)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Mão natural ao vivo • Escolha ou importe uma unha
+            </span>
+            {onRequestImportClient && (
+              <button
+                type="button"
+                onClick={onRequestImportClient}
+                className="quick-shape-pill is-active"
+                style={{ cursor: 'pointer' }}
+              >
+                Importar Foto
+              </button>
+            )}
+            {onRequestImportStudio && (
+              <button
+                type="button"
+                onClick={onRequestImportStudio}
+                className="quick-shape-pill"
+                style={{ cursor: 'pointer' }}
+              >
+                Catálogo
+              </button>
+            )}
           </div>
         )}
       </div>

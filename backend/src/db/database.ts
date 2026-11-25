@@ -11,6 +11,43 @@ const DB_PATH = path.join(DATA_DIR, 'nail-studio.sqlite');
 
 let dbInstance: DatabaseSync | null = null;
 
+interface SqliteTableColumnInfo {
+  cid: number;
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+}
+
+const NAIL_DESIGNS_V9_COLUMNS: ReadonlyArray<{
+  name: string;
+  definition: string;
+}> = [
+  { name: 'secondary_color', definition: 'TEXT' },
+  { name: 'finish', definition: "TEXT NOT NULL DEFAULT 'glossy'" },
+  { name: 'detected_shape', definition: 'TEXT' },
+  { name: 'detected_length', definition: 'REAL' },
+  { name: 'finger_specs_json', definition: 'TEXT' },
+  { name: 'is_studio_catalog', definition: 'INTEGER NOT NULL DEFAULT 0' },
+];
+
+function ensureNailDesignV9Columns(db: DatabaseSync): void {
+  const columns = db
+    .prepare('PRAGMA table_info(nail_designs)')
+    .all() as unknown as SqliteTableColumnInfo[];
+
+  const existingColumns = new Set(columns.map((column) => column.name));
+
+  for (const column of NAIL_DESIGNS_V9_COLUMNS) {
+    if (!existingColumns.has(column.name)) {
+      db.exec(
+        `ALTER TABLE nail_designs ADD COLUMN ${column.name} ${column.definition};`
+      );
+    }
+  }
+}
+
 function runMigrations(db: DatabaseSync): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS studio_config (
@@ -32,18 +69,26 @@ function runMigrations(db: DatabaseSync): void {
       style_type TEXT NOT NULL,
       base_color TEXT NOT NULL,
       accent_color TEXT NOT NULL,
+      secondary_color TEXT,
+      finish TEXT NOT NULL DEFAULT 'glossy',
       pattern_type TEXT NOT NULL,
       image_data_url TEXT,
       default_scale REAL NOT NULL DEFAULT 1.0,
       default_rotation REAL NOT NULL DEFAULT 0,
       default_opacity REAL NOT NULL DEFAULT 0.92,
       is_custom_reference INTEGER NOT NULL DEFAULT 0,
+      is_studio_catalog INTEGER NOT NULL DEFAULT 0,
+      detected_shape TEXT,
+      detected_length REAL,
+      finger_specs_json TEXT,
       created_at TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_nail_designs_category
       ON nail_designs (category);
   `);
+
+  ensureNailDesignV9Columns(db);
 }
 
 export function getDatabasePath(): string {

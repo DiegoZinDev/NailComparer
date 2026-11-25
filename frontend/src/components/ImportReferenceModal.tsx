@@ -29,6 +29,7 @@ import type {
 
 const SHAPE_LABELS: Record<NailShape, string> = {
   natural: 'Natural',
+  oval: 'Oval',
   almond: 'Amendoada',
   square: 'Quadrada',
   coffin: 'Bailarina',
@@ -62,14 +63,33 @@ function mapArtisticToDesignPattern(pattern: ArtisticPattern): NailPatternType {
   }
 }
 
+function getSilhouetteBorderRadius(shape: NailShape): string {
+  switch (shape) {
+    case 'square':
+      return '6px 6px 14px 14px';
+    case 'coffin':
+      return '10px 10px 16px 16px';
+    case 'stiletto':
+      return '50% 50% 24px 24px / 70% 70% 18px 18px';
+    case 'natural':
+      return '16px 16px 14px 14px';
+    case 'oval':
+    case 'almond':
+    default:
+      return '20px 20px 14px 14px';
+  }
+}
+
 interface ImportReferenceModalProps {
   open: boolean;
+  targetMode?: 'client' | 'studio';
   onClose: () => void;
   onCreateDesign: (design: Omit<NailDesign, 'id' | 'createdAt'>) => Promise<void>;
 }
 
 export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   open,
+  targetMode = 'client',
   onClose,
   onCreateDesign,
 }) => {
@@ -83,6 +103,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const isStudioMode = targetMode === 'studio';
 
   useEffect(() => {
     if (!open) {
@@ -100,7 +122,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   }, [fingerSpecs]);
 
   const activeSpec = fingerSpecs ? fingerSpecs[selectedFinger] : null;
-  const activePreviewUrl = fingerPreviews ? fingerPreviews[selectedFinger] : null;
+  const activePreviewUrl = activeSpec?.uvPatchDataUrl
+    ? activeSpec.uvPatchDataUrl
+    : fingerPreviews
+      ? fingerPreviews[selectedFinger]
+      : null;
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -112,7 +138,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       setAnalysis(result);
       setFingerSpecs(result.fingerSpecs);
 
-      // Focus initial inspection on the richest accent finger (usually ring or middle)
       const richFinger =
         ORDERED_FINGERS.find(
           (id) =>
@@ -221,7 +246,10 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     setSaving(true);
     try {
       const middleSpec = fingerSpecs.middle ?? activeSpec;
-      const swatchDataUrl = renderProceduralNailSwatchDataUrl(activeSpec, 180, 260);
+      const swatchDataUrl =
+        activeSpec.uvPatchDataUrl ??
+        middleSpec.uvPatchDataUrl ??
+        renderProceduralNailSwatchDataUrl(activeSpec, 180, 260);
       const gloss = finish === 'velvet' ? 0.56 : 0.96;
 
       const finalizedSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
@@ -234,15 +262,15 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
       await onCreateDesign({
         name: name.trim() || `${PATTERN_LABELS_PT[middleSpec.pattern]} 3D`,
-        category: 'Cliente',
+        category: isStudioMode ? 'Estudio' : 'Cliente',
         patternType: mapArtisticToDesignPattern(middleSpec.pattern),
         baseColor: middleSpec.baseColor,
         secondaryColor: middleSpec.secondaryColor,
         accentColor: middleSpec.accentColor,
         finish,
-        // Clean vector swatch preview only (NEVER raw cropped photo bitmap!)
         imageDataUrl: swatchDataUrl,
-        isCustom: true,
+        isCustom: !isStudioMode,
+        isStudioCatalog: isStudioMode,
         detectedShape: middleSpec.shape,
         detectedLength: middleSpec.relativeLength,
         fingerSpecs: finalizedSpecs,
@@ -278,9 +306,15 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
           >
             <div className="modal-header">
               <div>
-                <span className="modal-eyebrow">Procedural 3D Vision • 1024×1024 PBR</span>
+                <span className="modal-eyebrow">
+                  {isStudioMode
+                    ? 'Catálogo Oficial do Estúdio • Fidelidade V9'
+                    : 'Referência da Cliente • Fidelidade V9'}
+                </span>
                 <h2 id="import-title" className="modal-title">
-                  Reconstruir Referência 3D
+                  {isStudioMode
+                    ? 'Cadastrar Modelo no Catálogo do Estúdio'
+                    : 'Reconstruir Referência 3D'}
                 </h2>
               </div>
               <button
@@ -295,7 +329,17 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
             <form onSubmit={handleSubmit} className="modal-body">
               <div className="import-preview-stage">
-                <div className={`nail-crop-preview is-loupe ${activePreviewUrl ? 'has-texture' : ''}`}>
+                <div
+                  className={`nail-crop-preview is-loupe ${activePreviewUrl ? 'has-texture' : ''}`}
+                  style={
+                    activeSpec
+                      ? {
+                          backgroundColor: activeSpec.baseColor,
+                          borderRadius: getSilhouetteBorderRadius(activeSpec.shape),
+                        }
+                      : undefined
+                  }
+                >
                   {analyzing ? (
                     <div className="nail-crop-placeholder">
                       <Loader2 size={22} className="spin-icon" />
@@ -304,13 +348,15 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   ) : activePreviewUrl ? (
                     <img
                       src={activePreviewUrl}
-                      alt={`Prévia procedural ${FINGER_LABELS_PT[selectedFinger]}`}
+                      alt={`Prévia fiel ${FINGER_LABELS_PT[selectedFinger]}`}
                       draggable={false}
                     />
                   ) : (
                     <div className="nail-crop-placeholder">
                       <Sparkles size={22} />
-                      <span>Vetor 3D Limpo</span>
+                      <span>
+                        {isStudioMode ? 'Foto do Trabalho Real' : 'Foto da Referência'}
+                      </span>
                     </div>
                   )}
                   <div className="nail-crop-gloss" aria-hidden="true" />
@@ -336,7 +382,9 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
                   <label className="upload-action-btn is-secondary">
                     <Camera size={16} />
-                    <span>Fotografar Referência</span>
+                    <span>
+                      {isStudioMode ? 'Fotografar Trabalho' : 'Fotografar Referência'}
+                    </span>
                     <input
                       type="file"
                       accept="image/*"
@@ -349,16 +397,20 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   {analysis && activeSpec && (
                     <div className="extractor-status-note">
                       {analysis.method === 'mediapipe'
-                        ? `${analysis.detectedFingerIds.length} dedos detectados na foto • ${SHAPE_LABELS[activeSpec.shape]} (${activeSpec.relativeLength.toFixed(2)}x) • Arte vetorial 1024px pronta.`
-                        : `Close-up macro reconstruído com harmonia nos 5 dedos • ${SHAPE_LABELS[activeSpec.shape]}.`}
+                        ? `${analysis.detectedFingerIds.length} dedos detectados na foto • ${SHAPE_LABELS[activeSpec.shape]} (${activeSpec.relativeLength.toFixed(2)}x) • Textura PBR reconstruída.`
+                        : `Close-up macro reconstruído nos 5 dedos • ${SHAPE_LABELS[activeSpec.shape]}.`}
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* 5-Finger Procedural Reconstruction Preview Strip */}
-              {fingerSpecs && fingerPreviews && (
-                <div className="v5-five-finger-section" role="group" aria-label="Reconstrução dos 5 dedos">
+              {/* 5-Finger Real UV Patch Reconstruction Preview Strip */}
+              {fingerSpecs && (
+                <div
+                  className="v5-five-finger-section"
+                  role="group"
+                  aria-label="Reconstrução dos 5 dedos"
+                >
                   <div className="v5-section-head">
                     <span className="field-label">Reconstrução 5 Dedos (toque para editar)</span>
                     <button
@@ -374,6 +426,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                     {ORDERED_FINGERS.map((fid) => {
                       const spec = fingerSpecs[fid];
                       const isActive = fid === selectedFinger;
+                      const thumbRadius = getSilhouetteBorderRadius(spec.shape);
+                      const patchSrc = spec.uvPatchDataUrl;
                       return (
                         <button
                           key={fid}
@@ -381,8 +435,40 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                           onClick={() => setSelectedFinger(fid)}
                           className={`v5-finger-card ${isActive ? 'is-active' : ''}`}
                         >
-                          <div className="v5-finger-thumb">
-                            <img src={fingerPreviews[fid]} alt={FINGER_LABELS_PT[fid]} />
+                          <div
+                            className="v5-finger-thumb"
+                            style={{
+                              position: 'relative',
+                              backgroundColor: spec.baseColor,
+                              borderRadius: thumbRadius,
+                              border: '1px solid rgba(255,255,255,0.22)',
+                              boxShadow:
+                                'inset 0 2px 5px rgba(255,255,255,0.28), 0 3px 8px rgba(0,0,0,0.32)',
+                            }}
+                          >
+                            {patchSrc && (
+                              <img
+                                src={patchSrc}
+                                alt={FINGER_LABELS_PT[fid]}
+                                style={{
+                                  width: '100%',
+                                  height: '100%',
+                                  objectFit: 'cover',
+                                  borderRadius: thumbRadius,
+                                }}
+                              />
+                            )}
+                            <span
+                              aria-hidden="true"
+                              style={{
+                                position: 'absolute',
+                                inset: 0,
+                                borderRadius: thumbRadius,
+                                background:
+                                  'linear-gradient(115deg, rgba(255,255,255,0.34) 8%, rgba(255,255,255,0.06) 40%, transparent 62%)',
+                                pointerEvents: 'none',
+                              }}
+                            />
                           </div>
                           <span className="v5-finger-name">{FINGER_LABELS_PT[fid]}</span>
                           <span className="v5-finger-badge">{PATTERN_LABELS_PT[spec.pattern]}</span>
@@ -404,7 +490,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   <div className="extractor-refine-head">
                     <span>
                       <Palette size={12} style={{ verticalAlign: 'middle', marginRight: 5 }} />
-                      {FINGER_LABELS_PT[selectedFinger]} • {SHAPE_LABELS[activeSpec.shape]} ({activeSpec.relativeLength.toFixed(2)}x)
+                      {FINGER_LABELS_PT[selectedFinger]} • {SHAPE_LABELS[activeSpec.shape]} (
+                      {activeSpec.relativeLength.toFixed(2)}x)
                     </span>
                     <span className="v5-source-pill">
                       {activeSpec.detectedFromPhoto ? 'Extraído da Foto' : 'Harmonia Automática'}
@@ -454,13 +541,19 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
               )}
 
               <label className="field-group">
-                <span className="field-label">Nome do Set 3D</span>
+                <span className="field-label">
+                  {isStudioMode ? 'Nome do Modelo no Catálogo' : 'Nome do Set 3D'}
+                </span>
                 <input
                   type="text"
                   value={name}
                   maxLength={32}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="Ex: Aura Blush com Ondas Ouro 3D"
+                  placeholder={
+                    isStudioMode
+                      ? 'Ex: Amendoada Aura Rose Atelier'
+                      : 'Ex: Aura Blush com Ondas Ouro 3D'
+                  }
                   className="glass-input"
                 />
               </label>
@@ -499,7 +592,15 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   disabled={!fingerSpecs || analyzing || saving}
                 >
                   <Check size={16} />
-                  <span>{saving ? 'Aplicando Set 3D...' : 'Aplicar Set 3D na Mão'}</span>
+                  <span>
+                    {saving
+                      ? isStudioMode
+                        ? 'Salvando no Catálogo...'
+                        : 'Aplicando Set 3D...'
+                      : isStudioMode
+                        ? 'Cadastrar Modelo no Catálogo do Estúdio'
+                        : 'Aplicar Set 3D na Mão'}
+                  </span>
                 </button>
               </div>
             </form>

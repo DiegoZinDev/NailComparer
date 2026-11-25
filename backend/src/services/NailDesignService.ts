@@ -7,11 +7,19 @@ import {
   validateUpdateNailDesignDTO,
   type NailDesignDTO,
 } from '../dtos/NailDesignDto.js';
-import type { NailCategory, NailDesign, NailPatternType } from '../entities/NailDesign.js';
+import type {
+  NailCategory,
+  NailDesign,
+  NailFinish,
+  NailPatternType,
+} from '../entities/NailDesign.js';
 import { NailDesignRepository } from '../repositories/NailDesignRepository.js';
 import { BadRequestError, NotFoundError } from './AppError.js';
 
 const CATEGORY_ALIASES: Record<string, NailCategory> = {
+  estudio: 'estudio',
+  estúdio: 'estudio',
+  studio: 'estudio',
   francesinha: 'francesinha',
   gel: 'gel',
   cromado: 'cromado',
@@ -21,10 +29,22 @@ const CATEGORY_ALIASES: Record<string, NailCategory> = {
   cliente: 'cliente',
 };
 
+const FINISH_ALIASES: Record<string, NailFinish> = {
+  glossy: 'glossy',
+  glossy_gel: 'glossy',
+  jelly_translucent: 'glossy',
+  chrome: 'chrome',
+  chrome_mirror: 'chrome',
+  velvet: 'velvet',
+  velvet_matte: 'velvet',
+  cat_eye: 'velvet',
+  glitter: 'glitter',
+};
+
 export type NailDesignResponseDTO = NailDesignDTO & {
   isCustom: boolean;
   secondaryColor: string;
-  finish: 'glossy' | 'chrome' | 'velvet' | 'glitter';
+  finish: NailFinish;
 };
 
 export class NailDesignService {
@@ -76,20 +96,33 @@ export class NailDesignService {
     const input = validation.data;
     const generatedId = this.resolveUniqueId(input.id);
 
+    const patternType: NailPatternType =
+      input.patternType ?? (input.imageDataUrl ? 'custom-photo' : 'solid');
+    const resolvedFinish: NailFinish =
+      input.finish ?? this.deriveFinish(patternType);
+    const resolvedAccentColor = input.accentColor ?? '#FFFFFF';
+    const resolvedSecondaryColor =
+      input.secondaryColor !== undefined ? input.secondaryColor : null;
+
     const entity: NailDesign = {
       id: generatedId,
       name: input.name,
       category: input.category,
       styleType: input.styleType ?? (input.imageDataUrl ? 'image' : 'procedural'),
       baseColor: input.baseColor ?? '#F3D5C0',
-      accentColor: input.accentColor ?? '#FFFFFF',
-      patternType:
-        input.patternType ?? (input.imageDataUrl ? 'custom-photo' : 'solid'),
+      secondaryColor: resolvedSecondaryColor,
+      accentColor: resolvedAccentColor,
+      finish: resolvedFinish,
+      patternType,
       imageDataUrl: input.imageDataUrl ?? null,
       defaultScale: input.defaultScale ?? 1.0,
       defaultRotation: input.defaultRotation ?? 0,
       defaultOpacity: input.defaultOpacity ?? 0.92,
       isCustomReference: input.isCustomReference ?? false,
+      isStudioCatalog: input.isStudioCatalog ?? input.category === 'estudio',
+      detectedShape: input.detectedShape ?? null,
+      detectedLength: input.detectedLength ?? null,
+      fingerSpecs: input.fingerSpecs ?? null,
       createdAt: new Date().toISOString(),
     };
 
@@ -168,6 +201,12 @@ export class NailDesignService {
     return CATEGORY_ALIASES[trimmed.toLowerCase()];
   }
 
+  private normalizeFinish(value: unknown): NailFinish | undefined {
+    if (typeof value !== 'string') return undefined;
+    const key = value.trim().toLowerCase();
+    return FINISH_ALIASES[key];
+  }
+
   private normalizeIncomingPayload(payload: unknown, isPartial: boolean): unknown {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return payload;
@@ -181,6 +220,15 @@ export class NailDesignService {
       if (mapped) {
         normalized.category = mapped;
       }
+    }
+
+    if (raw.finish !== undefined) {
+      const mappedFinish = this.normalizeFinish(raw.finish);
+      if (mappedFinish) {
+        normalized.finish = mappedFinish;
+      }
+    } else if (!isPartial && raw.patternType !== undefined && typeof raw.patternType === 'string') {
+      normalized.finish = this.deriveFinish(raw.patternType as NailPatternType);
     }
 
     if (normalized.isCustomReference === undefined && typeof raw.isCustom === 'boolean') {
@@ -205,14 +253,12 @@ export class NailDesignService {
     return {
       ...dto,
       isCustom: dto.isCustomReference,
-      secondaryColor: dto.accentColor,
-      finish: this.deriveFinish(dto.patternType),
+      secondaryColor: dto.secondaryColor ?? dto.accentColor,
+      finish: dto.finish ?? this.deriveFinish(dto.patternType),
     };
   }
 
-  private deriveFinish(
-    patternType: NailPatternType
-  ): 'glossy' | 'chrome' | 'velvet' | 'glitter' {
+  private deriveFinish(patternType: NailPatternType): NailFinish {
     switch (patternType) {
       case 'chrome':
       case 'aurora':

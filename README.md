@@ -45,6 +45,37 @@ Os módulos [`frontend/src/lib/threeNailScene.ts`](frontend/src/lib/threeNailSce
 
 ---
 
+## 2.1 Arquitetura V9 (`feat/v9-photorealistic-ar-true-fidelity`) — AR Fotorrealista, Cinemática 3D & Reconstrução Híbrida
+
+A versão **V9** redefine todo o pipeline de tracking, geometria anatômica, shaders PBR, reconstrução visual e experiência do estúdio em **4 Pilares Integrados**:
+
+### Pilar 1: Tracking 3D Zero-Tick & Cinemática Anatômica Independente
+- **Sincronização Zero-Tick (`ARCameraCanvas.tsx` + `handTrackingWorker.ts`)**: O loop de visão é sincronizado diretamente com a chegada de cada frame real da câmera via `video.requestVideoFrameCallback` (com fallback limpo por `video.currentTime` quando indisponível). O controlador desacoplado [`HandTrackerController`](frontend/src/lib/handTrackingWorker.ts) (`detectVideo` em modo `VIDEO` com timestamps estritamente monotônicos e `detectImage` para a mão modelo) retorna o pacote unificado `HandSkeletonFrame` contendo simultaneamente `landmarks` (2D normalizados) e `worldLandmarks` (métricos em 3D).
+- **Filtro Contínuo Sem Chave Binária (`handKinematics.ts`)**: [`HandSkeletonFilter`](frontend/src/lib/handKinematics.ts) aplica o `OneEuroFilter` exato e contínuo (Casiez et al.) nos **21 pontos 2D** e nos **21 pontos `worldLandmarks`** antes da cinemática, eliminando qualquer chave binária `isStationary` (zero congelamento ou salto abrupto), com **histerese de lateralidade de 10 frames** (`HANDEDNESS_LOCK_FRAMES = 10`).
+- **Câmera Perspectiva Calibrada & Projeção Métrica (`threeNailScene.ts` + `handKinematics.ts`)**: Substituição da projeção ortográfica por `THREE.PerspectiveCamera(58°, aspect, 0.01, 10.0)` na origem `(0, 0, 0)` olhando `-Z`, acoplada a `projectHandToPerspectiveMeters` para preservar escorço 3D nativo ao aproximar ou inclinar os dedos com erro sub-pixel no crop `object-fit: cover`.
+- **Cinemática Independente por Dedo + Polegar Pronado (`handKinematics.ts`)**: `computeFingerAnatomicalBasis` constrói uma base ortonormal destrógira rigorosa (`det(M) = +1`) por dedo combinando o eixo lateral palmar e a normal do plano de flexão `(PIP - MCP) × (DIP - PIP)` (e fallback `(DIP - PIP) × (TIP - DIP)`), permitindo que cada dedo flexione `0° → 140°` de forma independente. Para o **polegar (`thumb`)**, aplica **pronação anatômica calibrada (~65°)** ao redor de `axisY` com estabilização de oposição e flexão.
+- **Oclusão Volumétrica Completa da Mão (`threeNailScene.ts`)**: Além dos cilindros coaxiais nas 3 falanges (`MCP→PIP`, `PIP→DIP`, `DIP→TIP`) e esferas articulares em `MCP`, `PIP`, `DIP` mais a **polpa distal ventral** (`distalPulpMesh` em `lerp(DIP, TIP, 0.82)` deslocada `-0.12 * distalRadius` ao longo de `-axisZ`), a cena mantém um **oclusor volumétrico fechado da palma/metacarpos** em heptágono extrudado de 16 vértices (`WRIST`, `THUMB_CMC`, `THUMB_MCP`, `INDEX_MCP`, `MIDDLE_MCP`, `RING_MCP`, `PINKY_MCP`) pré-alocado fora do `requestAnimationFrame` (`renderOrder: 1`, `colorWrite: false`, `depthWrite: true`).
+
+### Pilar 2: Malha Anatômica de Salão `40×48` & Shaders PBR Fotorrealistas
+- **Malha Anatômica de Salão `40×48` (`nail3DGeometry.ts`)**: `createVolumetricNailGeometry` gera malha fechada de alta resolução (`40 × 48` subdivisões) suportando os **6 formatos de salão** (`natural`, `oval`, `almond`, `coffin`, `square`, `stiletto`) com pisos mínimos arredondados na ponta (`TIP_MIN_HALF_W` entre `0.085` no stiletto e `0.44` no square — **zero espinhos ou pontas cônicas**), aderência dorsal exata na cutícula (`zTop === 0` em `v = 0, u = 0.5`, `dorsalOffset = phalanxRadiusMeters * 0.88`), **Arco C** transversal (`cCurveDepth = 0.22`) e UVs contínuos compatíveis com relevo `displacementMap` 3D (`0.00022 m` a `0.00050 m`).
+- **Skirt AO Conformal na Cutícula (`nail3DGeometry.ts` + `nailShaderMaterials.ts`)**: `createCuticleContactSkirtGeometry` constrói uma casca curva conformal acompanhando o contorno parabólico da cutícula (`v ∈ [-0.04, 0.24]`) e sulcos laterais (`v ∈ [0, 0.58]`), renderizada com textura quente rosada-marrom em `THREE.MultiplyBlending` (`depthWrite: false`, `premultipliedAlpha: false`) para fundir organicamente a lâmina ungueal à pele sem retângulos ou halos brancos.
+- **Shaders PBR & Studio Room PMREM IBL (`nailShaderMaterials.ts`)**: `createStudioRoomEnvMap` sintetiza via `THREE.PMREMGenerator` um ambiente de estúdio com janelas de céu em gradiente, difusores *softbox*, faixa especular fina para reflexo líquido de gel UV (`clearcoat: 1.0`, `clearcoatRoughness: 0.035`, `ior: 1.52`) e rebatedor quente inferior em tom de pele, modulados por `sampleDirectionalSkinLight` (3 patches `6×6` para estimar cor, luminância, azimute e elevação da luz real do ambiente).
+- **Underside Côncavo Translúcido Tingido Dinamicamente (`nailShaderMaterials.ts`)**: A cavidade ventral (`Grupo 1`, `v >= 0.40`) recebe `createUndersideNailMaterial` com `aoMap` de sulcos laterais/hiponíquio e `updateUndersideMaterialTint` executado exclusivamente na troca de cor/design (fora do RAF), mesclando ~30% da cor do esmalte dorsal ao marfim quente translúcido (`#E6D5C8`) na borda livre.
+
+### Pilar 3: Pipeline Híbrido de Reconstrução de Referência & Migração SQLite V9
+- **Endpoint Vision AI Backend (`POST /api/vision/reconstruct-reference`)**: Implementado em [`VisionController`](backend/src/controllers/VisionController.ts), [`VisionDto`](backend/src/dtos/VisionDto.ts) e [`ReferenceVisionService`](backend/src/services/ReferenceVisionService.ts). Quando `GEMINI_API_KEY` ou `OPENAI_API_KEY` estão configuradas, realiza reconstrução estruturada por dedo (`shape`, `tipRoundness`, `extensionMm`, `lengthMultiplier`, cores HEX, `finish`, relevos e texturas UV canônicas `1024×1024`); quando ausentes, responde cleanly `{ mode: 'local-fallback-required', configured: false }`.
+- **Fallback Local High-Res `320×480` → UV `512×512` (`perFingerVisionAnalyzer.ts` + `proceduralPBRSynthesizer.ts`)**: Extrai ROI vertical em alta resolução `320×480` por dedo diretamente da foto original, segmenta a placa ungueal (CIELab + HSV + Sobel + prior elíptico) e retifica textura UV `512×512` cobrindo **94% da placa** (`u ∈ [0.03, 0.97], v ∈ [0.04, 0.96]`). Executa **inpainting cirúrgico apenas nos pixels de reflexo especular estourado** (`luma > 0.92 && sat < 0.12`), preservando integralmente cores profundas como vinho (`#52101E`), preto ou esmaltes escuros, derivando `displacementMap`, `normalMap` via operador **Scharr 3×3**, `metalnessMap`, `roughnessMap` e swatches reais fotorrealistas (`swatchPreview.ts`).
+- **Migração SQLite V9 (`database.ts` + `NailDesign.ts` + `NailDesignRepository.ts`)**: Evolução idempotente da tabela `nail_designs` (`ensureNailDesignV9Columns`) adicionando `secondary_color`, `finish`, `detected_shape`, `detected_length`, **`finger_specs_json`** (especificações completas dos 5 dedos + mapas UV) e **`is_studio_catalog`** (distinção explícita entre *Catálogo do Estúdio* e *Referência da Cliente*).
+
+### Pilar 4: UX Clean, Zero Seeds Fictícios & Catálogo do Estúdio Real
+- **UX Limpa Sem Barra de Formatos "Joguinho" (`App.tsx` + `ARCameraCanvas.tsx` + `MagneticDesignDock.tsx`)**: Remoção da barra inferior fixa de seleção rápida de formatos, iniciando na mão natural limpa com CTA contextual discreto (*Importar Foto* / *Catálogo*) e 2 abas limpas no dock (`Referência da Cliente` e `Catálogo do Estúdio`).
+- **Zero Seeds Fictícios (`presets.ts` + `seed.ts`)**: `SEED_NAIL_DESIGNS` e `DEFAULT_NAIL_DESIGNS` são estritamente vazios (`[]`). O catálogo nasce limpo para que o estúdio cadastre seus próprios trabalhos reais.
+- **Micro-Ajustes Técnicos de Encaixe (`NailAdjustControls.tsx`)**: Drawer enxuto focado exclusivamente em **Largura de Encaixe (`0.85x–1.20x`)**, **Comprimento Fino (`±15%`)** e **Opacidade / Realismo (`70%–100%`)**, mantendo a geometria/formato anatômico detectado da referência ou modelo cadastrado.
+- **Fluxo Oficial do Catálogo do Estúdio (`ImportReferenceModal.tsx` + `MagneticDesignDock.tsx`)**: O mesmo motor de reconstrução V9 alimenta o botão *Cadastrar Modelo* na aba `Catálogo do Estúdio`, salvando modelos reais com `isStudioCatalog: true` e `category: 'estudio'`.
+- **Remoção de Código Morto**: Exclusão definitiva dos motores legados `frontend/src/lib/webglNailEngine.ts`, `frontend/src/lib/nail3DReconstructor.ts` e `frontend/src/lib/nailExtractor.ts`, além de zero vídeos `.mp4` no repositório.
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:
@@ -54,11 +85,13 @@ backend/src/
 ├── controllers/   # Camada HTTP (Request/Response + delegação para Services)
 │   ├── HealthController.ts
 │   ├── StudioConfigController.ts
-│   └── NailDesignController.ts
-├── services/      # Regras de negócio, validação de DTOs, enriquecimento e AppError
+│   ├── NailDesignController.ts
+│   └── VisionController.ts
+├── services/      # Regras de negócio, validação de DTOs, reconstrução Vision & AppError
 │   ├── AppError.ts
 │   ├── StudioConfigService.ts
-│   └── NailDesignService.ts
+│   ├── NailDesignService.ts
+│   └── ReferenceVisionService.ts
 ├── repositories/  # Único ponto autorizado a executar SQL via node:sqlite
 │   ├── StudioConfigRepository.ts
 │   └── NailDesignRepository.ts
@@ -67,8 +100,9 @@ backend/src/
 │   └── NailDesign.ts
 ├── dtos/          # Contratos de entrada/saída e validadores puros
 │   ├── StudioConfigDto.ts
-│   └── NailDesignDto.ts
-├── db/            # Conexão SQLite (WAL), DDL de migração e Seed idempotente
+│   ├── NailDesignDto.ts
+│   └── VisionDto.ts
+├── db/            # Conexão SQLite (WAL), DDL de migração V9 e Seed idempotente
 │   ├── database.ts
 │   └── seed.ts
 ├── routes/        # Roteamento REST (/api/*)
@@ -77,29 +111,20 @@ backend/src/
 └── index.ts       # Bootstrap do servidor (porta padrão 3001) e graceful shutdown
 ```
 
-- **Regra de Isolamento SQL**: Nenhuma query SQL (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`) existe em `controllers/` ou `services/`; toda persistência é encapsulada em `repositories/` e `db/`.
+- **Regra de Isolamento SQL**: Nenhuma query SQL (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `ALTER TABLE`, `PRAGMA`) existe em `controllers/` ou `services/`; toda persistência é encapsulada em `repositories/` e `db/`.
 - **Serving Unificado em Produção**: Quando `frontend/dist/` está compilado, o backend Express serve os assets estáticos e fallback SPA diretamente na mesma origem (`http://localhost:3001`).
 
 ---
 
-## 4. Banco `node:sqlite` & 10 Seeds de Unhas
+## 4. Banco `node:sqlite` V9 & Catálogo Real Sem Seeds Fictícios
 
 O banco relacional embarcado utiliza o módulo nativo `node:sqlite` (`DatabaseSync`) em `backend/data/nail-studio.sqlite` com `PRAGMA journal_mode = WAL` e `PRAGMA foreign_keys = ON`.
 
 - **Tabelas**:
   - `studio_config` (`id = 1` singleton): nome do estúdio, WhatsApp, `logo_data_url`, `theme_preset`, `primary_color`, `accent_color`, `surface_color`, `updated_at`.
-  - `nail_designs`: catálogo de modelos procedurais e referências personalizadas (`id`, `name`, `category`, `style_type`, `base_color`, `accent_color`, `pattern_type`, `image_data_url`, `default_scale`, `default_rotation`, `default_opacity`, `is_custom_reference`, `created_at`).
-- **Seed Idempotente (`backend/src/db/seed.ts`)**: Executado automaticamente no startup (`startServer()`) e via `npm run seed`. Popula a configuração padrão **`Atelier Lumière Nails`** e **10 designs iniciais** cobrindo todas as técnicas:
-  1. `francesinha-perolada` — Francesinha Clássica Perolada
-  2. `baby-boomer-rose` — Baby Boomer Rosé
-  3. `glazed-donut-cromado` — Glazed Donut Cromado
-  4. `vermelho-valentino` — Vermelho Valentino Gloss
-  5. `nude-leitoso` — Nude Leitoso Minimalista
-  6. `francesinha-dourada` — Francesinha Dourada Luxo
-  7. `lilas-aurora` — Lilás Pastel Aurora
-  8. `onix-folha-ouro` — Preto Ônix + Folha de Ouro
-  9. `marmore-quartzo` — Mármore Quartzo Rosa
-  10. `cat-eye-champagne` — Cat Eye Magnético Champagne
+  - `nail_designs`: catálogo real do estúdio e referências das clientes (`id`, `name`, `category`, `style_type`, `base_color`, `accent_color`, `secondary_color`, `finish`, `pattern_type`, `image_data_url`, `default_scale`, `default_rotation`, `default_opacity`, `is_custom_reference`, `is_studio_catalog`, `detected_shape`, `detected_length`, `finger_specs_json`, `created_at`).
+- **Migração Idempotente V9 (`ensureNailDesignV9Columns`)**: Garante automaticamente a presença das colunas V9 (`secondary_color`, `finish`, `detected_shape`, `detected_length`, `finger_specs_json`, `is_studio_catalog`) em bancos pré-existentes sem perda de dados.
+- **Seed Idempotente (`backend/src/db/seed.ts`)**: Executado automaticamente no startup (`startServer()`) e via `npm run seed`. Popula exclusivamente a configuração White-Label padrão **`Atelier Lumière Nails`** mantendo **`DEFAULT_NAIL_DESIGNS = []`** (zero seeds fictícios de unhas — catálogo 100% real cadastrado pelo estúdio).
 
 ---
 
@@ -118,14 +143,13 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
 
 ---
 
-## 6. Analisador Visual por Dedo (`PerFingerVisionAnalyzer`), Síntese PBR & UI Limpa
+## 6. Analisador Visual Híbrido (`PerFingerVisionAnalyzer`), Síntese PBR & UI Limpa
 
-- **PerFingerVisionAnalyzer (`frontend/src/lib/perFingerVisionAnalyzer.ts` + `ImportReferenceModal.tsx`)**:
-  - Ao importar uma foto de referência (galeria ou câmera), executa MediaPipe `HandLandmarker` em modo **`IMAGE` (`numHands: 2`)** para localizar **todos os 5 dedos visíveis independentemente** (`thumb`, `index`, `middle`, `ring`, `pinky`) — com fallback inteligente `smart-macro` para closes extremos de 1 a 3 unhas.
-  - Segmenta exclusivamente a placa ungueal (excluindo pele, anéis e fundo), mede formato (`natural`, `square`, `coffin`, `almond`, `stiletto`) e proporção (`relativeLength`, `relativeWidth`), extrai 3 camadas cromáticas (`baseColor`, `secondaryColor`, `accentColor`), detecta `strokeAnchors` `(u, v)` para relevos 3D e classifica entre **6 padrões artísticos**: `solid_gloss`, `chrome_mirror`, `gold_3d_waves`, `aura_gradient`, `french_tip` e `floral_accent`.
-  - Aplica **Herança Harmônica (`applyHarmonicInheritance`)** para dedos não visíveis na foto, preservando unhas de destaque (*filha única* no anelar/médio) e harmonizando os demais dedos em um `Record<FingerId, NailFingerDesignSpec>` completo.
-- **Prévia Vetorial Limpa Sem Pixel Sujo de Foto (`renderProceduralNailSwatchDataUrl`)**: Tanto o modal de importação (grade interativa dos 5 dedos com edição por dedo e botão *Uniformizar nos 5*) quanto o dock utilizam exclusivamente swatches vetoriais procedurais gerados a partir do `NailFingerDesignSpec` — garantindo zero pixel de foto borrada/cortada na renderização 3D e na UI.
-- **Seletor Rápido + Dock Limpo em 2 Abas**: Seletor discreto de 5 formatos acima do dock, 2 abas limpas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**) e destaque máximo para o botão **`+ Importar Referência`**.
+- **Pipeline Híbrido por Dedo (`frontend/src/lib/perFingerVisionAnalyzer.ts` + `ReferenceVisionService.ts` + `ImportReferenceModal.tsx`)**:
+  - Ao importar uma foto de referência (ou cadastrar um modelo no Catálogo do Estúdio), tenta primeiro a reconstrução estruturada via `POST /api/vision/reconstruct-reference` (quando `GEMINI_API_KEY` ou `OPENAI_API_KEY` está ativa no backend) e executa com perfeição o fallback local high-res `320×480` via MediaPipe `HandLandmarker` em modo **`IMAGE` (`numHands: 2`)** com fallback macro `smart-macro`.
+  - Segmenta exclusivamente a placa ungueal, retifica textura UV `512×512` cobrindo 94% da placa com **inpainting cirúrgico apenas de reflexo especular**, preserva cores profundas (como vinho `#52101E`), extrai formato entre os 6 disponíveis (`natural`, `oval`, `almond`, `square`, `coffin`, `stiletto`), comprimento/extensão em mm e deriva `displacementMap`, `normalMap` (Scharr 3×3), `metalnessMap` e `roughnessMap`.
+  - Aplica **Herança Harmônica (`applyHarmonicInheritance`)** para dedos não visíveis na foto, preservando unhas de destaque (*filha única*) em um `Record<FingerId, NailFingerDesignSpec>` completo.
+- **Swatches Fotorrealistas & Dock em 2 Abas (`swatchPreview.ts` + `MagneticDesignDock.tsx`)**: Exibe a textura real reconstruída com sombreamento Arco C e brilho especular de gel (ou síntese vetorial limpa quando aplicável) nas 2 abas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**), com CTAs contextuais **`Importar Referência`** e **`Cadastrar Modelo`**.
 - **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera/modelo + overlay WebGL Three.js 3D + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
 
 ---
@@ -180,11 +204,12 @@ npm run start          # Inicia node backend/dist/index.js na porta 3001
 | `GET` | `/api/health` | Healthcheck do serviço e status do `node:sqlite` | `200` |
 | `GET` | `/api/config` | Retorna a configuração White-Label atual do estúdio | `200` |
 | `PUT` | `/api/config` | Atualiza nome, WhatsApp, logo, preset e cores do estúdio | `200` / `400` |
-| `GET` | `/api/designs` | Lista todos os designs (aceita filtro `?category=francesinha\|gel\|cromado\|nail-art\|cliente`) | `200` / `400` |
+| `GET` | `/api/designs` | Lista todos os designs (aceita filtro `?category=estudio\|francesinha\|gel\|cromado\|nail-art\|cliente`) | `200` / `400` |
 | `GET` | `/api/designs/:id` | Busca um design específico por ID | `200` / `404` |
-| `POST` | `/api/designs` | Cria um novo design ou referência importada da cliente | `201` / `400` |
+| `POST` | `/api/designs` | Cria um novo modelo do catálogo do estúdio ou referência da cliente (com `fingerSpecs` e `isStudioCatalog`) | `201` / `400` |
 | `PATCH` | `/api/designs/:id` | Atualiza parcialmente propriedades de um design existente | `200` / `400` / `404` |
 | `DELETE` | `/api/designs/:id` | Remove um design pelo ID | `200` / `404` |
+| `POST` | `/api/vision/reconstruct-reference` | Reconstrução VLM estruturada por dedo (ou sinaliza `local-fallback-required` sem chave de API) | `200` / `400` |
 
 ---
 

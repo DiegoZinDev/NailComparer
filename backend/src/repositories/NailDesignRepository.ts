@@ -5,7 +5,37 @@ import {
   type NailCategory,
   type NailDesign,
   type NailDesignRow,
+  type NailFingerSpecsMap,
 } from '../entities/NailDesign.js';
+
+const NAIL_DESIGN_SELECT_COLUMNS = `
+  id,
+  name,
+  category,
+  style_type,
+  base_color,
+  accent_color,
+  secondary_color,
+  finish,
+  pattern_type,
+  image_data_url,
+  default_scale,
+  default_rotation,
+  default_opacity,
+  is_custom_reference,
+  is_studio_catalog,
+  detected_shape,
+  detected_length,
+  finger_specs_json,
+  created_at
+`;
+
+function serializeFingerSpecs(specs: NailFingerSpecsMap | null | undefined): string | null {
+  if (!specs) {
+    return null;
+  }
+  return JSON.stringify(specs);
+}
 
 export class NailDesignRepository {
   private readonly db: DatabaseSync;
@@ -18,22 +48,10 @@ export class NailDesignRepository {
     if (category) {
       const stmt = this.db.prepare(`
         SELECT
-          id,
-          name,
-          category,
-          style_type,
-          base_color,
-          accent_color,
-          pattern_type,
-          image_data_url,
-          default_scale,
-          default_rotation,
-          default_opacity,
-          is_custom_reference,
-          created_at
+          ${NAIL_DESIGN_SELECT_COLUMNS}
         FROM nail_designs
         WHERE category = ?
-        ORDER BY is_custom_reference DESC, created_at ASC
+        ORDER BY is_custom_reference DESC, is_studio_catalog DESC, created_at ASC
       `);
       const rows = stmt.all(category) as unknown as NailDesignRow[];
       return rows.map(mapNailDesignRowToEntity);
@@ -41,21 +59,9 @@ export class NailDesignRepository {
 
     const stmt = this.db.prepare(`
       SELECT
-        id,
-        name,
-        category,
-        style_type,
-        base_color,
-        accent_color,
-        pattern_type,
-        image_data_url,
-        default_scale,
-        default_rotation,
-        default_opacity,
-        is_custom_reference,
-        created_at
+        ${NAIL_DESIGN_SELECT_COLUMNS}
       FROM nail_designs
-      ORDER BY is_custom_reference DESC, created_at ASC
+      ORDER BY is_custom_reference DESC, is_studio_catalog DESC, created_at ASC
     `);
     const rows = stmt.all() as unknown as NailDesignRow[];
     return rows.map(mapNailDesignRowToEntity);
@@ -64,19 +70,7 @@ export class NailDesignRepository {
   findById(id: string): NailDesign | null {
     const stmt = this.db.prepare(`
       SELECT
-        id,
-        name,
-        category,
-        style_type,
-        base_color,
-        accent_color,
-        pattern_type,
-        image_data_url,
-        default_scale,
-        default_rotation,
-        default_opacity,
-        is_custom_reference,
-        created_at
+        ${NAIL_DESIGN_SELECT_COLUMNS}
       FROM nail_designs
       WHERE id = ?
       LIMIT 1
@@ -95,14 +89,20 @@ export class NailDesignRepository {
         style_type,
         base_color,
         accent_color,
+        secondary_color,
+        finish,
         pattern_type,
         image_data_url,
         default_scale,
         default_rotation,
         default_opacity,
         is_custom_reference,
+        is_studio_catalog,
+        detected_shape,
+        detected_length,
+        finger_specs_json,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -112,12 +112,18 @@ export class NailDesignRepository {
       entity.styleType,
       entity.baseColor,
       entity.accentColor,
+      entity.secondaryColor,
+      entity.finish,
       entity.patternType,
       entity.imageDataUrl,
       entity.defaultScale,
       entity.defaultRotation,
       entity.defaultOpacity,
       entity.isCustomReference ? 1 : 0,
+      entity.isStudioCatalog ? 1 : 0,
+      entity.detectedShape,
+      entity.detectedLength,
+      serializeFingerSpecs(entity.fingerSpecs),
       entity.createdAt
     );
 
@@ -160,6 +166,14 @@ export class NailDesignRepository {
       setClauses.push('accent_color = ?');
       values.push(partial.accentColor);
     }
+    if (partial.secondaryColor !== undefined) {
+      setClauses.push('secondary_color = ?');
+      values.push(partial.secondaryColor);
+    }
+    if (partial.finish !== undefined) {
+      setClauses.push('finish = ?');
+      values.push(partial.finish);
+    }
     if (partial.patternType !== undefined) {
       setClauses.push('pattern_type = ?');
       values.push(partial.patternType);
@@ -183,6 +197,22 @@ export class NailDesignRepository {
     if (partial.isCustomReference !== undefined) {
       setClauses.push('is_custom_reference = ?');
       values.push(partial.isCustomReference ? 1 : 0);
+    }
+    if (partial.isStudioCatalog !== undefined) {
+      setClauses.push('is_studio_catalog = ?');
+      values.push(partial.isStudioCatalog ? 1 : 0);
+    }
+    if (partial.detectedShape !== undefined) {
+      setClauses.push('detected_shape = ?');
+      values.push(partial.detectedShape);
+    }
+    if (partial.detectedLength !== undefined) {
+      setClauses.push('detected_length = ?');
+      values.push(partial.detectedLength);
+    }
+    if (partial.fingerSpecs !== undefined) {
+      setClauses.push('finger_specs_json = ?');
+      values.push(serializeFingerSpecs(partial.fingerSpecs));
     }
 
     if (setClauses.length === 0) {

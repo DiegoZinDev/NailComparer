@@ -19,7 +19,7 @@ export function createApp(): express.Express {
   });
 
   app.use(cors());
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '25mb' }));
 
   app.use('/api', createApiRoutes());
 
@@ -67,7 +67,7 @@ export function createApp(): express.Express {
         'type' in err &&
         (err as { type?: string }).type === 'entity.too.large'
       ) {
-        res.status(413).json({ error: 'Payload excede o limite máximo de 10MB.' });
+        res.status(413).json({ error: 'Payload excede o limite máximo de 25MB.' });
         return;
       }
 

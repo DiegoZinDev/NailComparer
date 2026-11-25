@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Check, ImagePlus, Palette, RotateCcw, Sparkles, X } from 'lucide-react';
+import { Check, ImagePlus, Palette, Plus, RotateCcw, Sparkles, X } from 'lucide-react';
 import { DEFAULT_STUDIO_CONFIG, THEME_PRESETS } from '../data/presets';
 import { resizeImageToDataUrl } from '../lib/offlineStore';
 import { getStudioMonogram } from '../lib/swatchPreview';
@@ -12,6 +12,7 @@ interface WhiteLabelModalProps {
   onClose: () => void;
   onPreviewChange: (draft: StudioConfig) => void;
   onSave: (finalConfig: StudioConfig) => Promise<void>;
+  onOpenStudioCatalogImport?: () => void;
 }
 
 export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
@@ -20,6 +21,7 @@ export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
   onClose,
   onPreviewChange,
   onSave,
+  onOpenStudioCatalogImport,
 }) => {
   const [draft, setDraft] = useState<StudioConfig>(config);
   const [saving, setSaving] = useState(false);
@@ -264,6 +266,21 @@ export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
                   </label>
                 </div>
               </div>
+
+              {onOpenStudioCatalogImport && (
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ width: '100%' }}
+                  onClick={() => {
+                    onClose();
+                    onOpenStudioCatalogImport();
+                  }}
+                >
+                  <Plus size={15} />
+                  <span>Cadastrar Modelo no Catálogo</span>
+                </button>
+              )}
 
               <div className="modal-actions">
                 <button
