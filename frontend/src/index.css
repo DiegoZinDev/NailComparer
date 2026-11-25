@@ -119,14 +119,18 @@ body,
 /* Top White-Label Brand Bar */
 .top-hud {
   position: absolute;
-  top: calc(14px + var(--safe-top));
-  left: 14px;
-  right: 14px;
+  top: calc(12px + var(--safe-top));
+  left: 0;
+  right: 0;
   z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 6px;
+  padding: 0 10px;
+  max-width: 100vw;
+  box-sizing: border-box;
+  flex-wrap: nowrap;
   pointer-events: none;
 }
 
@@ -137,15 +141,17 @@ body,
 .brand-pill {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 6px 14px 6px 6px;
+  gap: 8px;
+  padding: 5px 10px 5px 5px;
   border-radius: 999px;
-  max-width: calc(100vw - 170px);
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: calc(100% - 175px);
 }
 
 .brand-avatar {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   overflow: hidden;
   flex-shrink: 0;
@@ -155,7 +161,7 @@ body,
   color: #161113;
   font-family: var(--font-serif);
   font-weight: 700;
-  font-size: 0.98rem;
+  font-size: 0.9rem;
   letter-spacing: 0.04em;
 }
 
@@ -166,15 +172,18 @@ body,
 }
 
 .brand-copy {
+  flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
 }
 
-.brand-name {
+.brand-name,
+.brand-pill-name {
   margin: 0;
+  min-width: 0;
   font-family: var(--font-serif);
-  font-size: 1.08rem;
+  font-size: 0.98rem;
   font-weight: 600;
   line-height: 1.05;
   letter-spacing: 0.015em;
@@ -187,7 +196,8 @@ body,
 .brand-subrow {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
+  min-width: 0;
   margin-top: 2px;
 }
 
@@ -206,7 +216,8 @@ body,
 }
 
 .active-design-caption {
-  font-size: 0.72rem;
+  min-width: 0;
+  font-size: 0.68rem;
   font-weight: 500;
   color: var(--glass-muted);
   white-space: nowrap;
@@ -218,42 +229,101 @@ body,
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
+.install-btn,
 .mode-toggle-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 40px;
-  padding: 0 13px;
+  justify-content: center;
+  gap: 5px;
+  height: 36px;
+  padding: 7px 9px;
   border-radius: 999px;
   font-family: var(--font-sans);
-  font-size: 0.76rem;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
   transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.install-btn {
+  border-color: rgba(243, 213, 192, 0.32);
+  color: var(--accent);
 }
 
 .mode-toggle-btn.is-live {
   border-color: var(--primary);
 }
 
-.glass-icon-btn {
-  width: 40px;
-  height: 40px;
+.glass-icon-btn,
+.icon-hud-btn {
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   display: grid;
   place-items: center;
+  flex-shrink: 0;
   cursor: pointer;
   transition: transform 0.16s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
-.glass-icon-btn.is-highlighted {
+.glass-icon-btn.is-highlighted,
+.icon-hud-btn.is-highlighted {
   border-color: var(--primary);
   color: var(--accent);
+}
+
+@media (min-width: 440px) {
+  .top-hud {
+    top: calc(14px + var(--safe-top));
+    gap: 10px;
+    padding: 0 14px;
+  }
+
+  .brand-pill {
+    gap: 10px;
+    padding: 6px 14px 6px 6px;
+    max-width: calc(100% - 230px);
+  }
+
+  .brand-avatar {
+    width: 36px;
+    height: 36px;
+    font-size: 0.98rem;
+  }
+
+  .brand-name,
+  .brand-pill-name {
+    font-size: 1.08rem;
+  }
+
+  .active-design-caption {
+    font-size: 0.72rem;
+  }
+
+  .top-actions {
+    gap: 8px;
+  }
+
+  .install-btn,
+  .mode-toggle-btn {
+    height: 40px;
+    padding: 0 13px;
+    gap: 6px;
+    font-size: 0.76rem;
+  }
+
+  .glass-icon-btn,
+  .icon-hud-btn {
+    width: 40px;
+    height: 40px;
+  }
 }
 
 /* Hand Guide Pill */
@@ -1430,4 +1500,140 @@ body,
   background: transparent;
   cursor: pointer;
 }
+
+/* PWA Install Modal & Clean Blueprint Badges */
+.install-platform-pill {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.install-platform-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #161113;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.install-platform-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.install-platform-copy strong {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--glass-text);
+}
+
+.install-platform-copy span {
+  font-size: 0.72rem;
+  color: var(--glass-muted);
+  line-height: 1.3;
+}
+
+.install-native-cta {
+  width: 100%;
+  flex: none;
+}
+
+.install-steps-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.install-step-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.install-step-num {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #161113;
+  font-size: 0.74rem;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.install-step-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.install-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.install-step-text strong {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--glass-text);
+}
+
+.install-step-text span {
+  font-size: 0.74rem;
+  line-height: 1.35;
+  color: var(--glass-muted);
+}
+
+.blueprint-meta-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.blueprint-meta-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: var(--glass-muted);
+}
+
+.blueprint-color-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
 

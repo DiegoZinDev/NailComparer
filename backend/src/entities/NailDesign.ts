@@ -39,12 +39,15 @@ export type ArtisticPattern =
   | 'french_tip'
   | 'floral_accent';
 
-export type NailFinishV9 =
+export type NailFinishV10 =
   | 'glossy_gel'
   | 'jelly_translucent'
   | 'chrome_mirror'
-  | 'velvet_matte'
-  | 'cat_eye';
+  | 'pearl_glazed'
+  | 'cat_eye'
+  | 'velvet_matte';
+
+export type NailFinishV9 = NailFinishV10;
 
 export type NailExtensionLevel =
   | 'Curta/Natural'
@@ -57,6 +60,105 @@ export interface StrokeAnchor {
   v: number;
   radius: number;
   angle: number;
+}
+
+// -----------------------------------------------------------------------------
+// V10 Mathematical Nail Design Blueprint (Compact ~2-6 KB Vector + Parametric JSON)
+// -----------------------------------------------------------------------------
+
+export type NailGradientMode =
+  | 'solid'
+  | 'vertical_ombre'
+  | 'radial_aura'
+  | 'cat_eye_band'
+  | 'pearl_chrome';
+
+export type NailBorderKind =
+  | 'none'
+  | 'full_metallic_outline'
+  | 'cuticle_cuff'
+  | 'classic_french'
+  | 'micro_french'
+  | 'v_french';
+
+export interface NailGeometryProfile {
+  profileHalfWidths: [number, number, number, number, number, number, number, number];
+  aspectRatio: number;
+  freeEdgeRatio: number;
+  tipRoundness: number;
+  shape: NailShape;
+}
+
+export interface NailBaseLayer {
+  baseColorHex: string;
+  gradientMode: NailGradientMode;
+  cuticleColorHex: string;
+  midColorHex: string;
+  tipColorHex: string;
+  finishStyle: NailFinishV10;
+  translucency: number;
+  metallicBase: number;
+  glossiness: number;
+}
+
+export interface NailBorderLayer {
+  kind: NailBorderKind;
+  colorHex: string;
+  thicknessNorm: number;
+  isMetallic: boolean;
+  is3DRaised: boolean;
+  smileCurveDepth: number;
+}
+
+export interface RibbonStrokePoint {
+  u: number;
+  v: number;
+  width: number;
+}
+
+export interface RibbonStrokeElement {
+  type: 'ribbon_stroke';
+  points: RibbonStrokePoint[];
+  colorHex: string;
+  highlightHex: string;
+  isMetallic: boolean;
+  reliefHeight: number;
+}
+
+export interface OrganicMotifPoint {
+  u: number;
+  v: number;
+}
+
+export interface OrganicMotifElement {
+  type: 'organic_motif';
+  contour: OrganicMotifPoint[];
+  fillColorHex: string;
+  shadeColorHex: string;
+  isMetallic: boolean;
+  reliefHeight: number;
+}
+
+export interface MicroGemElement {
+  type: 'micro_gem';
+  u: number;
+  v: number;
+  radius: number;
+  colorHex: string;
+  kind: 'gold_bead' | 'pearl' | 'crystal';
+}
+
+export type VectorArtElement =
+  | RibbonStrokeElement
+  | OrganicMotifElement
+  | MicroGemElement;
+
+export interface NailDesignBlueprint {
+  version: 10;
+  geometry: NailGeometryProfile;
+  baseLayer: NailBaseLayer;
+  borderLayer: NailBorderLayer;
+  artElements: VectorArtElement[];
 }
 
 export interface NailFingerDesignSpec {
@@ -72,7 +174,9 @@ export interface NailFingerDesignSpec {
   strokeAnchors: StrokeAnchor[];
   metallicIntensity: number;
   glossIntensity: number;
+  blueprint?: NailDesignBlueprint;
   extensionLevel?: NailExtensionLevel;
+  freeEdgeRatio?: number;
   extensionMm?: number;
   tipRoundness?: number;
   aspectRatio?: number;
@@ -82,12 +186,7 @@ export interface NailFingerDesignSpec {
   has3DRelief?: boolean;
   reliefDescription?: string;
   artDescription?: string;
-  finishStyle?: NailFinishV9;
-  uvPatchDataUrl?: string;
-  normalMapDataUrl?: string;
-  displacementMapDataUrl?: string;
-  metalnessMapDataUrl?: string;
-  roughnessMapDataUrl?: string;
+  finishStyle?: NailFinishV10;
   isImportedReference?: boolean;
 }
 

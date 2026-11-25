@@ -76,6 +76,33 @@ A versão **V9** redefine todo o pipeline de tracking, geometria anatômica, sha
 
 ---
 
+## 2.2 Arquitetura V10 (`feat/v10-fast-60fps-math-3d-pwa`) — Motor 60fps Mobile, Adaptação Anatômica Real, Blueprint Matemático & PWA 1-Toque
+
+A versão **V10** consolida o provador para uso comercial em celulares reais e hospedagem 100% gratuita (*Vercel Free Tier*), eliminando gargalos de CPU/GPU, APIs pagas de visão e distorções de encaixe através de **4 Pilares Integrados**:
+
+### Pilar 1 — Otimização Radical 60fps Mobile
+- **`<video>` Direto via CSS `object-fit: cover` (`ARCameraCanvas.tsx`)**: Fim da cópia 2D `ctx.drawImage(video)` 60×/s em canvas intermediário; o `<video>` e a mão modelo `<img>` são renderizados nativamente pelo compositor do navegador com overlay WebGL transparente (`pointerEvents: none`).
+- **Capture Sob Demanda com `preserveDrawingBuffer: false` (`threeNailScene.ts` + `ARCameraCanvas.tsx`)**: O contexto WebGL é inicializado com `preserveDrawingBuffer: false` e expõe `renderNow()`, chamado pontualmente na captura para garantir buffer válido sem penalizar o swapchain a cada frame.
+- **Pixel Ratio Adaptativo & Singleton MediaPipe (`threeNailScene.ts` + `handTrackingWorker.ts`)**: `pixelRatio <= 1.25` em viewports mobile (`<= 1.5` em desktop) e singleton único `@mediapipe/tasks-vision@0.10.18` WASM com pacing ~30Hz (`minIntervalMs: 30`) desacoplado do loop WebGL de 60fps.
+- **Oclusor Instanciado em Apenas 3 Draw Calls (`threeNailScene.ts`)**: Substituição de dezenas de meshes individuais por **2× `THREE.InstancedMesh`** (`15` cilindros de falange = 1 draw call + `20` esferas articulares/polpas distais = 1 draw call) + **1 mesh único da palma** (`16` vértices), reduzindo o oclusor inteiro da mão a apenas **3 draw calls**.
+- **Malha `20×24` & Fast-Path Opaco (`nail3DGeometry.ts` + `nailShaderMaterials.ts` + `App.tsx`)**: Redução da malha para `20×24` (`2.096` triângulos/unha mantendo Arco C `0.22` e cavidade ventral), `DEFAULT_ADJUSTMENT.opacity = 1.0` ativando o caminho rápido opaco (`transparent: false, depthWrite: true`), mapas PBR otimizados em **`512×512`** (`albedo`/`alpha`) e **`256×256`** (`normalMap`/`roughnessMap`/`metalnessMap`, ~12 MB VRAM total), **zero `displacementMap` / `bumpMap`** e **1 único readback `64×64` a cada `350ms`** compartilhado entre iluminação direcional e calibração ao vivo.
+
+### Pilar 2 — Adaptação Anatômica Real à Unha da Cliente
+- **Calibração Ao Vivo da Largura do Dedo (`liveFingerCalibrator.ts` + `handKinematics.ts`)**: [`LiveFingerCalibrator`](frontend/src/lib/liveFingerCalibrator.ts) traça um perfil transversal 1D de **32 amostras** perpendicular ao eixo `DIP → TIP` em `lerp(DIP, TIP, 0.35)` sobre o buffer compartilhado `64×64`, suavizado com **EMA lento (`0.08`)** e mapeado para `nailWidthMeters = 0.85 * liveFingerWidth`.
+- **Zero Distorção por Largura da Referência (`threeNailScene.ts`)**: A largura nativa da cliente controla 100% do encaixe lateral; `spec.relativeWidth` é ignorado na geometria 3D para que fotos importadas nunca estreitem ou alarguem artificialmente o dedo real da cliente.
+- **Cobertura Integral do Leito (`threeNailScene.ts` + `nail3DGeometry.ts`)**: `bedFraction = 1 / (1 + freeEdgeRatio)` (quantizado e limitado em `[0.44, 0.90]`) garante paredes paralelas sobre 100% do leito real da cliente (`v <= bedFraction`), restringindo o afinamento do formato (Stiletto, Amendoada, Bailarina) estritamente à borda livre (`v > bedFraction`).
+
+### Pilar 3 — Motor Matemático `NailDesignBlueprint` & Compilador PBR Vetorial Limpo (100% Client-Side / R$ 0,00)
+- **Extração Puramente Matemática Client-Side (`perFingerVisionAnalyzer.ts`)**: Opera em ROI compacto `128×192`, segmentando a placa ungueal com **flood-fill CIELab + YCbCr** anti-pele/fundo/anel, **K-Means determinístico em CIELab (`k = 4`)**, perfil geométrico **`profileHalfWidths[8]`**, **`borderLayer`** (francesinha, contorno metálico, cuff de cutícula) e vetorização automática de arte em **`ribbon_stroke`** (simplificação Ramer-Douglas-Peucker — RDP), **`organic_motif`** (contornos suaves de ~20 pontos) e **`micro_gem`** (pérolas, esferas douradas, cristais).
+- **Compilador PBR Vetorial `512×512` (`proceduralPBRSynthesizer.ts` + `swatchPreview.ts`)**: Compila mapas PBR limpos com filtro **Sobel 3×3 rápido (< 15ms/dedo)** a partir do `NailDesignBlueprint` — **ZERO pixels crus de foto em malhas 3D ou swatches**.
+- **Remoção Total da Rota Paga & Persistência Compacta (`apiRoutes.ts` + `NailDesignDto.ts`)**: Remoção definitiva de `VisionController.ts`, `ReferenceVisionService.ts`, `VisionDto.ts` e da rota `/api/vision/reconstruct-reference` (custo zero de API externa). Cada `blueprint` JSON compacto (**< 6 KB**) é persistido localmente em `IndexedDB` e no `SQLite` via `fingerSpecs`.
+
+### Pilar 4 — Retorno Definitivo do Botão Instalar PWA & HUD `360px`
+- **Botão `Instalar` Sempre Visível Fora do Modo `standalone` (`App.tsx` + `InstallAppModal.tsx`)**: O botão **Instalar** no `.top-hud` permanece visível sempre que `!isStandalone`, disparando `beforeinstallprompt` nativo em 1 toque quando disponível ou abrindo o guia visual responsivo [`InstallAppModal`](frontend/src/components/InstallAppModal.tsx) para Android (Chrome/Edge) e iOS (Safari).
+- **Blindagem Responsiva em `360px` (`index.css`)**: `.top-hud` sem quebra de linha (`flex-wrap: nowrap`), truncamento elegante em `.brand-pill` (`min-width: 0`, `text-overflow: ellipsis`) e botões compactos garantindo encaixe perfeito sem overflow horizontal a partir de `360px`.
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:
@@ -85,13 +112,11 @@ backend/src/
 ├── controllers/   # Camada HTTP (Request/Response + delegação para Services)
 │   ├── HealthController.ts
 │   ├── StudioConfigController.ts
-│   ├── NailDesignController.ts
-│   └── VisionController.ts
-├── services/      # Regras de negócio, validação de DTOs, reconstrução Vision & AppError
+│   └── NailDesignController.ts
+├── services/      # Regras de negócio, validação de DTOs & AppError (100% gratuito, zero VLM pago)
 │   ├── AppError.ts
 │   ├── StudioConfigService.ts
-│   ├── NailDesignService.ts
-│   └── ReferenceVisionService.ts
+│   └── NailDesignService.ts
 ├── repositories/  # Único ponto autorizado a executar SQL via node:sqlite
 │   ├── StudioConfigRepository.ts
 │   └── NailDesignRepository.ts
@@ -100,9 +125,8 @@ backend/src/
 │   └── NailDesign.ts
 ├── dtos/          # Contratos de entrada/saída e validadores puros
 │   ├── StudioConfigDto.ts
-│   ├── NailDesignDto.ts
-│   └── VisionDto.ts
-├── db/            # Conexão SQLite (WAL), DDL de migração V9 e Seed idempotente
+│   └── NailDesignDto.ts
+├── db/            # Conexão SQLite (WAL), DDL de migração e Seed idempotente
 │   ├── database.ts
 │   └── seed.ts
 ├── routes/        # Roteamento REST (/api/*)
@@ -116,14 +140,14 @@ backend/src/
 
 ---
 
-## 4. Banco `node:sqlite` V9 & Catálogo Real Sem Seeds Fictícios
+## 4. Banco `node:sqlite` & Catálogo Real Sem Seeds Fictícios
 
 O banco relacional embarcado utiliza o módulo nativo `node:sqlite` (`DatabaseSync`) em `backend/data/nail-studio.sqlite` com `PRAGMA journal_mode = WAL` e `PRAGMA foreign_keys = ON`.
 
 - **Tabelas**:
   - `studio_config` (`id = 1` singleton): nome do estúdio, WhatsApp, `logo_data_url`, `theme_preset`, `primary_color`, `accent_color`, `surface_color`, `updated_at`.
   - `nail_designs`: catálogo real do estúdio e referências das clientes (`id`, `name`, `category`, `style_type`, `base_color`, `accent_color`, `secondary_color`, `finish`, `pattern_type`, `image_data_url`, `default_scale`, `default_rotation`, `default_opacity`, `is_custom_reference`, `is_studio_catalog`, `detected_shape`, `detected_length`, `finger_specs_json`, `created_at`).
-- **Migração Idempotente V9 (`ensureNailDesignV9Columns`)**: Garante automaticamente a presença das colunas V9 (`secondary_color`, `finish`, `detected_shape`, `detected_length`, `finger_specs_json`, `is_studio_catalog`) em bancos pré-existentes sem perda de dados.
+- **Migração Idempotente (`ensureNailDesignV9Columns`)**: Garante automaticamente a presença das colunas (`secondary_color`, `finish`, `detected_shape`, `detected_length`, `finger_specs_json`, `is_studio_catalog`) em bancos pré-existentes sem perda de dados, armazenando agora o `blueprint` V10 compacto (< 6 KB) dentro de `finger_specs_json`.
 - **Seed Idempotente (`backend/src/db/seed.ts`)**: Executado automaticamente no startup (`startServer()`) e via `npm run seed`. Popula exclusivamente a configuração White-Label padrão **`Atelier Lumière Nails`** mantendo **`DEFAULT_NAIL_DESIGNS = []`** (zero seeds fictícios de unhas — catálogo 100% real cadastrado pelo estúdio).
 
 ---
@@ -143,18 +167,18 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
 
 ---
 
-## 6. Analisador Visual Híbrido (`PerFingerVisionAnalyzer`), Síntese PBR & UI Limpa
+## 6. Analisador Matemático (`PerFingerVisionAnalyzer`), Síntese PBR Vetorial & UI Limpa
 
-- **Pipeline Híbrido por Dedo (`frontend/src/lib/perFingerVisionAnalyzer.ts` + `ReferenceVisionService.ts` + `ImportReferenceModal.tsx`)**:
-  - Ao importar uma foto de referência (ou cadastrar um modelo no Catálogo do Estúdio), tenta primeiro a reconstrução estruturada via `POST /api/vision/reconstruct-reference` (quando `GEMINI_API_KEY` ou `OPENAI_API_KEY` está ativa no backend) e executa com perfeição o fallback local high-res `320×480` via MediaPipe `HandLandmarker` em modo **`IMAGE` (`numHands: 2`)** com fallback macro `smart-macro`.
-  - Segmenta exclusivamente a placa ungueal, retifica textura UV `512×512` cobrindo 94% da placa com **inpainting cirúrgico apenas de reflexo especular**, preserva cores profundas (como vinho `#52101E`), extrai formato entre os 6 disponíveis (`natural`, `oval`, `almond`, `square`, `coffin`, `stiletto`), comprimento/extensão em mm e deriva `displacementMap`, `normalMap` (Scharr 3×3), `metalnessMap` e `roughnessMap`.
+- **Pipeline 100% Client-Side (`frontend/src/lib/perFingerVisionAnalyzer.ts` + `ImportReferenceModal.tsx`)**:
+  - Ao importar uma foto de referência (ou cadastrar um modelo no Catálogo do Estúdio), executa integralmente no navegador (custo zero de API externa) com MediaPipe `HandLandmarker` em modo **`IMAGE` (`numHands: 2`)** e fallback macro `smart-macro`.
+  - Extrai ROI `128×192`, segmenta via flood-fill CIELab/YCbCr, aplica K-Means CIELab (`k = 4`), extrai `profileHalfWidths[8]`, `borderLayer` e vetoriza artes em `ribbon_stroke` (RDP), `organic_motif` (~20 pts) e `micro_gem` dentro de um `NailDesignBlueprint` compacto (< 6 KB).
   - Aplica **Herança Harmônica (`applyHarmonicInheritance`)** para dedos não visíveis na foto, preservando unhas de destaque (*filha única*) em um `Record<FingerId, NailFingerDesignSpec>` completo.
-- **Swatches Fotorrealistas & Dock em 2 Abas (`swatchPreview.ts` + `MagneticDesignDock.tsx`)**: Exibe a textura real reconstruída com sombreamento Arco C e brilho especular de gel (ou síntese vetorial limpa quando aplicável) nas 2 abas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**), com CTAs contextuais **`Importar Referência`** e **`Cadastrar Modelo`**.
-- **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera/modelo + overlay WebGL Three.js 3D + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
+- **Compilador PBR Vetorial & Swatches Limpos (`proceduralPBRSynthesizer.ts` + `swatchPreview.ts` + `MagneticDesignDock.tsx`)**: Compila mapas PBR `512×512`/`256×256` com Sobel 3×3 (< 15ms/dedo) e swatches vetoriais limpos (zero pixels crus de foto) nas 2 abas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**), com CTAs contextuais **`Importar Referência`** e **`Cadastrar Modelo`**.
+- **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera/modelo + overlay WebGL Three.js 3D (usando `renderNow()` sob demanda) + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
 
 ---
 
-## 7. PWA Instalável no Android, Empacotamento `.apk` & Resiliência Offline
+## 7. PWA Instalável no Android/iOS, Empacotamento `.apk` & Resiliência Offline
 
 - **Configuração `vite-plugin-pwa` + Workbox (`frontend/vite.config.ts`)**: Gera automaticamente o manifesto oficial (`manifest.webmanifest`) e o Service Worker Workbox (`sw.js`) com registro `autoUpdate` via `virtual:pwa-register`, pré-cache dos assets estáticos e runtime caching dedicado para módulos WASM/modelo do MediaPipe Hands (`CacheFirst`), Google Fonts (`CacheFirst`) e API `/api/*` (`NetworkFirst`).
 - **Web App Manifest & Ícones Oficiais (`frontend/public/icons/`)**: Configurado com `display: "standalone"`, `display_override: ["standalone", "fullscreen"]`, `orientation: "portrait"`, `start_url: "/"`, `lang: "pt-BR"` e conjunto completo de ícones PNG validados para instalação Android e empacotamento em APK:
@@ -163,8 +187,8 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
   - `icon-maskable-192x192.png` (`192×192`, `purpose: "maskable"`)
   - `icon-maskable-512x512.png` (`512×512`, `purpose: "maskable"`)
   - `apple-touch-icon.png` (`180×180`, iOS Home Screen)
-- **Instalação em 1 Toque no Android & Câmera HTTPS (`getUserMedia`)**:
-  - Captura o evento nativo `beforeinstallprompt` exibindo o botão discreto **Instalar** no HUD superior para adicionar o app direto à tela inicial do Android em modo tela cheia (`standalone`).
+- **Botão `Instalar` Sempre Visível Fora de `standalone` (`App.tsx` + `InstallAppModal.tsx`)**:
+  - Exibe o botão **Instalar** no `.top-hud` (inclusive em telas `360px`) sempre que o app não estiver em modo `standalone`; dispara `beforeinstallprompt` em 1 toque quando disponível ou abre `InstallAppModal` com passo-a-passo visual para Android (Chrome/Edge) e iOS (Safari).
   - Validação explícita de contexto seguro (`window.isSecureContext`) em `ARCameraCanvas.tsx`, fallback progressivo de constraints em `navigator.mediaDevices.getUserMedia` (câmera traseira `environment` / frontal `user` até 60fps) e cabeçalho HTTP `Permissions-Policy: camera=(self)` no backend Express para compatibilidade total com Chrome Android, TWA (PWABuilder) e WebView do Capacitor.
 - **Empacotamento em `.apk` (PWABuilder ou Capacitor)**:
   - **Via PWABuilder (mais rápido):** publique `frontend/` em HTTPS (Vercel/Netlify), cole a URL em [pwabuilder.com](https://www.pwabuilder.com) e gere o pacote Android TWA (`.apk` / `.aab`) usando o manifesto e ícones 192×192 / 512×512 já configurados.
@@ -209,7 +233,6 @@ npm run start          # Inicia node backend/dist/index.js na porta 3001
 | `POST` | `/api/designs` | Cria um novo modelo do catálogo do estúdio ou referência da cliente (com `fingerSpecs` e `isStudioCatalog`) | `201` / `400` |
 | `PATCH` | `/api/designs/:id` | Atualiza parcialmente propriedades de um design existente | `200` / `400` / `404` |
 | `DELETE` | `/api/designs/:id` | Remove um design pelo ID | `200` / `404` |
-| `POST` | `/api/vision/reconstruct-reference` | Reconstrução VLM estruturada por dedo (ou sinaliza `local-fallback-required` sem chave de API) | `200` / `400` |
 
 ---
 

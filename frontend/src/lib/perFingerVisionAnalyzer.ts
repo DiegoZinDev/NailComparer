@@ -1,37 +1,31 @@
-import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { detectHandsOnImageWithSingleton } from './handTrackingWorker';
 import type {
   ArtisticPattern,
   FingerId,
+  MicroGemElement,
+  NailBaseLayer,
+  NailBorderKind,
+  NailBorderLayer,
   NailDesign,
+  NailDesignBlueprint,
   NailExtensionLevel,
+  NailFinishV10,
   NailFinishV9,
   NailFingerDesignSpec as BaseNailFingerDesignSpec,
+  NailGeometryProfile,
+  NailGradientMode,
   NailShape,
+  OrganicMotifElement,
+  OrganicMotifPoint,
+  RibbonStrokeElement,
+  RibbonStrokePoint,
   StrokeAnchor,
+  VectorArtElement,
 } from '../types/nail';
 
-export type { NailExtensionLevel, NailFinishV9 };
+export type { NailExtensionLevel, NailFinishV9, NailFinishV10 };
 
-export type NailFingerDesignSpec = BaseNailFingerDesignSpec & {
-  extensionLevel?: NailExtensionLevel;
-  extensionMm?: number;
-  tipRoundness?: number;
-  aspectRatio?: number;
-  lengthMultiplier?: number;
-  hasMetallicOutline?: boolean;
-  outlineColor?: string;
-  has3DRelief?: boolean;
-  reliefDescription?: string;
-  artDescription?: string;
-  finishStyle?: NailFinishV9;
-  uvPatchDataUrl?: string;
-  normalMapDataUrl?: string;
-  displacementMapDataUrl?: string;
-  metalnessMapDataUrl?: string;
-  roughnessMapDataUrl?: string;
-  isImportedReference?: boolean;
-};
-
+export type NailFingerDesignSpec = BaseNailFingerDesignSpec;
 export type ExtendedNailFingerDesignSpec = NailFingerDesignSpec;
 
 export const ORDERED_FINGERS: FingerId[] = ['thumb', 'index', 'middle', 'ring', 'pinky'];
@@ -78,48 +72,1566 @@ const FINGER_LANDMARKS: Record<
   pinky: { tipIdx: 20, dipIdx: 19, pipIdx: 18, defaultWidth: 0.91, defaultLength: 0.91 },
 };
 
-const VALID_SHAPES: NailShape[] = ['natural', 'oval', 'almond', 'square', 'coffin', 'stiletto'];
-const VALID_PATTERNS: ArtisticPattern[] = [
-  'solid_gloss',
-  'chrome_mirror',
-  'gold_3d_waves',
-  'aura_gradient',
-  'french_tip',
-  'floral_accent',
-];
+const PROFILE_STATIONS_V: readonly number[] = [0, 0.15, 0.35, 0.55, 0.72, 0.85, 0.94, 1.0];
+const ROI_WIDTH = 128;
+const ROI_HEIGHT = 192;
 
-let cachedLandmarker: HandLandmarker | null = null;
-let landmarkerPromise: Promise<HandLandmarker | null> | null = null;
+const SHAPE_DEFAULT_PROFILES: Record<
+  NailShape,
+  [number, number, number, number, number, number, number, number]
+> = {
+  natural: [0.34, 0.48, 0.50, 0.50, 0.47, 0.43, 0.38, 0.34],
+  oval: [0.34, 0.48, 0.50, 0.50, 0.44, 0.36, 0.28, 0.21],
+  almond: [0.34, 0.48, 0.50, 0.50, 0.42, 0.31, 0.22, 0.15],
+  coffin: [0.34, 0.48, 0.50, 0.50, 0.43, 0.36, 0.32, 0.29],
+  square: [0.34, 0.49, 0.50, 0.50, 0.50, 0.49, 0.47, 0.44],
+  stiletto: [0.34, 0.48, 0.50, 0.49, 0.36, 0.23, 0.14, 0.09],
+};
 
-async function getImageHandLandmarker(): Promise<HandLandmarker | null> {
-  if (cachedLandmarker) return cachedLandmarker;
-  if (!landmarkerPromise) {
-    landmarkerPromise = (async () => {
-      try {
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
-        );
-        const landmarker = await HandLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-            delegate: 'CPU',
-          },
-          runningMode: 'IMAGE',
-          numHands: 2,
-          minHandDetectionConfidence: 0.26,
-          minHandPresenceConfidence: 0.26,
-        });
-        cachedLandmarker = landmarker;
-        return landmarker;
-      } catch {
-        landmarkerPromise = null;
-        return null;
-      }
-    })();
-  }
-  return landmarkerPromise;
+// -----------------------------------------------------------------------------
+// Fast Color & Math Utilities (Zero DOM dependency, pure TypedArrays)
+// -----------------------------------------------------------------------------
+
+function clamp(v: number, min: number, max: number): number {
+  return v < min ? min : v > max ? max : v;
 }
+
+function clamp01(v: number): number {
+  return clamp(v, 0, 1);
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  const clampByte = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+  return (
+    '#' +
+    [clampByte(r), clampByte(g), clampByte(b)]
+      .map((n) => n.toString(16).padStart(2, '0'))
+      .join('')
+      .toUpperCase()
+  );
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const clean = hex.replace('#', '').trim();
+  if (clean.length === 3) {
+    const r = parseInt(clean[0] + clean[0], 16);
+    const g = parseInt(clean[1] + clean[1], 16);
+    const b = parseInt(clean[2] + clean[2], 16);
+    if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) return [r, g, b];
+  } else if (clean.length >= 6) {
+    const r = parseInt(clean.slice(0, 2), 16);
+    const g = parseInt(clean.slice(2, 4), 16);
+    const b = parseInt(clean.slice(4, 6), 16);
+    if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) return [r, g, b];
+  }
+  return [225, 190, 179];
+}
+
+function shadeHex(hex: string, amount: number): string {
+  const [r, g, b] = hexToRgb(hex);
+  return rgbToHex(r + amount, g + amount, b + amount);
+}
+
+function mixHex(hexA: string, hexB: string, t: number): string {
+  const [r1, g1, b1] = hexToRgb(hexA);
+  const [r2, g2, b2] = hexToRgb(hexB);
+  const tc = clamp01(t);
+  return rgbToHex(r1 * (1 - tc) + r2 * tc, g1 * (1 - tc) + g2 * tc, b1 * (1 - tc) + b2 * tc);
+}
+
+// Lookup table for fast sRGB -> linear conversion (256 entries)
+const SRGB_TO_LIN = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const v = i / 255;
+  SRGB_TO_LIN[i] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+/**
+ * Exact CIE L*a*b* conversion (sRGB -> D65 XYZ -> CIELab) preserving deep burgundy/wine,
+ * obsidian, pearls, and warm gold without brown washout.
+ */
+function rgbToLab(r: number, g: number, b: number): [number, number, number] {
+  const ri = r < 0 ? 0 : r > 255 ? 255 : Math.round(r);
+  const gi = g < 0 ? 0 : g > 255 ? 255 : Math.round(g);
+  const bi = b < 0 ? 0 : b > 255 ? 255 : Math.round(b);
+  const rl = SRGB_TO_LIN[ri];
+  const gl = SRGB_TO_LIN[gi];
+  const bl = SRGB_TO_LIN[bi];
+
+  const x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.95047;
+  const y = 0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl;
+  const z = (0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl) / 1.08883;
+
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(x);
+  const fy = f(y);
+  const fz = f(z);
+
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+}
+
+function labToRgb(L: number, a: number, b: number): [number, number, number] {
+  const fy = (L + 16) / 116;
+  const fx = a / 500 + fy;
+  const fz = fy - b / 200;
+
+  const invf = (t: number) => {
+    const t3 = t * t * t;
+    return t3 > 0.008856 ? t3 : (t - 16 / 116) / 7.787;
+  };
+  const x = 0.95047 * invf(fx);
+  const y = invf(fy);
+  const z = 1.08883 * invf(fz);
+
+  const rl = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+  const gl = -0.969266 * x + 1.8760108 * y + 0.041556 * z;
+  const bl = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+
+  const gamma = (u: number) => {
+    const cu = clamp01(u);
+    return cu <= 0.0031308 ? 12.92 * cu : 1.055 * Math.pow(cu, 1 / 2.4) - 0.055;
+  };
+
+  return [
+    Math.round(gamma(rl) * 255),
+    Math.round(gamma(gl) * 255),
+    Math.round(gamma(bl) * 255),
+  ];
+}
+
+function hexToLab(hex: string): [number, number, number] {
+  const [r, g, b] = hexToRgb(hex);
+  return rgbToLab(r, g, b);
+}
+
+function deltaLab(c1: [number, number, number], c2: [number, number, number]): number {
+  const dl = c1[0] - c2[0];
+  const da = c1[1] - c2[1];
+  const db = c1[2] - c2[2];
+  return Math.sqrt(dl * dl + da * da + db * db);
+}
+
+function rgbToYCbCr(r: number, g: number, b: number): [number, number, number] {
+  const y = 0.299 * r + 0.587 * g + 0.114 * b;
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  return [y, cb, cr];
+}
+
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d > 1e-5) {
+    if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+    else if (max === gn) h = ((bn - rn) / d + 2) / 6;
+    else h = ((rn - gn) / d + 4) / 6;
+  }
+  const s = max > 0 ? d / max : 0;
+  return [h * 360, s, max];
+}
+
+function isSpecularGlare(r: number, g: number, b: number): boolean {
+  const maxC = Math.max(r, g, b);
+  const minC = Math.min(r, g, b);
+  const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+  const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luma > 0.92 && sat < 0.12;
+}
+
+function detectMetallicSignal(
+  r: number,
+  g: number,
+  b: number,
+  gradMag: number
+): { isMetallic: boolean; isGold: boolean; isSilver: boolean } {
+  const [hue, sat, val] = rgbToHsv(r, g, b);
+  const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+  // Warm gold / champagne / rose gold metallic hue (20°..58°)
+  const isWarmGold =
+    hue >= 18 &&
+    hue <= 58 &&
+    r > g * 1.03 &&
+    g > b * 1.12 &&
+    luma > 0.32 &&
+    sat > 0.20;
+
+  // Cool chrome / silver specular ridge (low sat, bright, high local contrast gradient)
+  const isSilver = sat < 0.16 && val > 0.64 && gradMag > 0.11 && luma < 0.94;
+
+  return {
+    isMetallic: isWarmGold || isSilver,
+    isGold: isWarmGold,
+    isSilver,
+  };
+}
+
+function medianColorFromLabSamples(
+  labs: Array<[number, number, number]>,
+  rgbs: Array<[number, number, number]>,
+  fallbackHex: string
+): string {
+  const n = rgbs.length;
+  if (n === 0) return fallbackHex;
+  if (n === 1) return rgbToHex(rgbs[0][0], rgbs[0][1], rgbs[0][2]);
+
+  // O(n) representative selection (subsampled median/mean in CIELab -> nearest real pixel)
+  let sumL = 0;
+  let sumA = 0;
+  let sumB = 0;
+  const step = n > 256 ? Math.floor(n / 128) : 1;
+  let cnt = 0;
+  for (let i = 0; i < n; i += step) {
+    sumL += labs[i][0];
+    sumA += labs[i][1];
+    sumB += labs[i][2];
+    cnt++;
+  }
+  const targetLab: [number, number, number] = [sumL / cnt, sumA / cnt, sumB / cnt];
+
+  let bestIdx = 0;
+  let bestDist2 = Infinity;
+  for (let i = 0; i < n; i += step) {
+    const dl = labs[i][0] - targetLab[0];
+    const da = labs[i][1] - targetLab[1];
+    const db = labs[i][2] - targetLab[2];
+    const d2 = dl * dl + da * da + db * db;
+    if (d2 < bestDist2) {
+      bestDist2 = d2;
+      bestIdx = i;
+    }
+  }
+  const [r, g, b] = rgbs[bestIdx];
+  return rgbToHex(r, g, b);
+}
+
+// -----------------------------------------------------------------------------
+// Extension Mapping (V10: freeEdgeRatio 0.12..1.15, relativeLength = 1 + freeEdgeRatio)
+// -----------------------------------------------------------------------------
+
+function classifyExtensionFromFreeEdgeRatio(freeEdgeRatio: number): {
+  freeEdgeRatio: number;
+  relativeLength: number;
+  extensionLevel: NailExtensionLevel;
+  extensionMm: number;
+} {
+  const ratio = Number(clamp(freeEdgeRatio, 0.12, 1.15).toFixed(2));
+  const relativeLength = Number((1 + ratio).toFixed(2));
+  const extensionMm = Number(clamp(1.5 + ((ratio - 0.12) / (1.15 - 0.12)) * 10.5, 1.5, 12.0).toFixed(1));
+
+  let extensionLevel: NailExtensionLevel;
+  if (ratio <= 0.26) extensionLevel = 'Curta/Natural';
+  else if (ratio <= 0.51) extensionLevel = 'Pouco Alongada';
+  else if (ratio <= 0.83) extensionLevel = 'Alongada';
+  else extensionLevel = 'Muito Alongada (Extrema)';
+
+  return { freeEdgeRatio: ratio, relativeLength, extensionLevel, extensionMm };
+}
+
+function mapAspectRatioToFreeEdgeRatio(aspectRatio: number): number {
+  const ar = clamp(aspectRatio, 0.78, 3.3);
+  if (ar < 1.25) {
+    // Curta: 0.12..0.25
+    const t = clamp01((ar - 0.85) / (1.25 - 0.85));
+    return 0.12 + t * (0.25 - 0.12);
+  }
+  if (ar < 1.68) {
+    // Pouco alongada: 0.28..0.50
+    const t = clamp01((ar - 1.25) / (1.68 - 1.25));
+    return 0.28 + t * (0.50 - 0.28);
+  }
+  if (ar < 2.25) {
+    // Alongada salão: 0.52..0.82
+    const t = clamp01((ar - 1.68) / (2.25 - 1.68));
+    return 0.52 + t * (0.82 - 0.52);
+  }
+  // Muito alongada: 0.85..1.15
+  const t = clamp01((ar - 2.25) / (3.15 - 2.25));
+  return 0.85 + t * (1.15 - 0.85);
+}
+
+function normalizeRelativeLengthV10(rawLen: number): number {
+  // Legacy specs used 0.85..1.65; V10 uses 1.12..2.15 (= 1 + freeEdgeRatio)
+  if (rawLen >= 1.12 && rawLen <= 2.15) {
+    return rawLen;
+  }
+  const t = clamp01((rawLen - 0.85) / (1.65 - 0.85));
+  return 1.12 + t * (2.05 - 1.12);
+}
+
+// -----------------------------------------------------------------------------
+// Stage 2 Pure Engine: Deterministic CIELab K-Means, Geometry Profile & Vector Art
+// -----------------------------------------------------------------------------
+
+interface LabSample {
+  L: number;
+  a: number;
+  b: number;
+  r: number;
+  g: number;
+  bp: number;
+  u: number;
+  v: number;
+  x: number;
+  y: number;
+  isMetal: boolean;
+  isGold: boolean;
+}
+
+/**
+ * Deterministic CIELab K-Means (k = 4, 8 iterations) with farthest-first seeding
+ * (zero Math.random()!). Returns clusters sorted descending by population size.
+ */
+function deterministicLabKMeans(
+  samples: readonly LabSample[],
+  k = 4,
+  iterations = 8
+): Array<{
+  count: number;
+  L: number;
+  a: number;
+  b: number;
+  hex: string;
+  rgb: [number, number, number];
+}> {
+  if (samples.length === 0) return [];
+  if (samples.length <= k) {
+    return samples.map((s) => ({
+      count: 1,
+      L: s.L,
+      a: s.a,
+      b: s.b,
+      hex: rgbToHex(s.r, s.g, s.bp),
+      rgb: [s.r, s.g, s.bp],
+    }));
+  }
+
+  // Deterministic farthest-first seed initialization starting from median luminance sample
+  const stride = Math.max(1, Math.floor(samples.length / 480));
+  const sub: LabSample[] = [];
+  for (let i = 0; i < samples.length; i += stride) {
+    sub.push(samples[i]);
+  }
+
+  const centroids: Array<[number, number, number]> = [];
+  // Seed 0: median sample by L*
+  const sortedByL = [...sub].sort((x, y) => x.L - y.L);
+  const s0 = sortedByL[Math.floor(sortedByL.length / 2)];
+  centroids.push([s0.L, s0.a, s0.b]);
+
+  // Seeds 1..k-1: deterministic farthest point in CIELab from existing centroids
+  while (centroids.length < k) {
+    let bestSample = sub[0];
+    let bestMinDist = -1;
+    for (const pt of sub) {
+      let minD = Infinity;
+      for (const c of centroids) {
+        const dl = pt.L - c[0];
+        const da = pt.a - c[1];
+        const db = pt.b - c[2];
+        const d2 = dl * dl + da * da + db * db;
+        if (d2 < minD) minD = d2;
+      }
+      if (minD > bestMinDist) {
+        bestMinDist = minD;
+        bestSample = pt;
+      }
+    }
+    centroids.push([bestSample.L, bestSample.a, bestSample.b]);
+  }
+
+  const counts = new Int32Array(k);
+  const sumL = new Float64Array(k);
+  const sumA = new Float64Array(k);
+  const sumB = new Float64Array(k);
+
+  for (let iter = 0; iter < iterations; iter++) {
+    counts.fill(0);
+    sumL.fill(0);
+    sumA.fill(0);
+    sumB.fill(0);
+
+    for (let i = 0; i < sub.length; i++) {
+      const s = sub[i];
+      let bestK = 0;
+      let bestD2 = Infinity;
+      for (let c = 0; c < k; c++) {
+        const dl = s.L - centroids[c][0];
+        const da = s.a - centroids[c][1];
+        const db = s.b - centroids[c][2];
+        const d2 = dl * dl + da * da + db * db;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestK = c;
+        }
+      }
+      counts[bestK]++;
+      sumL[bestK] += s.L;
+      sumA[bestK] += s.a;
+      sumB[bestK] += s.b;
+    }
+
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        centroids[c][0] = sumL[c] / counts[c];
+        centroids[c][1] = sumA[c] / counts[c];
+        centroids[c][2] = sumB[c] / counts[c];
+      }
+    }
+  }
+
+  // Final assignment over all samples to get exact cluster counts and true representative color
+  counts.fill(0);
+  sumL.fill(0);
+  sumA.fill(0);
+  sumB.fill(0);
+
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    let bestK = 0;
+    let bestD2 = Infinity;
+    for (let c = 0; c < k; c++) {
+      const dl = s.L - centroids[c][0];
+      const da = s.a - centroids[c][1];
+      const db = s.b - centroids[c][2];
+      const d2 = dl * dl + da * da + db * db;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        bestK = c;
+      }
+    }
+    counts[bestK]++;
+    sumL[bestK] += s.L;
+    sumA[bestK] += s.a;
+    sumB[bestK] += s.b;
+  }
+
+  const clusters: Array<{
+    count: number;
+    L: number;
+    a: number;
+    b: number;
+    hex: string;
+    rgb: [number, number, number];
+  }> = [];
+
+  for (let c = 0; c < k; c++) {
+    if (counts[c] === 0) continue;
+    const L = sumL[c] / counts[c];
+    const a = sumA[c] / counts[c];
+    const b = sumB[c] / counts[c];
+    const rgb = labToRgb(L, a, b);
+    clusters.push({
+      count: counts[c],
+      L,
+      a,
+      b,
+      hex: rgbToHex(rgb[0], rgb[1], rgb[2]),
+      rgb,
+    });
+  }
+
+  clusters.sort((x, y) => y.count - x.count);
+  return clusters;
+}
+
+/**
+ * Ramer-Douglas-Peucker polyline simplification in normalized (u, v) coordinates.
+ */
+function rdpSimplifyPoints(
+  points: RibbonStrokePoint[],
+  epsilon: number
+): RibbonStrokePoint[] {
+  if (points.length <= 2) return points;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const dx = last.u - first.u;
+  const dy = last.v - first.v;
+  const lenSq = dx * dx + dy * dy;
+
+  let maxDist = 0;
+  let index = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const p = points[i];
+    let dist: number;
+    if (lenSq < 1e-8) {
+      dist = Math.hypot(p.u - first.u, p.v - first.v);
+    } else {
+      const t = clamp01(((p.u - first.u) * dx + (p.v - first.v) * dy) / lenSq);
+      const projU = first.u + t * dx;
+      const projV = first.v + t * dy;
+      dist = Math.hypot(p.u - projU, p.v - projV);
+    }
+    if (dist > maxDist) {
+      maxDist = dist;
+      index = i;
+    }
+  }
+
+  if (maxDist > epsilon) {
+    const left = rdpSimplifyPoints(points.slice(0, index + 1), epsilon);
+    const right = rdpSimplifyPoints(points.slice(index), epsilon);
+    return [...left.slice(0, -1), ...right];
+  }
+  return [first, last];
+}
+
+/**
+ * Resamples/simplifies a ribbon polyline strictly to 4..10 smooth points.
+ */
+function normalizeRibbonControlPoints(rawPts: RibbonStrokePoint[]): RibbonStrokePoint[] {
+  if (rawPts.length === 0) return [];
+  if (rawPts.length === 1) {
+    const p = rawPts[0];
+    return [
+      { u: clamp01(p.u - 0.04), v: p.v, width: p.width },
+      p,
+      { u: clamp01(p.u + 0.02), v: p.v, width: p.width },
+      { u: clamp01(p.u + 0.04), v: p.v, width: p.width },
+    ];
+  }
+
+  let simplified = rdpSimplifyPoints(rawPts, 0.018);
+  let eps = 0.024;
+  while (simplified.length > 10 && eps < 0.14) {
+    simplified = rdpSimplifyPoints(rawPts, eps);
+    eps += 0.012;
+  }
+  if (simplified.length > 10) {
+    const picked: RibbonStrokePoint[] = [];
+    for (let i = 0; i < 10; i++) {
+      const idx = Math.round((i / 9) * (simplified.length - 1));
+      picked.push(simplified[idx]);
+    }
+    simplified = picked;
+  }
+
+  // Ensure at least 4 control points via midpoint subdivision if needed
+  while (simplified.length < 4 && simplified.length >= 2) {
+    const next: RibbonStrokePoint[] = [];
+    for (let i = 0; i < simplified.length - 1; i++) {
+      const a = simplified[i];
+      const b = simplified[i + 1];
+      next.push(a);
+      if (next.length + (simplified.length - i - 1) < 4) {
+        next.push({
+          u: Number(((a.u + b.u) * 0.5).toFixed(3)),
+          v: Number(((a.v + b.v) * 0.5).toFixed(3)),
+          width: Number(((a.width + b.width) * 0.5).toFixed(3)),
+        });
+      }
+    }
+    next.push(simplified[simplified.length - 1]);
+    simplified = next;
+  }
+
+  return simplified.map((p) => ({
+    u: Number(clamp01(p.u).toFixed(3)),
+    v: Number(clamp01(p.v).toFixed(3)),
+    width: Number(clamp(p.width, 0.015, 0.14).toFixed(3)),
+  }));
+}
+
+/**
+ * Extracts closed radial/boundary contour (16..24 vertices) with Laplacian smoothing
+ * for organic floral/marble motifs.
+ */
+function extractSmoothedOrganicContour(
+  pts: Array<{ u: number; v: number }>,
+  cu: number,
+  cv: number,
+  vertexCount = 20
+): OrganicMotifPoint[] {
+  const nBins = clamp(vertexCount, 16, 24);
+  const maxR = new Float32Array(nBins).fill(-1);
+  const fallbackDist: number[] = [];
+
+  for (const pt of pts) {
+    const du = pt.u - cu;
+    const dv = pt.v - cv;
+    const dist = Math.hypot(du, dv);
+    fallbackDist.push(dist);
+    let ang = Math.atan2(dv, du);
+    if (ang < 0) ang += Math.PI * 2;
+    const bin = Math.min(nBins - 1, Math.floor((ang / (Math.PI * 2)) * nBins));
+    if (dist > maxR[bin]) maxR[bin] = dist;
+  }
+
+  fallbackDist.sort((a, b) => a - b);
+  const defaultR =
+    fallbackDist.length > 0 ? fallbackDist[Math.floor(fallbackDist.length * 0.85)] : 0.08;
+
+  // Fill empty angular bins via circular linear interpolation
+  for (let i = 0; i < nBins; i++) {
+    if (maxR[i] >= 0) continue;
+    let prev = -1;
+    let next = -1;
+    for (let step = 1; step < nBins; step++) {
+      const pi = (i - step + nBins) % nBins;
+      if (prev < 0 && maxR[pi] >= 0) prev = maxR[pi];
+      const ni = (i + step) % nBins;
+      if (next < 0 && maxR[ni] >= 0) next = maxR[ni];
+      if (prev >= 0 && next >= 0) break;
+    }
+    maxR[i] = prev >= 0 && next >= 0 ? (prev + next) * 0.5 : defaultR;
+  }
+
+  let ring: OrganicMotifPoint[] = [];
+  for (let i = 0; i < nBins; i++) {
+    const ang = ((i + 0.5) / nBins) * Math.PI * 2;
+    const r = Math.max(0.014, maxR[i]);
+    ring.push({
+      u: clamp01(cu + Math.cos(ang) * r),
+      v: clamp01(cv + Math.sin(ang) * r),
+    });
+  }
+
+  // 2 passes of periodic Laplacian smoothing
+  for (let pass = 0; pass < 2; pass++) {
+    const smoothed: OrganicMotifPoint[] = new Array(nBins);
+    for (let i = 0; i < nBins; i++) {
+      const prev = ring[(i - 1 + nBins) % nBins];
+      const curr = ring[i];
+      const next = ring[(i + 1) % nBins];
+      smoothed[i] = {
+        u: clamp01(curr.u * 0.5 + (prev.u + next.u) * 0.25),
+        v: clamp01(curr.v * 0.5 + (prev.v + next.v) * 0.25),
+      };
+    }
+    ring = smoothed;
+  }
+
+  return ring.map((p) => ({
+    u: Number(p.u.toFixed(3)),
+    v: Number(p.v.toFixed(3)),
+  }));
+}
+
+/**
+ * Pure Stage 2 Extractor: Converts a segmented nail patch (`rgba`, `width`, `height`, `mask`)
+ * into a 100% vector + parametric `NailDesignBlueprint` (zero raw bitmap pixels!).
+ *
+ * Exported directly so Node unit tests can validate color preservation, border detection,
+ * geometry profiles, and vector element extraction without DOM or MediaPipe dependencies.
+ */
+export function extractBlueprintFromNailPatch(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number,
+  mask: Uint8Array,
+  _fingerId: FingerId
+): NailDesignBlueprint {
+  const rowLeft = new Int16Array(height).fill(-1);
+  const rowRight = new Int16Array(height).fill(-1);
+  const rowWidth = new Float32Array(height);
+
+  let minY = height;
+  let maxY = -1;
+  let maxWidth = 0;
+
+  for (let y = 0; y < height; y++) {
+    let lx = -1;
+    let rx = -1;
+    const rowOff = y * width;
+    for (let x = 0; x < width; x++) {
+      if (mask[rowOff + x] > 0) {
+        if (lx < 0) lx = x;
+        rx = x;
+      }
+    }
+    if (lx >= 0 && rx > lx) {
+      rowLeft[y] = lx;
+      rowRight[y] = rx;
+      const w = rx - lx + 1;
+      rowWidth[y] = w;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (w > maxWidth) maxWidth = w;
+    }
+  }
+
+  // Safe fallback envelope if an empty mask is passed
+  if (maxY <= minY || maxWidth < 4) {
+    minY = Math.round(height * 0.14);
+    maxY = Math.round(height * 0.86);
+    maxWidth = Math.round(width * 0.42);
+    const lDef = Math.round(width * 0.29);
+    const rDef = Math.round(width * 0.71);
+    for (let y = minY; y <= maxY; y++) {
+      rowLeft[y] = lDef;
+      rowRight[y] = rDef;
+      rowWidth[y] = rDef - lDef + 1;
+    }
+  }
+
+  // Smooth left/right boundaries across Y to suppress pixelation noise
+  const smoothL = new Float32Array(height);
+  const smoothR = new Float32Array(height);
+  for (let y = minY; y <= maxY; y++) {
+    let accL = 0;
+    let accR = 0;
+    let cnt = 0;
+    for (let dy = -2; dy <= 2; dy++) {
+      const yy = clamp(y + dy, minY, maxY);
+      if (rowLeft[yy] >= 0 && rowRight[yy] > rowLeft[yy]) {
+        accL += rowLeft[yy];
+        accR += rowRight[yy];
+        cnt++;
+      }
+    }
+    smoothL[y] = cnt > 0 ? accL / cnt : width * 0.3;
+    smoothR[y] = cnt > 0 ? accR / cnt : width * 0.7;
+  }
+
+  const nailLength = Math.max(8, maxY - minY + 1);
+
+  // Measure normalized half-width at the 8 V10 parametric stations (v=0 cuticle .. v=1 tip)
+  const sampleBandWidth = (vNorm: number): number => {
+    const targetY = Math.round(maxY - vNorm * (maxY - minY));
+    const win = Math.max(1, Math.round(nailLength * 0.03));
+    let acc = 0;
+    let cnt = 0;
+    for (let dy = -win; dy <= win; dy++) {
+      const yy = clamp(targetY + dy, minY, maxY);
+      const span = smoothR[yy] - smoothL[yy];
+      if (span > 1) {
+        acc += span;
+        cnt++;
+      }
+    }
+    return cnt > 0 ? acc / cnt : maxWidth;
+  };
+
+  const bedRefWidth = Math.max(
+    4,
+    sampleBandWidth(0.35),
+    sampleBandWidth(0.55),
+    maxWidth * 0.90
+  );
+
+  const rawProfile: number[] = PROFILE_STATIONS_V.map((vSt) => {
+    const wSt = sampleBandWidth(vSt);
+    return clamp((wSt / bedRefWidth) * 0.5, 0.085, 0.5);
+  });
+  // Enforce smooth symmetry and bed plateau + anti-needle tip floor (>= 0.085)
+  rawProfile[2] = Math.max(rawProfile[2], 0.48);
+  rawProfile[3] = Math.max(rawProfile[3], 0.47);
+  for (let i = 4; i < 8; i++) {
+    // Enforce non-increasing distal taper after bed plateau to avoid jagged mask bumps
+    rawProfile[i] = clamp(Math.min(rawProfile[i], rawProfile[i - 1] + 0.015), 0.085, 0.5);
+  }
+  rawProfile[7] = clamp(rawProfile[7], 0.085, 0.5);
+
+  const profileHalfWidths: NailGeometryProfile['profileHalfWidths'] = [
+    Number(rawProfile[0].toFixed(3)),
+    Number(rawProfile[1].toFixed(3)),
+    Number(rawProfile[2].toFixed(3)),
+    Number(rawProfile[3].toFixed(3)),
+    Number(rawProfile[4].toFixed(3)),
+    Number(rawProfile[5].toFixed(3)),
+    Number(rawProfile[6].toFixed(3)),
+    Number(rawProfile[7].toFixed(3)),
+  ];
+
+  const aspectRatio = Number(clamp(nailLength / bedRefWidth, 0.78, 3.3).toFixed(2));
+  const w72 = profileHalfWidths[4] * 2;
+  const w85 = profileHalfWidths[5] * 2;
+  const w94 = profileHalfWidths[6] * 2;
+  const w100 = profileHalfWidths[7] * 2;
+
+  const tipTapering = clamp(w85, 0.14, 1.0);
+  const tipFlatness = clamp(w94 / Math.max(0.16, w85), 0, 1);
+  const distalDrop = clamp(w72 - w100, 0, 1);
+  const apexCurvature = clamp01((1 - tipFlatness) * 0.6 + distalDrop * 0.45);
+  const tipRoundness = Number(
+    clamp01((1 - tipFlatness) * 0.68 + (1 - tipTapering) * 0.32).toFixed(2)
+  );
+
+  let shape: NailShape = 'almond';
+  if (aspectRatio < 1.26) {
+    shape = tipTapering >= 0.84 && apexCurvature < 0.32 ? 'square' : 'natural';
+  } else if (
+    w100 < 0.25 ||
+    tipTapering < 0.40 ||
+    (aspectRatio >= 1.72 && tipTapering < 0.48 && apexCurvature >= 0.44)
+  ) {
+    shape = 'stiletto';
+  } else if (tipTapering >= 0.84 && apexCurvature < 0.34) {
+    shape = 'square';
+  } else if (tipTapering >= 0.54 && tipTapering < 0.84 && apexCurvature < 0.40) {
+    shape = 'coffin';
+  } else if (tipTapering >= 0.64 && apexCurvature >= 0.36 && aspectRatio < 1.68) {
+    shape = 'oval';
+  } else {
+    shape = 'almond';
+  }
+
+  const freeEdgeRatio = Number(mapAspectRatioToFreeEdgeRatio(aspectRatio).toFixed(2));
+  const geometry: NailGeometryProfile = {
+    profileHalfWidths,
+    aspectRatio,
+    freeEdgeRatio,
+    tipRoundness,
+    shape,
+  };
+
+  // Precompute luma, gradient magnitude, and cached CIELab buffer inside ROI (avoids redundant cbrt calls!)
+  const totalPx = width * height;
+  const lumaBuf = new Float32Array(totalPx);
+  const gradBuf = new Float32Array(totalPx);
+  const labBuf = new Float32Array(totalPx * 3);
+  for (let i = 0; i < totalPx; i++) {
+    const p4 = i * 4;
+    lumaBuf[i] = (0.299 * rgba[p4] + 0.587 * rgba[p4 + 1] + 0.114 * rgba[p4 + 2]) / 255;
+  }
+  for (let y = 1; y < height - 1; y++) {
+    const rowOff = y * width;
+    for (let x = 1; x < width - 1; x++) {
+      const idx = rowOff + x;
+      if (mask[idx] === 0) continue;
+      const gx = lumaBuf[idx + 1] - lumaBuf[idx - 1];
+      const gy = lumaBuf[idx + width] - lumaBuf[idx - width];
+      gradBuf[idx] = Math.hypot(gx, gy) * 0.5;
+    }
+  }
+
+  // Collect Lab samples across interior plate (excluding blown specular glare) and border regions
+  const interiorSamples: LabSample[] = [];
+  const cuticleBandLabs: Array<[number, number, number]> = [];
+  const cuticleBandRgbs: Array<[number, number, number]> = [];
+  const midBandLabs: Array<[number, number, number]> = [];
+  const midBandRgbs: Array<[number, number, number]> = [];
+  const tipBandLabs: Array<[number, number, number]> = [];
+  const tipBandRgbs: Array<[number, number, number]> = [];
+  const centerAuraLabs: Array<[number, number, number]> = [];
+  const centerAuraRgbs: Array<[number, number, number]> = [];
+  const outerAuraLabs: Array<[number, number, number]> = [];
+  const outerAuraRgbs: Array<[number, number, number]> = [];
+
+  interface BorderSample {
+    r: number;
+    g: number;
+    b: number;
+    lab: [number, number, number];
+    u: number;
+    v: number;
+    isLateral: boolean;
+    isCuticle: boolean;
+    isTip: boolean;
+    isMetal: boolean;
+    isGold: boolean;
+  }
+  const borderSamples: BorderSample[] = [];
+
+  let lumaSum = 0;
+  let lumaSqSum = 0;
+  let highGradCount = 0;
+  let catEyeBandHits = 0;
+  let catEyeBandTotal = 0;
+  let satSum = 0;
+  let maskCount = 0;
+
+  for (let y = minY; y <= maxY; y++) {
+    const lx = smoothL[y];
+    const rx = smoothR[y];
+    const span = rx - lx;
+    if (span < 3) continue;
+    const v = clamp01((maxY - y) / Math.max(1, maxY - minY));
+    const rowOff = y * width;
+
+    for (let x = Math.max(0, Math.floor(lx)); x <= Math.min(width - 1, Math.ceil(rx)); x++) {
+      const idx = rowOff + x;
+      if (mask[idx] === 0) continue;
+
+      const p4 = idx * 4;
+      const r = rgba[p4];
+      const g = rgba[p4 + 1];
+      const b = rgba[p4 + 2];
+      const u = clamp01((x - lx) / span);
+      const grad = gradBuf[idx];
+      const luma = lumaBuf[idx];
+      const [, sat] = rgbToHsv(r, g, b);
+      const glare = isSpecularGlare(r, g, b);
+
+      maskCount++;
+      lumaSum += luma;
+      lumaSqSum += luma * luma;
+      satSum += sat;
+      if (grad > 0.11) highGradCount++;
+
+      const metalInfo = detectMetallicSignal(r, g, b, grad);
+      const lab = rgbToLab(r, g, b);
+      const l3 = idx * 3;
+      labBuf[l3] = lab[0];
+      labBuf[l3 + 1] = lab[1];
+      labBuf[l3 + 2] = lab[2];
+
+      const isLateralBorder = u <= 0.10 || u >= 0.90;
+      const isCuticleBorder = v <= 0.10;
+      const isTipBorder = v >= 0.80;
+      const isPerimeter = isLateralBorder || isCuticleBorder || v >= 0.80;
+
+      // In perimeter border bands (especially crisp white French tips!), bright matte/gel white
+      // should still be evaluated as border pigment (only skip narrow interior specular streaks).
+      if (isPerimeter && (!glare || isTipBorder)) {
+        borderSamples.push({
+          r,
+          g,
+          b,
+          lab,
+          u,
+          v,
+          isLateral: isLateralBorder,
+          isCuticle: isCuticleBorder,
+          isTip: isTipBorder,
+          isMetal: metalInfo.isMetallic,
+          isGold: metalInfo.isGold,
+        });
+      }
+
+      if (glare) continue;
+
+      // Interior plate pixels (for K-Means baseColorHex so perimeter borders don't hijack base!)
+      if (u >= 0.12 && u <= 0.88 && v >= 0.10 && v <= 0.84) {
+        interiorSamples.push({
+          L: lab[0],
+          a: lab[1],
+          b: lab[2],
+          r,
+          g,
+          bp: b,
+          u,
+          v,
+          x,
+          y,
+          isMetal: metalInfo.isMetallic,
+          isGold: metalInfo.isGold,
+        });
+      }
+
+      if (u >= 0.22 && u <= 0.78) {
+        if (v >= 0.08 && v <= 0.28) {
+          cuticleBandLabs.push(lab);
+          cuticleBandRgbs.push([r, g, b]);
+        } else if (v >= 0.40 && v <= 0.62) {
+          midBandLabs.push(lab);
+          midBandRgbs.push([r, g, b]);
+        } else if (v >= 0.74 && v <= 0.94) {
+          tipBandLabs.push(lab);
+          tipBandRgbs.push([r, g, b]);
+        }
+      }
+
+      const auraDist = Math.hypot((u - 0.5) * 1.45, (v - 0.5) * 1.25);
+      if (auraDist < 0.28) {
+        centerAuraLabs.push(lab);
+        centerAuraRgbs.push([r, g, b]);
+      } else if (auraDist > 0.46 && u > 0.12 && u < 0.88 && v > 0.10 && v < 0.88) {
+        outerAuraLabs.push(lab);
+        outerAuraRgbs.push([r, g, b]);
+      }
+
+      // Diagonal cat-eye bright band test
+      const diagDist = Math.abs((u - 0.5) * 0.85 + (v - 0.52) * 0.55);
+      if (diagDist < 0.14) {
+        catEyeBandTotal++;
+        if (luma > 0.58) catEyeBandHits++;
+      }
+    }
+  }
+
+  // Fallback if interiorSamples was tiny (e.g. ultra narrow ROI)
+  if (interiorSamples.length < 12) {
+    for (let y = minY; y <= maxY; y++) {
+      const rowOff = y * width;
+      const lx = smoothL[y];
+      const rx = smoothR[y];
+      const span = Math.max(1, rx - lx);
+      const v = clamp01((maxY - y) / Math.max(1, maxY - minY));
+      for (let x = 0; x < width; x++) {
+        const idx = rowOff + x;
+        if (mask[idx] === 0) continue;
+        const p4 = idx * 4;
+        const r = rgba[p4];
+        const g = rgba[p4 + 1];
+        const b = rgba[p4 + 2];
+        if (isSpecularGlare(r, g, b)) continue;
+        const lab = rgbToLab(r, g, b);
+        const l3 = idx * 3;
+        labBuf[l3] = lab[0];
+        labBuf[l3 + 1] = lab[1];
+        labBuf[l3 + 2] = lab[2];
+        const mInfo = detectMetallicSignal(r, g, b, gradBuf[idx]);
+        interiorSamples.push({
+          L: lab[0],
+          a: lab[1],
+          b: lab[2],
+          r,
+          g,
+          bp: b,
+          u: clamp01((x - lx) / span),
+          v,
+          x,
+          y,
+          isMetal: mInfo.isMetallic,
+          isGold: mInfo.isGold,
+        });
+      }
+    }
+  }
+
+  // B. K-Means (k=4, 8 iterations) in CIELab for true dominant baseColorHex
+  const clusters = deterministicLabKMeans(interiorSamples, 4, 8);
+  const primaryCluster = clusters[0];
+  const baseColorHex = primaryCluster ? primaryCluster.hex : '#C88D84';
+  const baseLab = hexToLab(baseColorHex);
+
+  const cuticleColorHex = medianColorFromLabSamples(cuticleBandLabs, cuticleBandRgbs, baseColorHex);
+  const midColorHex = medianColorFromLabSamples(midBandLabs, midBandRgbs, baseColorHex);
+  const tipColorHex = medianColorFromLabSamples(tipBandLabs, tipBandRgbs, baseColorHex);
+  const centerAuraHex = medianColorFromLabSamples(centerAuraLabs, centerAuraRgbs, midColorHex);
+  const outerAuraHex = medianColorFromLabSamples(outerAuraLabs, outerAuraRgbs, baseColorHex);
+
+  const meanLuma = lumaSum / Math.max(1, maskCount);
+  const lumaVar = Math.max(0, lumaSqSum / Math.max(1, maskCount) - meanLuma * meanLuma);
+  const lumaStd = Math.sqrt(lumaVar);
+  const meanSat = satSum / Math.max(1, maskCount);
+  const gradDensity = highGradCount / Math.max(1, maskCount);
+
+  const cuticleTipDelta = deltaLab(hexToLab(cuticleColorHex), hexToLab(tipColorHex));
+  const centerOuterDelta = deltaLab(hexToLab(centerAuraHex), hexToLab(outerAuraHex));
+  const catEyeRatio = catEyeBandTotal > 0 ? catEyeBandHits / catEyeBandTotal : 0;
+
+  // Classify borderLayer (0..10% perimeter ring vs baseLab)
+  const lateralSamples = borderSamples.filter((s) => s.isLateral && !s.isTip);
+  const cuticleSamples = borderSamples.filter((s) => s.isCuticle && !s.isLateral);
+  const tipBorderSamples = borderSamples.filter((s) => s.isTip);
+
+  const lateralDiff = lateralSamples.filter((s) => deltaLab(s.lab, baseLab) > 14);
+  const cuticleDiff = cuticleSamples.filter((s) => deltaLab(s.lab, baseLab) > 14);
+  const tipDiff = tipBorderSamples.filter((s) => deltaLab(s.lab, baseLab) > 14);
+
+  const lateralDiffRatio = lateralSamples.length > 0 ? lateralDiff.length / lateralSamples.length : 0;
+  const cuticleDiffRatio = cuticleSamples.length > 0 ? cuticleDiff.length / cuticleSamples.length : 0;
+  const tipDiffRatio = tipBorderSamples.length > 0 ? tipDiff.length / tipBorderSamples.length : 0;
+  const lateralMetalRatio =
+    lateralSamples.length > 0
+      ? lateralSamples.filter((s) => s.isMetal && deltaLab(s.lab, baseLab) > 12).length /
+        lateralSamples.length
+      : 0;
+  const cuticleMetalRatio =
+    cuticleSamples.length > 0
+      ? cuticleSamples.filter((s) => s.isMetal && deltaLab(s.lab, baseLab) > 12).length /
+        cuticleSamples.length
+      : 0;
+  const tipMetalRatio =
+    tipBorderSamples.length > 0
+      ? tipBorderSamples.filter((s) => s.isMetal && deltaLab(s.lab, baseLab) > 12).length /
+        tipBorderSamples.length
+      : 0;
+
+  let borderKind: NailBorderKind = 'none';
+  let borderSamplesChosen: BorderSample[] = [];
+  let borderIsMetallic = false;
+  let borderThicknessNorm = 0.05;
+  let smileCurveDepth = 0.14;
+
+  if (
+    (lateralDiffRatio > 0.34 && (cuticleDiffRatio > 0.24 || tipDiffRatio > 0.24)) &&
+    (lateralMetalRatio > 0.22 || cuticleMetalRatio > 0.22 || tipMetalRatio > 0.22)
+  ) {
+    borderKind = 'full_metallic_outline';
+    borderSamplesChosen = [...lateralDiff, ...cuticleDiff, ...tipDiff];
+    borderIsMetallic = true;
+    borderThicknessNorm = 0.055;
+    smileCurveDepth = 0.08;
+  } else if (cuticleDiffRatio > 0.42 && cuticleMetalRatio > 0.24 && tipDiffRatio < 0.28) {
+    borderKind = 'cuticle_cuff';
+    borderSamplesChosen = cuticleDiff;
+    borderIsMetallic = true;
+    borderThicknessNorm = 0.075;
+    smileCurveDepth = 0.16;
+  } else if (tipDiffRatio > 0.38 && lateralDiffRatio < 0.36) {
+    // Distinguish micro_french vs classic_french vs v_french
+    const v82Samples = borderSamples.filter((s) => s.v >= 0.80 && s.v < 0.90);
+    const v82DiffRatio =
+      v82Samples.length > 0
+        ? v82Samples.filter((s) => deltaLab(s.lab, baseLab) > 14).length / v82Samples.length
+        : 0;
+    const centerTipDiff = tipBorderSamples.filter(
+      (s) => s.u >= 0.40 && s.u <= 0.60 && s.v >= 0.78 && s.v <= 0.88 && deltaLab(s.lab, baseLab) > 14
+    ).length;
+    const sideTipDiff = tipBorderSamples.filter(
+      (s) => (s.u < 0.25 || s.u > 0.75) && s.v >= 0.82 && deltaLab(s.lab, baseLab) > 14
+    ).length;
+
+    if (v82DiffRatio < 0.20) {
+      borderKind = 'micro_french';
+      borderThicknessNorm = 0.065;
+      smileCurveDepth = 0.10;
+    } else if (centerTipDiff > sideTipDiff * 1.4 && v82DiffRatio > 0.24) {
+      borderKind = 'v_french';
+      borderThicknessNorm = 0.18;
+      smileCurveDepth = 0.24;
+    } else {
+      borderKind = 'classic_french';
+      borderThicknessNorm = 0.17;
+      smileCurveDepth = 0.16;
+    }
+    borderSamplesChosen = tipDiff;
+    borderIsMetallic = tipMetalRatio > 0.36;
+  }
+
+  const borderColorHex =
+    borderSamplesChosen.length > 0
+      ? medianColorFromLabSamples(
+          borderSamplesChosen.map((s) => s.lab),
+          borderSamplesChosen.map((s) => [s.r, s.g, s.b]),
+          borderIsMetallic ? '#D4AF37' : '#FFFDF9'
+        )
+      : '#D4AF37';
+
+  const borderLayer: NailBorderLayer = {
+    kind: borderKind,
+    colorHex: borderColorHex,
+    thicknessNorm: Number(clamp(borderThicknessNorm, 0.02, 0.28).toFixed(3)),
+    isMetallic: borderIsMetallic,
+    is3DRaised: borderKind === 'full_metallic_outline' || borderKind === 'cuticle_cuff',
+    smileCurveDepth: Number(clamp(smileCurveDepth, 0, 0.35).toFixed(3)),
+  };
+
+  // D. Foreground Art Segmentation (deltaLab > 13 vs baseLab, excluding borderLayer & glare)
+  const artMask = new Uint8Array(totalPx);
+  const artSeeds: number[] = [];
+
+  for (let y = minY; y <= maxY; y++) {
+    const lx = smoothL[y];
+    const rx = smoothR[y];
+    const span = rx - lx;
+    if (span < 4) continue;
+    const v = clamp01((maxY - y) / Math.max(1, maxY - minY));
+    const rowOff = y * width;
+
+    // Respect borderLayer margin so perimeter gold rims or French tips aren't duplicated as strokes
+    const uMargin =
+      borderKind === 'full_metallic_outline' ? 0.11 : 0.06;
+    const vMinArt =
+      borderKind === 'full_metallic_outline' || borderKind === 'cuticle_cuff' ? 0.12 : 0.06;
+    const vMaxArt =
+      borderKind === 'classic_french' || borderKind === 'v_french'
+        ? 0.78
+        : borderKind === 'micro_french' || borderKind === 'full_metallic_outline'
+          ? 0.89
+          : 0.94;
+
+    if (v < vMinArt || v > vMaxArt) continue;
+
+    for (let x = Math.max(0, Math.floor(lx)); x <= Math.min(width - 1, Math.ceil(rx)); x++) {
+      const idx = rowOff + x;
+      if (mask[idx] === 0) continue;
+      const u = (x - lx) / span;
+      if (u < uMargin || u > 1 - uMargin) continue;
+
+      const p4 = idx * 4;
+      const r = rgba[p4];
+      const g = rgba[p4 + 1];
+      const b = rgba[p4 + 2];
+      if (isSpecularGlare(r, g, b)) continue;
+
+      const l3 = idx * 3;
+      const dL = labBuf[l3] - baseLab[0];
+      const dA = labBuf[l3 + 1] - baseLab[1];
+      const dB = labBuf[l3 + 2] - baseLab[2];
+      const dBase = Math.sqrt(dL * dL + dA * dA + dB * dB);
+      const mInfo = detectMetallicSignal(r, g, b, gradBuf[idx]);
+
+      if (dBase > 13.0 || (mInfo.isMetallic && dBase > 9.5)) {
+        artMask[idx] = 1;
+        artSeeds.push(idx);
+      }
+    }
+  }
+
+  // 8-neighbor Connected Components Vectorization
+  const visited = new Uint8Array(totalPx);
+  const rawPlateArea = Math.max(40, maskCount);
+  interface VectorCandidate {
+    relevance: number;
+    element: VectorArtElement;
+  }
+  const vectorCandidates: VectorCandidate[] = [];
+
+  for (const seedIdx of artSeeds) {
+    if (visited[seedIdx] || artMask[seedIdx] === 0) continue;
+
+    const queue: number[] = [seedIdx];
+    visited[seedIdx] = 1;
+    let head = 0;
+
+    interface CompPx {
+      x: number;
+      y: number;
+      u: number;
+      v: number;
+      r: number;
+      g: number;
+      b: number;
+      lab: [number, number, number];
+      luma: number;
+      isMetal: boolean;
+      isGold: boolean;
+      grad: number;
+    }
+    const pts: CompPx[] = [];
+
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const cy = Math.floor(cur / width);
+      const cx = cur - cy * width;
+      const lx = smoothL[cy];
+      const rx = smoothR[cy];
+      const span = Math.max(1, rx - lx);
+      const p4 = cur * 4;
+      const r = rgba[p4];
+      const g = rgba[p4 + 1];
+      const b = rgba[p4 + 2];
+      const grad = gradBuf[cur];
+      const mInfo = detectMetallicSignal(r, g, b, grad);
+      const l3 = cur * 3;
+
+      pts.push({
+        x: cx,
+        y: cy,
+        u: clamp01((cx - lx) / span),
+        v: clamp01((maxY - cy) / Math.max(1, maxY - minY)),
+        r,
+        g,
+        b,
+        lab: [labBuf[l3], labBuf[l3 + 1], labBuf[l3 + 2]],
+        luma: lumaBuf[cur],
+        isMetal: mInfo.isMetallic,
+        isGold: mInfo.isGold,
+        grad,
+      });
+
+      for (let oy = -1; oy <= 1; oy++) {
+        const ny = cy + oy;
+        if (ny < 0 || ny >= height) continue;
+        const nRow = ny * width;
+        for (let ox = -1; ox <= 1; ox++) {
+          if (ox === 0 && oy === 0) continue;
+          const nx = cx + ox;
+          if (nx < 0 || nx >= width) continue;
+          const nIdx = nRow + nx;
+          if (visited[nIdx] === 0 && artMask[nIdx] === 1) {
+            visited[nIdx] = 1;
+            queue.push(nIdx);
+          }
+        }
+      }
+    }
+
+    const areaFrac = pts.length / rawPlateArea;
+    if (pts.length < 4 || areaFrac < 0.0012) continue;
+
+    let sumU = 0;
+    let sumV = 0;
+    let metalCount = 0;
+    let goldCount = 0;
+    let lumaAcc = 0;
+    let maxLuma = 0;
+    for (const p of pts) {
+      sumU += p.u;
+      sumV += p.v;
+      if (p.isMetal) metalCount++;
+      if (p.isGold) goldCount++;
+      lumaAcc += p.luma;
+      if (p.luma > maxLuma) maxLuma = p.luma;
+    }
+    const cu = sumU / pts.length;
+    const cv = sumV / pts.length;
+    const metalFrac = metalCount / pts.length;
+    const goldFrac = goldCount / pts.length;
+    const compMeanLuma = lumaAcc / pts.length;
+
+    // Covariance matrix PCA in isotropic pixel space (adjusted for nail aspect ratio!)
+    // so circular beads/pearls on tall nails are not falsely stretched horizontally in (u, v)!
+    const uToX = bedRefWidth;
+    const vToY = nailLength;
+    let cxPx = 0;
+    let cyPx = 0;
+    for (const p of pts) {
+      cxPx += p.u * uToX;
+      cyPx += p.v * vToY;
+    }
+    cxPx /= pts.length;
+    cyPx /= pts.length;
+
+    let cxx = 0;
+    let cyy = 0;
+    let cxy = 0;
+    let cxxUV = 0;
+    let cyyUV = 0;
+    let cxyUV = 0;
+    for (const p of pts) {
+      const dx = p.u * uToX - cxPx;
+      const dy = p.v * vToY - cyPx;
+      cxx += dx * dx;
+      cyy += dy * dy;
+      cxy += dx * dy;
+
+      const du = p.u - cu;
+      const dv = p.v - cv;
+      cxxUV += du * du;
+      cyyUV += dv * dv;
+      cxyUV += du * dv;
+    }
+    cxx /= pts.length;
+    cyy /= pts.length;
+    cxy /= pts.length;
+    cxxUV /= pts.length;
+    cyyUV /= pts.length;
+    cxyUV /= pts.length;
+
+    const trace = cxx + cyy;
+    const disc = Math.sqrt(Math.max(0, (cxx - cyy) * (cxx - cyy) + 4 * cxy * cxy));
+    const lambda1 = Math.max(1e-5, (trace + disc) * 0.5);
+    const lambda2 = Math.max(0, (trace - disc) * 0.5);
+    const eccentricity = Math.sqrt(Math.max(0, 1 - lambda2 / lambda1));
+
+    const traceUV = cxxUV + cyyUV;
+    const discUV = Math.sqrt(Math.max(0, (cxxUV - cyyUV) * (cxxUV - cyyUV) + 4 * cxyUV * cxyUV));
+    const lambda1UV = Math.max(1e-7, (traceUV + discUV) * 0.5);
+
+    // Effective radius normalized to nail width (0.015 .. 0.065)
+    const pixelRadius = Math.sqrt(pts.length / Math.PI);
+    const approxRadius = pixelRadius / Math.max(8, bedRefWidth);
+    const majorR = Math.max(1e-3, Math.sqrt(lambda1) * 2.0);
+    const minorR = Math.max(1e-3, Math.sqrt(lambda2) * 2.0);
+    const circularity = clamp01(Math.min(1, minorR / majorR));
+
+    const compLabs = pts.map((p) => p.lab);
+    const compRgbs: Array<[number, number, number]> = pts.map((p) => [p.r, p.g, p.b]);
+    const compColorHex = medianColorFromLabSamples(compLabs, compRgbs, '#D4AF37');
+    const isCompMetallic = metalFrac > 0.28 || goldFrac > 0.20;
+
+    // 1. Small circular bright/metallic bead/pearl/crystal -> micro_gem
+    if (
+      approxRadius >= 0.015 &&
+      approxRadius <= 0.085 &&
+      circularity >= 0.56 &&
+      eccentricity <= 0.80 &&
+      (isCompMetallic || compMeanLuma > 0.65 || maxLuma > 0.78)
+    ) {
+      const [, compSat] = rgbToHsv(...hexToRgb(compColorHex));
+      const kind: MicroGemElement['kind'] =
+        goldFrac > 0.25
+          ? 'gold_bead'
+          : compSat < 0.16 && compMeanLuma > 0.70
+            ? 'pearl'
+            : 'crystal';
+
+      const gem: MicroGemElement = {
+        type: 'micro_gem',
+        u: Number(clamp01(cu).toFixed(3)),
+        v: Number(clamp01(cv).toFixed(3)),
+        radius: Number(clamp(approxRadius, 0.015, 0.065).toFixed(3)),
+        colorHex: compColorHex,
+        kind,
+      };
+      vectorCandidates.push({
+        relevance: areaFrac * (isCompMetallic ? 2.2 : 1.5),
+        element: gem,
+      });
+      continue;
+    }
+
+    // 2. Elongated element (eccentricity > 0.76) -> ribbon_stroke via PCA ridge slicing + RDP
+    if (eccentricity > 0.76 && pts.length >= 6) {
+      // Principal axis eigenvector (ux, uy) in UV space for eigenvalue lambda1UV
+      let ux = 1;
+      let uy = 0;
+      if (Math.abs(cxyUV) > 1e-8) {
+        ux = lambda1UV - cyyUV;
+        uy = cxyUV;
+      } else if (cyyUV > cxxUV) {
+        ux = 0;
+        uy = 1;
+      }
+      const uLen = Math.hypot(ux, uy) || 1;
+      ux /= uLen;
+      uy /= uLen;
+      const vx = -uy;
+      const vy = ux;
+
+      // Project points along principal axis t and perpendicular n
+      let minT = Infinity;
+      let maxT = -Infinity;
+      const projected = pts.map((p) => {
+        const du = p.u - cu;
+        const dv = p.v - cv;
+        const t = du * ux + dv * uy;
+        const n = du * vx + dv * vy;
+        if (t < minT) minT = t;
+        if (t > maxT) maxT = t;
+        return { p, t, n };
+      });
+
+      const spanT = Math.max(1e-4, maxT - minT);
+      const nSlices = clamp(Math.round(spanT / 0.045), 6, 14);
+      const sliceBins: Array<Array<{ u: number; v: number; n: number }>> = Array.from(
+        { length: nSlices },
+        () => []
+      );
+
+      for (const item of projected) {
+        const bIdx = Math.min(nSlices - 1, Math.floor(((item.t - minT) / spanT) * nSlices));
+        sliceBins[bIdx].push({ u: item.p.u, v: item.p.v, n: item.n });
+      }
+
+      const rawCenterline: RibbonStrokePoint[] = [];
+      for (let sIdx = 0; sIdx < nSlices; sIdx++) {
+        const bin = sliceBins[sIdx];
+        if (bin.length === 0) continue;
+        let su = 0;
+        let sv = 0;
+        let minN = Infinity;
+        let maxN = -Infinity;
+        for (const bp of bin) {
+          su += bp.u;
+          sv += bp.v;
+          if (bp.n < minN) minN = bp.n;
+          if (bp.n > maxN) maxN = bp.n;
+        }
+        const localWidth = clamp(Math.max(0.022, (maxN - minN) * 1.1), 0.015, 0.14);
+        rawCenterline.push({
+          u: su / bin.length,
+          v: sv / bin.length,
+          width: localWidth,
+        });
+      }
+
+      const points = normalizeRibbonControlPoints(rawCenterline);
+      if (points.length >= 4) {
+        const highlightHex = isCompMetallic
+          ? mixHex(compColorHex, '#FFF7DF', 0.55)
+          : shadeHex(compColorHex, 32);
+        const ribbon: RibbonStrokeElement = {
+          type: 'ribbon_stroke',
+          points,
+          colorHex: compColorHex,
+          highlightHex,
+          isMetallic: isCompMetallic,
+          reliefHeight: Number(clamp(isCompMetallic ? 0.82 : 0.48, 0.2, 1.0).toFixed(2)),
+        };
+        vectorCandidates.push({
+          relevance: areaFrac * (isCompMetallic ? 2.5 : 1.5),
+          element: ribbon,
+        });
+        continue;
+      }
+    }
+
+    // 3. Organic/floral/marble motif (eccentricity <= 0.76, area >= 1.2% of plate)
+    if (areaFrac >= 0.012) {
+      const contour = extractSmoothedOrganicContour(pts, cu, cv, 20);
+      const motif: OrganicMotifElement = {
+        type: 'organic_motif',
+        contour,
+        fillColorHex: compColorHex,
+        shadeColorHex: shadeHex(compColorHex, -34),
+        isMetallic: isCompMetallic,
+        reliefHeight: Number(clamp(isCompMetallic ? 0.72 : 0.55, 0.15, 1.0).toFixed(2)),
+      };
+      vectorCandidates.push({
+        relevance: areaFrac * 1.6,
+        element: motif,
+      });
+    }
+  }
+
+  vectorCandidates.sort((a, b) => b.relevance - a.relevance);
+  const artElements: VectorArtElement[] = vectorCandidates
+    .slice(0, 12)
+    .map((c) => c.element);
+
+  // Detect gradientMode & finishStyle for baseLayer
+  const totalMetalRatio =
+    interiorSamples.length > 0
+      ? interiorSamples.filter((s) => s.isMetal).length / interiorSamples.length
+      : 0;
+  const isVelvetMatte =
+    gradDensity < 0.025 && lumaStd < 0.055 && totalMetalRatio < 0.04;
+  const isChromeMirror =
+    (lumaStd > 0.15 && totalMetalRatio > 0.18 && artElements.length <= 2) ||
+    (meanLuma > 0.62 && lumaStd > 0.17 && meanSat < 0.25);
+  const isPearlGlazed =
+    !isChromeMirror && meanLuma > 0.68 && meanSat < 0.24 && lumaStd > 0.075 && totalMetalRatio > 0.04;
+  const isCatEye =
+    !isChromeMirror && catEyeRatio > 0.62 && lumaStd > 0.10 && meanLuma < 0.65;
+  const isJelly =
+    !isChromeMirror &&
+    !isVelvetMatte &&
+    meanLuma > 0.56 &&
+    meanSat < 0.36 &&
+    deltaLab(hexToLab(cuticleColorHex), hexToLab(tipColorHex)) > 11 &&
+    artElements.length === 0;
+
+  let finishStyle: NailFinishV10 = 'glossy_gel';
+  if (isChromeMirror) finishStyle = 'chrome_mirror';
+  else if (isPearlGlazed) finishStyle = 'pearl_glazed';
+  else if (isCatEye) finishStyle = 'cat_eye';
+  else if (isVelvetMatte) finishStyle = 'velvet_matte';
+  else if (isJelly) finishStyle = 'jelly_translucent';
+
+  let gradientMode: NailGradientMode = 'solid';
+  if (finishStyle === 'chrome_mirror' || finishStyle === 'pearl_glazed') {
+    gradientMode = 'pearl_chrome';
+  } else if (finishStyle === 'cat_eye') {
+    gradientMode = 'cat_eye_band';
+  } else if (centerOuterDelta > 12.5 && centerOuterDelta >= cuticleTipDelta * 0.9) {
+    gradientMode = 'radial_aura';
+  } else if (cuticleTipDelta > 13.0) {
+    gradientMode = 'vertical_ombre';
+  }
+
+  const baseLayer: NailBaseLayer = {
+    baseColorHex,
+    gradientMode,
+    cuticleColorHex,
+    midColorHex: gradientMode === 'radial_aura' ? centerAuraHex : midColorHex,
+    tipColorHex,
+    finishStyle,
+    translucency: finishStyle === 'jelly_translucent' ? 0.52 : finishStyle === 'pearl_glazed' ? 0.22 : 0.06,
+    metallicBase:
+      finishStyle === 'chrome_mirror'
+        ? 0.92
+        : finishStyle === 'pearl_glazed'
+          ? 0.42
+          : finishStyle === 'cat_eye'
+            ? 0.55
+            : 0.04,
+    glossiness: finishStyle === 'velvet_matte' ? 0.42 : finishStyle === 'chrome_mirror' ? 1.0 : 0.95,
+  };
+
+  return {
+    version: 10,
+    geometry,
+    baseLayer,
+    borderLayer,
+    artElements,
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Stage 1: Fast 128×192 ROI Extraction, Local Skin/Background Modeling & Region Growing
+// -----------------------------------------------------------------------------
 
 type ScratchCanvas = OffscreenCanvas | HTMLCanvasElement;
 type ScratchCtx = OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D;
@@ -146,7 +1658,7 @@ function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-function loadImageFromDataUrl(dataUrl: string, maxDim = 2200): Promise<HTMLImageElement> {
+function loadImageFromDataUrl(dataUrl: string, maxDim = 1600): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const rawImg = new Image();
     rawImg.onerror = () => reject(new Error('Imagem inválida.'));
@@ -169,425 +1681,813 @@ function loadImageFromDataUrl(dataUrl: string, maxDim = 2200): Promise<HTMLImage
       const norm = new Image();
       norm.onload = () => resolve(norm);
       norm.onerror = () => resolve(rawImg);
-      norm.src = c.toDataURL('image/jpeg', 0.95);
+      norm.src = c.toDataURL('image/jpeg', 0.92);
     };
     rawImg.src = dataUrl;
   });
 }
 
-function rgbToHex(r: number, g: number, b: number): string {
-  const clampByte = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
-  return (
-    '#' +
-    [clampByte(r), clampByte(g), clampByte(b)]
-      .map((n) => n.toString(16).padStart(2, '0'))
-      .join('')
-      .toUpperCase()
-  );
+interface SkinStats {
+  labMean: [number, number, number];
+  labStd: [number, number, number];
+  ycbcrMean: [number, number, number];
+  ycbcrStd: [number, number, number];
 }
 
-/**
- * True CIE L*a*b* conversion (sRGB -> D65 XYZ -> CIELab) so deep burgundy/wine (#5A0A1E),
- * crimson flowers, skin tones, and warm gold rims remain accurately separated without muddying.
- */
-function rgbToLabLike(r: number, g: number, b: number): [number, number, number] {
-  const lin = (c: number) => {
-    const v = c / 255;
-    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
-  };
-  const rl = lin(r);
-  const gl = lin(g);
-  const bl = lin(b);
-
-  const x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.95047;
-  const y = 0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl;
-  const z = (0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl) / 1.08883;
-
-  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
-  const fx = f(x);
-  const fy = f(y);
-  const fz = f(z);
-
-  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
-}
-
-function deltaLab(c1: [number, number, number], c2: [number, number, number]): number {
-  const dl = (c1[0] - c2[0]) * 0.78;
-  const da = (c1[1] - c2[1]) * 1.15;
-  const db = (c1[2] - c2[2]) * 1.1;
-  return Math.hypot(dl, da, db);
-}
-
-function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
-  const rn = r / 255;
-  const gn = g / 255;
-  const bn = b / 255;
-  const max = Math.max(rn, gn, bn);
-  const min = Math.min(rn, gn, bn);
-  const d = max - min;
-  let h = 0;
-  if (d > 1e-5) {
-    if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
-    else if (max === gn) h = ((bn - rn) / d + 2) / 6;
-    else h = ((rn - gn) / d + 4) / 6;
-  }
-  const s = max > 0 ? d / max : 0;
-  return [h * 360, s, max];
-}
-
-function medianRgbColor(samples: Array<[number, number, number]>, fallback: string): string {
-  if (samples.length === 0) return fallback;
-  const rs = samples.map((s) => s[0]).sort((a, b) => a - b);
-  const gs = samples.map((s) => s[1]).sort((a, b) => a - b);
-  const bs = samples.map((s) => s[2]).sort((a, b) => a - b);
-  const mid = Math.floor(samples.length / 2);
-  return rgbToHex(rs[mid], gs[mid], bs[mid]);
-}
-
-function isGoldOrMetallicPixel(r: number, g: number, b: number, gradMag: number): boolean {
-  const maxC = Math.max(r, g, b);
-  const minC = Math.min(r, g, b);
-  const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-  const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
-  // Warm gold / champagne metallic
-  const isWarmGold = r > g * 1.05 && g > b * 1.16 && luma > 0.40 && sat > 0.22;
-  // Bright pearl / specular chrome ridge
-  const isPearlRidge = luma > 0.78 && gradMag > 0.14;
-  return isWarmGold || isPearlRidge;
-}
-
-function classifyExtensionFromAspectRatio(aspectRatio: number): {
-  extensionLevel: NailExtensionLevel;
-  extensionMm: number;
-  lengthMultiplier: number;
-} {
-  const ar = Math.max(0.75, Math.min(3.4, aspectRatio));
-
-  if (ar < 1.30) {
-    const t = Math.max(0, Math.min(1, (ar - 0.85) / (1.30 - 0.85)));
-    return {
-      extensionLevel: 'Curta/Natural',
-      extensionMm: Number((1.5 + t * 1.5).toFixed(1)),
-      lengthMultiplier: Number(Math.min(1.65, 0.85 + t * (1.02 - 0.85)).toFixed(2)),
-    };
-  }
-  if (ar < 1.72) {
-    const t = Math.max(0, Math.min(1, (ar - 1.30) / (1.72 - 1.30)));
-    return {
-      extensionLevel: 'Pouco Alongada',
-      extensionMm: Number((3.0 + t * 2.2).toFixed(1)),
-      lengthMultiplier: Number(Math.min(1.65, 1.04 + t * (1.22 - 1.04)).toFixed(2)),
-    };
-  }
-  if (ar < 2.25) {
-    const t = Math.max(0, Math.min(1, (ar - 1.72) / (2.25 - 1.72)));
-    return {
-      extensionLevel: 'Alongada',
-      extensionMm: Number((5.2 + t * 3.3).toFixed(1)),
-      lengthMultiplier: Number(Math.min(1.65, 1.24 + t * (1.44 - 1.24)).toFixed(2)),
-    };
-  }
-  const t = Math.max(0, Math.min(1, (ar - 2.25) / (3.10 - 2.25)));
-  return {
-    extensionLevel: 'Muito Alongada (Extrema)',
-    extensionMm: Number((8.5 + t * 3.5).toFixed(1)),
-    lengthMultiplier: Number(Math.min(1.65, 1.46 + t * (1.65 - 1.46)).toFixed(2)),
-  };
-}
-
-function classifyExtensionFromMultiplier(lengthMultiplier: number): NailExtensionLevel {
-  if (lengthMultiplier <= 1.03) return 'Curta/Natural';
-  if (lengthMultiplier <= 1.23) return 'Pouco Alongada';
-  if (lengthMultiplier <= 1.45) return 'Alongada';
-  return 'Muito Alongada (Extrema)';
-}
-
-function computeExtensionMmFromMultiplier(lengthMultiplier: number): number {
-  const t = Math.max(0, Math.min(1, (lengthMultiplier - 0.85) / (1.65 - 0.85)));
-  return Number((1.5 + t * 10.5).toFixed(1));
-}
-
-function sanitizeHexColor(hex: unknown, fallback: string): string {
-  if (typeof hex !== 'string') return fallback;
-  const trimmed = hex.trim();
-  if (/^#[0-9A-Fa-f]{6}$/.test(trimmed)) return trimmed.toUpperCase();
-  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
-    const r = trimmed[1];
-    const g = trimmed[2];
-    const b = trimmed[3];
-    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
-  }
-  return fallback;
-}
-
-function normalizeShape(shape: unknown, fallback: NailShape = 'almond'): NailShape {
-  if (typeof shape === 'string' && VALID_SHAPES.includes(shape as NailShape)) {
-    return shape as NailShape;
-  }
-  return fallback;
-}
-
-function normalizePattern(pattern: unknown, fallback: ArtisticPattern = 'solid_gloss'): ArtisticPattern {
-  if (typeof pattern === 'string' && VALID_PATTERNS.includes(pattern as ArtisticPattern)) {
-    return pattern as ArtisticPattern;
-  }
-  return fallback;
-}
-
-/**
- * Full 512×512 UV Rectification covering 94% of the segmented nail plate
- * (`u ∈ [0.03, 0.97], v ∈ [0.04, 0.96]`) via direct bilinear sampling from the full-res source photo.
- *
- * CRITICAL FIDELITY GUARANTEE:
- * - NO global Retinex normalization (preserves deep burgundy/wine `#5A0A1E`, obsidian, crimson florals, gold rims).
- * - Surgical specular-glare inpainting ONLY on blown-out specular highlight pixels (`luma > 0.92 && sat < 0.12`),
- *   replacing each glare pixel with the Gaussian/distance-weighted mean of non-specular neighbors within radius 6px.
- * - Orientation: u = 0..1 (left->right), v = 0..1 (cuticle at canvas bottom -> tip at canvas top).
- */
-function buildRectifiedNailUVPatch(
+function computeSkinModel(
   img: HTMLImageElement,
-  rowLeft: Int16Array,
-  rowRight: Int16Array,
-  minY: number,
-  maxY: number,
-  roiW: number,
-  roiH: number,
-  anchorX: number,
-  anchorY: number,
-  scale: number,
-  angleRad: number
-): string | undefined {
-  const nailLen = maxY - minY;
-  if (nailLen < 16) return undefined;
-
+  pipNorm: { x: number; y: number },
+  dipNorm: { x: number; y: number },
+  segPx: number
+): SkinStats {
   const imgW = img.naturalWidth;
   const imgH = img.naturalHeight;
-  if (!imgW || !imgH) return undefined;
+  const { ctx } = createScratchCanvas(24, 24);
+  const sx = (pipNorm.x * 0.55 + dipNorm.x * 0.45) * imgW;
+  const sy = (pipNorm.y * 0.55 + dipNorm.y * 0.45) * imgH;
+  const patch = Math.max(10, Math.round(segPx * 0.24));
 
-  // Smooth segmented left/right boundaries across Y to prevent jagged scanlines
-  const smoothL = new Float32Array(roiH);
-  const smoothR = new Float32Array(roiH);
-  for (let y = minY; y <= maxY; y++) {
+  ctx.drawImage(
+    img,
+    clamp(sx - patch * 0.5, 0, Math.max(0, imgW - patch)),
+    clamp(sy - patch * 0.5, 0, Math.max(0, imgH - patch)),
+    patch,
+    patch,
+    0,
+    0,
+    24,
+    24
+  );
+
+  const px = ctx.getImageData(0, 0, 24, 24).data;
+  const labs: Array<[number, number, number]> = [];
+  const yccs: Array<[number, number, number]> = [];
+
+  for (let i = 0; i < px.length; i += 4) {
+    const r = px[i];
+    const g = px[i + 1];
+    const b = px[i + 2];
+    const mInfo = detectMetallicSignal(r, g, b, 0);
+    if (mInfo.isGold) continue;
+    labs.push(rgbToLab(r, g, b));
+    yccs.push(rgbToYCbCr(r, g, b));
+  }
+
+  if (labs.length < 12) {
+    return {
+      labMean: [72, 12, 18],
+      labStd: [9, 6, 6],
+      ycbcrMean: [175, 112, 146],
+      ycbcrStd: [18, 9, 9],
+    };
+  }
+
+  const calcStats = (arr: Array<[number, number, number]>, minStd: [number, number, number]) => {
+    const n = arr.length;
+    const mean: [number, number, number] = [0, 0, 0];
+    for (const v of arr) {
+      mean[0] += v[0];
+      mean[1] += v[1];
+      mean[2] += v[2];
+    }
+    mean[0] /= n;
+    mean[1] /= n;
+    mean[2] /= n;
+
+    const std: [number, number, number] = [0, 0, 0];
+    for (const v of arr) {
+      std[0] += (v[0] - mean[0]) ** 2;
+      std[1] += (v[1] - mean[1]) ** 2;
+      std[2] += (v[2] - mean[2]) ** 2;
+    }
+    std[0] = Math.max(minStd[0], Math.sqrt(std[0] / n));
+    std[1] = Math.max(minStd[1], Math.sqrt(std[1] / n));
+    std[2] = Math.max(minStd[2], Math.sqrt(std[2] / n));
+    return { mean, std };
+  };
+
+  const labS = calcStats(labs, [6.5, 4.0, 4.0]);
+  const yccS = calcStats(yccs, [14.0, 6.0, 6.0]);
+  return {
+    labMean: labS.mean,
+    labStd: labS.std,
+    ycbcrMean: yccS.mean,
+    ycbcrStd: yccS.std,
+  };
+}
+
+function skinMahalanobisDist(
+  lab: [number, number, number],
+  ycc: [number, number, number],
+  skin: SkinStats
+): number {
+  const dl = (lab[0] - skin.labMean[0]) / skin.labStd[0];
+  const da = (lab[1] - skin.labMean[1]) / skin.labStd[1];
+  const db = (lab[2] - skin.labMean[2]) / skin.labStd[2];
+  const dLabMaha = Math.sqrt((dl * dl * 0.6 + da * da * 1.2 + db * db * 1.2) / 3);
+
+  const dcb = (ycc[1] - skin.ycbcrMean[1]) / skin.ycbcrStd[1];
+  const dcr = (ycc[2] - skin.ycbcrMean[2]) / skin.ycbcrStd[2];
+  const dYccMaha = Math.sqrt((dcb * dcb + dcr * dcr) * 0.5);
+
+  return Math.min(dLabMaha, dYccMaha * 0.9 + dLabMaha * 0.35);
+}
+
+/**
+ * Isolates the nail plate inside the `128 × 192` aligned ROI via:
+ * 1. Background sampling along outer ROI borders (`u < 0.08`, `u > 0.92`, `v > 0.94`)
+ * 2. Central seed selection around `(u = 0.5, v ∈ [0.45, 0.68])`
+ * 3. Seed-guided Region Growing / Flood-Fill rejecting skin (Mahalanobis + DeltaLab),
+ *    background, and metallic rings outside the distal plate (`v < 0.08` or excessive width)
+ * 4. Fast morphological closing (3×3 dilate -> erode) + smooth left/right envelope + 2px anti-leak retraction
+ */
+function isolateNailPlateMask(
+  rgba: Uint8ClampedArray,
+  w: number,
+  h: number,
+  skin: SkinStats
+): {
+  mask: Uint8Array;
+  qualityScore: number;
+  ringOcclusionRatio: number;
+} {
+  const total = w * h;
+
+  // 1. Sample outer ROI borders for background model
+  const bgLabs: Array<[number, number, number]> = [];
+  for (let y = 2; y < h - 2; y += 4) {
+    for (const x of [2, 5, w - 6, w - 3]) {
+      const p4 = (y * w + x) * 4;
+      bgLabs.push(rgbToLab(rgba[p4], rgba[p4 + 1], rgba[p4 + 2]));
+    }
+  }
+  for (let x = 6; x < w - 6; x += 6) {
+    for (const y of [2, 5]) {
+      const p4 = (y * w + x) * 4;
+      bgLabs.push(rgbToLab(rgba[p4], rgba[p4 + 1], rgba[p4 + 2]));
+    }
+  }
+  const bgMean: [number, number, number] = [0, 0, 0];
+  for (const c of bgLabs) {
+    bgMean[0] += c[0];
+    bgMean[1] += c[1];
+    bgMean[2] += c[2];
+  }
+  if (bgLabs.length > 0) {
+    bgMean[0] /= bgLabs.length;
+    bgMean[1] /= bgLabs.length;
+    bgMean[2] /= bgLabs.length;
+  }
+
+  // Precompute per-pixel skin/background acceptance field
+  const pixelValid = new Uint8Array(total);
+  const pixelLab = new Float32Array(total * 3);
+  const pixelSkinDist = new Float32Array(total);
+  const pixelBgDist = new Float32Array(total);
+
+  let ringHits = 0;
+  const cx = w * 0.5;
+  const cy = h * 0.46;
+  const rxPrior = w * 0.31;
+  const ryPrior = h * 0.42;
+
+  for (let y = 0; y < h; y++) {
+    // ROI y=0 is distal tip (v=1), y=h-1 is proximal base (v=0)
+    const vApprox = 1 - y / (h - 1);
+    const rowOff = y * w;
+
+    for (let x = 0; x < w; x++) {
+      const idx = rowOff + x;
+      const p4 = idx * 4;
+      const r = rgba[p4];
+      const g = rgba[p4 + 1];
+      const b = rgba[p4 + 2];
+
+      const lab = rgbToLab(r, g, b);
+      pixelLab[idx * 3] = lab[0];
+      pixelLab[idx * 3 + 1] = lab[1];
+      pixelLab[idx * 3 + 2] = lab[2];
+
+      const ycc = rgbToYCbCr(r, g, b);
+      const mahaSkin = skinMahalanobisDist(lab, ycc, skin);
+      const dSkinLab = deltaLab(lab, skin.labMean);
+      const dBgLab = deltaLab(lab, bgMean);
+
+      pixelSkinDist[idx] = dSkinLab;
+      pixelBgDist[idx] = dBgLab;
+
+      const ellip = Math.hypot((x - cx) / rxPrior, (y - cy) / ryPrior);
+      const isDarkPolish = lab[0] < 28 && dBgLab > 7.0 && ellip < 1.12;
+      const [, sat, val] = rgbToHsv(r, g, b);
+      const isVividOrLight = (sat > 0.18 || val > 0.80) && dSkinLab > 7.5;
+
+      // Reject metallic rings outside distal nail zone (v < 0.08 or wide outside central shaft)
+      const mInfo = detectMetallicSignal(r, g, b, 0);
+      const outsideDistalRing =
+        mInfo.isGold && (vApprox < 0.08 || Math.abs(x - cx) > w * 0.29);
+      if (outsideDistalRing) {
+        ringHits++;
+        continue;
+      }
+
+      const notSkin =
+        mahaSkin > 1.75 || dSkinLab > 10.5 || isDarkPolish || isVividOrLight;
+      const notBg = dBgLab > 8.5 || isDarkPolish;
+
+      if (notSkin && notBg && ellip <= 1.18) {
+        pixelValid[idx] = 1;
+      }
+    }
+  }
+
+  // 2. Central seed search in u ∈ [0.40, 0.60], v ∈ [0.45, 0.68] (ROI y ∈ [0.32*h, 0.55*h])
+  const seedYStart = Math.round(h * 0.32);
+  const seedYEnd = Math.round(h * 0.55);
+  const seedXStart = Math.round(w * 0.40);
+  const seedXEnd = Math.round(w * 0.60);
+
+  let bestSeedIdx = Math.round(h * 0.44) * w + Math.round(w * 0.5);
+  let bestSeedScore = -1;
+  for (let y = seedYStart; y <= seedYEnd; y++) {
+    for (let x = seedXStart; x <= seedXEnd; x++) {
+      const idx = y * w + x;
+      if (pixelValid[idx] === 0) continue;
+      const centerBonus = 1 - Math.abs(x - w * 0.5) / (w * 0.25);
+      const score = pixelSkinDist[idx] + pixelBgDist[idx] * 0.4 + centerBonus * 6;
+      if (score > bestSeedScore) {
+        bestSeedScore = score;
+        bestSeedIdx = idx;
+      }
+    }
+  }
+
+  // 3. Seed-guided Region Growing (Flood-Fill) bounded by anatomical limits
+  const grown = new Uint8Array(total);
+  if (bestSeedScore >= 0) {
+    const queue = new Int32Array(total);
+    let qHead = 0;
+    let qTail = 0;
+    queue[qTail++] = bestSeedIdx;
+    grown[bestSeedIdx] = 1;
+
+    // Also seed vertically along central axis where pixelValid is high (bridges French tips / 3D waves!)
+    for (let y = Math.round(h * 0.14); y <= Math.round(h * 0.80); y += 2) {
+      const midIdx = y * w + Math.round(w * 0.5);
+      if (pixelValid[midIdx] === 1 && grown[midIdx] === 0) {
+        grown[midIdx] = 1;
+        queue[qTail++] = midIdx;
+      }
+    }
+
+    while (qHead < qTail) {
+      const cur = queue[qHead++];
+      const cyCur = Math.floor(cur / w);
+      const cxCur = cur - cyCur * w;
+      const curL = pixelLab[cur * 3];
+      const curA = pixelLab[cur * 3 + 1];
+      const curB = pixelLab[cur * 3 + 2];
+
+      const neighbors = [
+        cxCur > 1 ? cur - 1 : -1,
+        cxCur < w - 2 ? cur + 1 : -1,
+        cyCur > 2 ? cur - w : -1,
+        cyCur < h - 3 ? cur + w : -1,
+      ];
+
+      for (const nIdx of neighbors) {
+        if (nIdx < 0 || grown[nIdx] === 1) continue;
+        if (pixelValid[nIdx] === 0) continue;
+
+        const dl = pixelLab[nIdx * 3] - curL;
+        const da = pixelLab[nIdx * 3 + 1] - curA;
+        const db = pixelLab[nIdx * 3 + 2] - curB;
+        const stepLab = Math.sqrt(dl * dl + da * da + db * db);
+
+        // Allow continuous gradient/art transitions inside plate while blocking hard skin jumps
+        if (stepLab < 38 || pixelSkinDist[nIdx] > 14) {
+          grown[nIdx] = 1;
+          queue[qTail++] = nIdx;
+        }
+      }
+    }
+  }
+
+  // 4. Fast 3×3 Morphological Closing (Dilate -> Erode)
+  const dilated = new Uint8Array(total);
+  for (let y = 1; y < h - 1; y++) {
+    const r0 = (y - 1) * w;
+    const r1 = y * w;
+    const r2 = (y + 1) * w;
+    for (let x = 1; x < w - 1; x++) {
+      if (
+        grown[r0 + x - 1] ||
+        grown[r0 + x] ||
+        grown[r0 + x + 1] ||
+        grown[r1 + x - 1] ||
+        grown[r1 + x] ||
+        grown[r1 + x + 1] ||
+        grown[r2 + x - 1] ||
+        grown[r2 + x] ||
+        grown[r2 + x + 1]
+      ) {
+        dilated[r1 + x] = 1;
+      }
+    }
+  }
+
+  const closed = new Uint8Array(total);
+  for (let y = 1; y < h - 1; y++) {
+    const r0 = (y - 1) * w;
+    const r1 = y * w;
+    const r2 = (y + 1) * w;
+    for (let x = 1; x < w - 1; x++) {
+      if (
+        dilated[r0 + x - 1] &&
+        dilated[r0 + x] &&
+        dilated[r0 + x + 1] &&
+        dilated[r1 + x - 1] &&
+        dilated[r1 + x] &&
+        dilated[r1 + x + 1] &&
+        dilated[r2 + x - 1] &&
+        dilated[r2 + x] &&
+        dilated[r2 + x + 1]
+      ) {
+        closed[r1 + x] = 1;
+      }
+    }
+  }
+
+  // 5. Smooth Left/Right Envelope + Reject Wide Ring Rows + 2px Anti-Leak Retraction
+  const rowL = new Int16Array(h).fill(-1);
+  const rowR = new Int16Array(h).fill(-1);
+  let activeRows = 0;
+
+  for (let y = Math.round(h * 0.05); y < Math.round(h * 0.90); y++) {
+    const rowOff = y * w;
+    let lx = -1;
+    let rx = -1;
+    for (let x = 4; x < w - 4; x++) {
+      if (closed[rowOff + x] > 0) {
+        if (lx < 0) lx = x;
+        rx = x;
+      }
+    }
+    if (lx < 0 || rx <= lx) continue;
+    const rowW = rx - lx + 1;
+    // Reject rows wider than anatomical finger width (ring/overlapping finger leak)
+    if (rowW > w * 0.64 || (y > h * 0.75 && rowW > w * 0.56)) continue;
+    if (rowW < 10) continue;
+
+    rowL[y] = lx;
+    rowR[y] = rx;
+    activeRows++;
+  }
+
+  const finalMask = new Uint8Array(total);
+  if (activeRows < 14) {
+    // Fallback clean elliptical plate mask centered at DIP->TIP
+    const fMinY = Math.round(h * 0.16);
+    const fMaxY = Math.round(h * 0.80);
+    for (let y = fMinY; y <= fMaxY; y++) {
+      const v = (fMaxY - y) / Math.max(1, fMaxY - fMinY);
+      const halfW = w * 0.19 * (v > 0.65 ? 1 - (v - 0.65) * 1.4 : 1);
+      const lx = Math.round(cx - halfW);
+      const rx = Math.round(cx + halfW);
+      for (let x = lx; x <= rx; x++) {
+        finalMask[y * w + x] = 1;
+      }
+    }
+    return { mask: finalMask, qualityScore: 10, ringOcclusionRatio: 0 };
+  }
+
+  let skinContrastSum = 0;
+  let finalCount = 0;
+  for (let y = 1; y < h - 1; y++) {
+    if (rowL[y] < 0) continue;
     let accL = 0;
     let accR = 0;
     let cnt = 0;
-    for (let dy = -4; dy <= 4; dy++) {
-      const yy = Math.max(minY, Math.min(maxY, y + dy));
-      if (rowLeft[yy] >= 0 && rowRight[yy] > rowLeft[yy]) {
-        accL += rowLeft[yy];
-        accR += rowRight[yy];
+    for (let dy = -2; dy <= 2; dy++) {
+      const yy = clamp(y + dy, 0, h - 1);
+      if (rowL[yy] >= 0) {
+        accL += rowL[yy];
+        accR += rowR[yy];
         cnt++;
       }
     }
-    smoothL[y] = cnt > 0 ? accL / cnt : roiW * 0.34;
-    smoothR[y] = cnt > 0 ? accR / cnt : roiW * 0.66;
+    let lx = Math.round(accL / cnt);
+    let rx = Math.round(accR / cnt);
+
+    // 2px inward anti-leak retraction whenever boundary pixel touches skin/background
+    if (lx + 2 < rx - 2) {
+      const leftTouchesSkinBg = pixelValid[y * w + Math.max(0, lx - 1)] === 0;
+      const rightTouchesSkinBg = pixelValid[y * w + Math.min(w - 1, rx + 1)] === 0;
+      if (leftTouchesSkinBg) lx += 2;
+      if (rightTouchesSkinBg) rx -= 2;
+    }
+
+    if (rx - lx < 6) continue;
+    for (let x = lx; x <= rx; x++) {
+      finalMask[y * w + x] = 1;
+      skinContrastSum += pixelSkinDist[y * w + x];
+      finalCount++;
+    }
   }
 
-  const cosA = Math.cos(angleRad);
-  const sinA = Math.sin(angleRad);
-  const roiToImg = (rx: number, ry: number): [number, number] => {
-    const ux = (rx - roiW * 0.5) / scale;
-    const uy = (ry - roiH * 0.5) / scale;
-    return [anchorX + cosA * ux - sinA * uy, anchorY + sinA * ux + cosA * uy];
+  const avgContrast = skinContrastSum / Math.max(1, finalCount);
+  const ringOcclusionRatio = ringHits / total;
+  const qualityScore =
+    Math.min(55, avgContrast) * 1.6 +
+    Math.min(120, activeRows) * 0.45 -
+    ringOcclusionRatio * 90;
+
+  return {
+    mask: finalMask,
+    qualityScore,
+    ringOcclusionRatio,
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Blueprint <-> NailFingerDesignSpec Mapping (V10 <-> Legacy compatibility)
+// -----------------------------------------------------------------------------
+
+function mapBlueprintToLegacyPattern(bp: NailDesignBlueprint): ArtisticPattern {
+  const hasRibbons = bp.artElements.some((el) => el.type === 'ribbon_stroke');
+  const hasMotifs = bp.artElements.some((el) => el.type === 'organic_motif');
+  const hasMetallicArt = bp.artElements.some(
+    (el) =>
+      (el.type === 'ribbon_stroke' && el.isMetallic) ||
+      (el.type === 'micro_gem' && el.kind === 'gold_bead')
+  );
+
+  if (hasMotifs && !hasMetallicArt) return 'floral_accent';
+  if (hasRibbons || hasMetallicArt) return 'gold_3d_waves';
+  if (
+    bp.borderLayer.kind === 'classic_french' ||
+    bp.borderLayer.kind === 'micro_french' ||
+    bp.borderLayer.kind === 'v_french'
+  ) {
+    return 'french_tip';
+  }
+  if (bp.baseLayer.finishStyle === 'chrome_mirror') return 'chrome_mirror';
+  if (
+    bp.baseLayer.gradientMode === 'radial_aura' ||
+    bp.baseLayer.gradientMode === 'vertical_ombre'
+  ) {
+    return 'aura_gradient';
+  }
+  if (hasMotifs) return 'floral_accent';
+  return 'solid_gloss';
+}
+
+function extractAnchorsFromBlueprint(bp: NailDesignBlueprint): StrokeAnchor[] {
+  const anchors: StrokeAnchor[] = [];
+  for (const el of bp.artElements) {
+    if (anchors.length >= 4) break;
+    if (el.type === 'ribbon_stroke' && el.points.length > 0) {
+      const mid = el.points[Math.floor(el.points.length / 2)];
+      const p0 = el.points[0];
+      const p1 = el.points[el.points.length - 1];
+      anchors.push({
+        u: Number(mid.u.toFixed(2)),
+        v: Number(mid.v.toFixed(2)),
+        radius: Number(clamp(mid.width * 2.2, 0.08, 0.24).toFixed(2)),
+        angle: Number(Math.atan2(p1.v - p0.v, p1.u - p0.u).toFixed(2)),
+      });
+    } else if (el.type === 'organic_motif' && el.contour.length > 0) {
+      let su = 0;
+      let sv = 0;
+      for (const c of el.contour) {
+        su += c.u;
+        sv += c.v;
+      }
+      const cu = su / el.contour.length;
+      const cv = sv / el.contour.length;
+      let maxR = 0.08;
+      for (const c of el.contour) {
+        const d = Math.hypot(c.u - cu, c.v - cv);
+        if (d > maxR) maxR = d;
+      }
+      anchors.push({
+        u: Number(cu.toFixed(2)),
+        v: Number(cv.toFixed(2)),
+        radius: Number(clamp(maxR, 0.08, 0.24).toFixed(2)),
+        angle: 0,
+      });
+    } else if (el.type === 'micro_gem') {
+      anchors.push({
+        u: Number(el.u.toFixed(2)),
+        v: Number(el.v.toFixed(2)),
+        radius: Number(clamp(el.radius * 2, 0.05, 0.15).toFixed(2)),
+        angle: 0,
+      });
+    }
+  }
+  return anchors;
+}
+
+function pickSecondaryAndAccentColors(bp: NailDesignBlueprint): {
+  secondaryColor: string;
+  accentColor: string;
+} {
+  let secondary = bp.baseLayer.tipColorHex;
+  if (bp.baseLayer.gradientMode === 'radial_aura') {
+    secondary = bp.baseLayer.midColorHex;
+  } else if (
+    bp.borderLayer.kind === 'classic_french' ||
+    bp.borderLayer.kind === 'micro_french' ||
+    bp.borderLayer.kind === 'v_french'
+  ) {
+    secondary = bp.borderLayer.colorHex;
+  } else {
+    const motif = bp.artElements.find((e): e is OrganicMotifElement => e.type === 'organic_motif');
+    if (motif) secondary = motif.fillColorHex;
+    else if (bp.baseLayer.finishStyle === 'chrome_mirror') secondary = '#FFFFFF';
+  }
+
+  let accent = '#D4AF37';
+  if (bp.borderLayer.kind !== 'none' && bp.borderLayer.isMetallic) {
+    accent = bp.borderLayer.colorHex;
+  } else {
+    const ribbon = bp.artElements.find((e): e is RibbonStrokeElement => e.type === 'ribbon_stroke');
+    if (ribbon) accent = ribbon.colorHex;
+    else {
+      const gem = bp.artElements.find((e): e is MicroGemElement => e.type === 'micro_gem');
+      if (gem) accent = gem.colorHex;
+    }
+  }
+
+  return { secondaryColor: secondary, accentColor: accent };
+}
+
+function buildSpecFromBlueprint(
+  fingerId: FingerId,
+  bp: NailDesignBlueprint,
+  detectedFromPhoto: boolean
+): NailFingerDesignSpec {
+  const cfg = FINGER_LANDMARKS[fingerId];
+  const ext = classifyExtensionFromFreeEdgeRatio(bp.geometry.freeEdgeRatio);
+  const pattern = mapBlueprintToLegacyPattern(bp);
+  const { secondaryColor, accentColor } = pickSecondaryAndAccentColors(bp);
+  const hasMetallicOutline =
+    bp.borderLayer.kind === 'full_metallic_outline' ||
+    bp.borderLayer.kind === 'cuticle_cuff' ||
+    bp.borderLayer.isMetallic;
+
+  const has3DRelief =
+    bp.borderLayer.is3DRaised ||
+    bp.artElements.some((el) => el.type !== 'organic_motif' || el.reliefHeight > 0.35);
+
+  const metallicIntensity =
+    bp.baseLayer.finishStyle === 'chrome_mirror'
+      ? 0.92
+      : hasMetallicOutline ||
+          bp.artElements.some(
+            (e) =>
+              (e.type === 'ribbon_stroke' && e.isMetallic) ||
+              (e.type === 'micro_gem' && e.kind === 'gold_bead')
+          )
+        ? 0.88
+        : bp.baseLayer.metallicBase;
+
+  return {
+    fingerId,
+    detectedFromPhoto,
+    shape: bp.geometry.shape,
+    relativeLength: ext.relativeLength,
+    lengthMultiplier: ext.relativeLength,
+    freeEdgeRatio: ext.freeEdgeRatio,
+    extensionLevel: ext.extensionLevel,
+    extensionMm: ext.extensionMm,
+    tipRoundness: bp.geometry.tipRoundness,
+    aspectRatio: bp.geometry.aspectRatio,
+    relativeWidth: cfg.defaultWidth,
+    baseColor: bp.baseLayer.baseColorHex,
+    secondaryColor,
+    accentColor,
+    hasMetallicOutline,
+    outlineColor: hasMetallicOutline ? bp.borderLayer.colorHex : undefined,
+    has3DRelief,
+    finishStyle: bp.baseLayer.finishStyle,
+    pattern,
+    strokeAnchors:
+      extractAnchorsFromBlueprint(bp).length > 0
+        ? extractAnchorsFromBlueprint(bp)
+        : defaultAnchorsForPattern(pattern),
+    metallicIntensity,
+    glossIntensity: bp.baseLayer.glossiness,
+    blueprint: bp,
+    isImportedReference: true,
+  };
+}
+
+/**
+ * Synthesizes a clean 100% vector + parametric `NailDesignBlueprint` from any legacy
+ * or studio `NailFingerDesignSpec` that does not yet carry a `blueprint` object.
+ */
+export function buildBlueprintFromLegacySpec(
+  spec: NailFingerDesignSpec
+): NailDesignBlueprint {
+  const shape = normalizeShape(spec.shape, 'almond');
+  const rawFreeEdge =
+    spec.freeEdgeRatio !== undefined
+      ? spec.freeEdgeRatio
+      : normalizeRelativeLengthV10(spec.lengthMultiplier ?? spec.relativeLength ?? 1.45) - 1;
+  const freeEdgeRatio = Number(clamp(rawFreeEdge, 0.12, 1.15).toFixed(2));
+  const tipRoundness = Number(
+    clamp01(spec.tipRoundness ?? (shape === 'square' ? 0.25 : shape === 'stiletto' ? 0.82 : 0.55)).toFixed(2)
+  );
+  const aspectRatio = Number(
+    clamp(spec.aspectRatio ?? 1.15 + freeEdgeRatio * 1.15, 0.85, 3.2).toFixed(2)
+  );
+
+  const profileHalfWidths = [...(SHAPE_DEFAULT_PROFILES[shape] ?? SHAPE_DEFAULT_PROFILES.almond)] as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+
+  const baseColorHex = sanitizeHexColor(spec.baseColor, '#E5BEB3');
+  const secondaryHex = sanitizeHexColor(spec.secondaryColor, '#FFFDF9');
+  const accentHex = sanitizeHexColor(spec.accentColor, '#D4AF37');
+
+  let finishStyle: NailFinishV10 = spec.finishStyle ?? 'glossy_gel';
+  if (!spec.finishStyle) {
+    if (spec.pattern === 'chrome_mirror') finishStyle = 'chrome_mirror';
+    else if (spec.glossIntensity < 0.65) finishStyle = 'velvet_matte';
+  }
+
+  let gradientMode: NailGradientMode = 'solid';
+  if (finishStyle === 'chrome_mirror' || finishStyle === 'pearl_glazed') {
+    gradientMode = 'pearl_chrome';
+  } else if (finishStyle === 'cat_eye') {
+    gradientMode = 'cat_eye_band';
+  } else if (spec.pattern === 'aura_gradient') {
+    gradientMode =
+      spec.secondaryColor &&
+      spec.secondaryColor.toUpperCase() !== spec.baseColor.toUpperCase() &&
+      spec.finishStyle === 'jelly_translucent'
+        ? 'vertical_ombre'
+        : 'radial_aura';
+  }
+
+  const baseLayer: NailBaseLayer = {
+    baseColorHex,
+    gradientMode,
+    cuticleColorHex: shadeHex(baseColorHex, -8),
+    midColorHex: gradientMode === 'radial_aura' ? secondaryHex : baseColorHex,
+    tipColorHex: gradientMode === 'vertical_ombre' ? secondaryHex : shadeHex(baseColorHex, 6),
+    finishStyle,
+    translucency: finishStyle === 'jelly_translucent' ? 0.5 : 0.06,
+    metallicBase: finishStyle === 'chrome_mirror' ? 0.92 : spec.metallicIntensity * 0.25,
+    glossiness: finishStyle === 'velvet_matte' ? 0.42 : 0.96,
   };
 
-  // Compute tight source bounding box covering 94% of the segmented plate (u,v in [0.03..0.97], [0.04..0.96])
-  let minSrcX = imgW;
-  let maxSrcX = 0;
-  let minSrcY = imgH;
-  let maxSrcY = 0;
-  const yStart = minY + nailLen * 0.04;
-  const yEnd = maxY - nailLen * 0.04;
-  for (let k = 0; k <= 6; k++) {
-    const ry = yStart + ((yEnd - yStart) * k) / 6;
-    const yi = Math.max(minY, Math.min(maxY, Math.round(ry)));
-    const l = smoothL[yi];
-    const r = smoothR[yi];
-    const span = r - l;
-    for (const rx of [l + span * 0.03, (l + r) * 0.5, r - span * 0.03]) {
-      const [sx, sy] = roiToImg(rx, ry);
-      if (sx < minSrcX) minSrcX = sx;
-      if (sx > maxSrcX) maxSrcX = sx;
-      if (sy < minSrcY) minSrcY = sy;
-      if (sy > maxSrcY) maxSrcY = sy;
-    }
+  let borderKind: NailBorderKind = 'none';
+  let borderColor = accentHex;
+  let isBorderMetallic = false;
+  let thicknessNorm = 0.05;
+  let smileCurveDepth = 0.14;
+
+  if (spec.hasMetallicOutline) {
+    borderKind = 'full_metallic_outline';
+    borderColor = sanitizeHexColor(spec.outlineColor, accentHex);
+    isBorderMetallic = true;
+    thicknessNorm = 0.055;
+    smileCurveDepth = 0.08;
+  } else if (spec.pattern === 'french_tip') {
+    borderKind = 'classic_french';
+    borderColor = secondaryHex;
+    isBorderMetallic = spec.metallicIntensity > 0.55;
+    thicknessNorm = 0.18;
+    smileCurveDepth = 0.16;
   }
 
-  const pad = 12;
-  const bx = Math.max(0, Math.floor(minSrcX - pad));
-  const by = Math.max(0, Math.floor(minSrcY - pad));
-  const bx2 = Math.min(imgW, Math.ceil(maxSrcX + pad));
-  const by2 = Math.min(imgH, Math.ceil(maxSrcY + pad));
-  const bw = Math.max(8, bx2 - bx);
-  const bh = Math.max(8, by2 - by);
+  const borderLayer: NailBorderLayer = {
+    kind: borderKind,
+    colorHex: borderColor,
+    thicknessNorm,
+    isMetallic: isBorderMetallic,
+    is3DRaised: Boolean(spec.hasMetallicOutline || spec.has3DRelief),
+    smileCurveDepth,
+  };
 
-  const { ctx: cropCtx } = createScratchCanvas(bw, bh);
-  cropCtx.drawImage(img, bx, by, bw, bh, 0, 0, bw, bh);
-  const srcData = cropCtx.getImageData(0, 0, bw, bh).data;
+  const artElements: VectorArtElement[] = [];
+  const anchors =
+    spec.strokeAnchors && spec.strokeAnchors.length > 0
+      ? spec.strokeAnchors
+      : defaultAnchorsForPattern(spec.pattern);
 
-  const size = 512;
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = size;
-  outCanvas.height = size;
-  const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
-  if (!outCtx) return undefined;
+  if (spec.pattern === 'gold_3d_waves') {
+    const a0 = anchors[0] ?? { u: 0.34, v: 0.34, radius: 0.16, angle: 0.35 };
+    const a1 = anchors[1] ?? { u: 0.64, v: 0.58, radius: 0.18, angle: -0.3 };
+    const a2 = anchors[2] ?? { u: 0.46, v: 0.78, radius: 0.14, angle: 0.2 };
 
-  const outImg = outCtx.createImageData(size, size);
-  const patchRGB = new Float32Array(size * size * 3);
-  const isSpecGlare = new Uint8Array(size * size);
-
-  // 1. Bilinear sampling over 94% of segmented plate: uPlate ∈ [0.03, 0.97], vPlate ∈ [0.04, 0.96]
-  for (let py = 0; py < size; py++) {
-    // py = 0 is canvas top (v = 1 tip), py = size-1 is canvas bottom (v = 0 cuticle)
-    const v = 1 - py / (size - 1);
-    const vPlate = 0.04 + v * 0.92;
-    const ry = maxY - vPlate * nailLen;
-    const y0 = Math.max(minY, Math.min(maxY, Math.floor(ry)));
-    const y1 = Math.max(minY, Math.min(maxY, y0 + 1));
-    const fy = Math.max(0, Math.min(1, ry - y0));
-
-    const l0 = smoothL[y0];
-    const r0 = smoothR[y0];
-    const l1 = smoothL[y1];
-    const r1 = smoothR[y1];
-    const lx = l0 + (l1 - l0) * fy;
-    const rx = r0 + (r1 - r0) * fy;
-    const span = Math.max(4, rx - lx);
-
-    for (let px = 0; px < size; px++) {
-      const u = px / (size - 1);
-      const uPlate = 0.03 + u * 0.94;
-      const rxf = lx + uPlate * span;
-      const [sxAbs, syAbs] = roiToImg(rxf, ry);
-
-      const sx = Math.max(0, Math.min(bw - 1.001, sxAbs - bx));
-      const sy = Math.max(0, Math.min(bh - 1.001, syAbs - by));
-      const ix = Math.floor(sx);
-      const iy = Math.floor(sy);
-      const tx = sx - ix;
-      const ty = sy - iy;
-
-      const idx00 = (iy * bw + ix) * 4;
-      const idx10 = (iy * bw + Math.min(bw - 1, ix + 1)) * 4;
-      const idx01 = (Math.min(bh - 1, iy + 1) * bw + ix) * 4;
-      const idx11 = (Math.min(bh - 1, iy + 1) * bw + Math.min(bw - 1, ix + 1)) * 4;
-
-      const w00 = (1 - tx) * (1 - ty);
-      const w10 = tx * (1 - ty);
-      const w01 = (1 - tx) * ty;
-      const w11 = tx * ty;
-
-      const r =
-        srcData[idx00] * w00 +
-        srcData[idx10] * w10 +
-        srcData[idx01] * w01 +
-        srcData[idx11] * w11;
-      const g =
-        srcData[idx00 + 1] * w00 +
-        srcData[idx10 + 1] * w10 +
-        srcData[idx01 + 1] * w01 +
-        srcData[idx11 + 1] * w11;
-      const b =
-        srcData[idx00 + 2] * w00 +
-        srcData[idx10 + 2] * w10 +
-        srcData[idx01 + 2] * w01 +
-        srcData[idx11 + 2] * w11;
-
-      const pIdx = py * size + px;
-      patchRGB[pIdx * 3] = r;
-      patchRGB[pIdx * 3 + 1] = g;
-      patchRGB[pIdx * 3 + 2] = b;
-
-      const maxC = Math.max(r, g, b);
-      const minC = Math.min(r, g, b);
-      const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
-      const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-
-      // Mark ONLY blown-out specular glare highlights (luma > 0.92 && saturation < 0.12)
-      if (luma > 0.92 && sat < 0.12) {
-        isSpecGlare[pIdx] = 1;
-      }
+    artElements.push({
+      type: 'ribbon_stroke',
+      points: [
+        { u: 0.14, v: clamp01(a0.v * 0.85), width: 0.042 },
+        { u: clamp01(a0.u + 0.12), v: clamp01(a0.v + 0.08), width: 0.052 },
+        { u: clamp01(a1.u - 0.10), v: clamp01(a1.v - 0.06), width: 0.046 },
+        { u: 0.86, v: clamp01(a1.v * 0.92), width: 0.036 },
+      ],
+      colorHex: accentHex,
+      highlightHex: mixHex(accentHex, '#FFF8DF', 0.58),
+      isMetallic: true,
+      reliefHeight: 0.85,
+    });
+    artElements.push({
+      type: 'ribbon_stroke',
+      points: [
+        { u: 0.82, v: clamp01(a2.v * 0.88), width: 0.034 },
+        { u: clamp01(a2.u + 0.14), v: clamp01(a2.v - 0.04), width: 0.042 },
+        { u: clamp01(a0.u), v: clamp01(a0.v + 0.12), width: 0.036 },
+        { u: 0.20, v: 0.82, width: 0.028 },
+      ],
+      colorHex: accentHex,
+      highlightHex: mixHex(accentHex, '#FFF8DF', 0.58),
+      isMetallic: true,
+      reliefHeight: 0.75,
+    });
+    for (const a of anchors.slice(0, 3)) {
+      artElements.push({
+        type: 'micro_gem',
+        u: clamp01(a.u),
+        v: clamp01(a.v),
+        radius: 0.032,
+        colorHex: accentHex,
+        kind: 'gold_bead',
+      });
     }
-  }
-
-  // 2. Surgical specular-glare inpainting: replace blown highlight pixels with weighted average
-  //    of non-specular neighbor pixels within local radius 6..8px (100% preserving real deep colors!)
-  const outBytes = outImg.data;
-  const searchRadius = 7;
-
-  for (let py = 0; py < size; py++) {
-    for (let px = 0; px < size; px++) {
-      const pIdx = py * size + px;
-      const p4 = pIdx * 4;
-
-      let rr = patchRGB[pIdx * 3];
-      let gg = patchRGB[pIdx * 3 + 1];
-      let bb = patchRGB[pIdx * 3 + 2];
-
-      if (isSpecGlare[pIdx]) {
-        let sumW = 0;
-        let sumR = 0;
-        let sumG = 0;
-        let sumB = 0;
-
-        for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-          const ny = py + dy;
-          if (ny < 0 || ny >= size) continue;
-          for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-            const nx = px + dx;
-            if (nx < 0 || nx >= size) continue;
-            const d2 = dx * dx + dy * dy;
-            if (d2 === 0 || d2 > searchRadius * searchRadius) continue;
-
-            const nIdx = ny * size + nx;
-            if (isSpecGlare[nIdx]) continue;
-
-            const w = 1 / (1 + d2 * 0.35);
-            sumW += w;
-            sumR += patchRGB[nIdx * 3] * w;
-            sumG += patchRGB[nIdx * 3 + 1] * w;
-            sumB += patchRGB[nIdx * 3 + 2] * w;
-          }
+  } else if (spec.pattern === 'floral_accent') {
+    for (const a of anchors.slice(0, 2)) {
+      const petalR = clamp(a.radius * 0.65, 0.06, 0.13);
+      for (let p = 0; p < 5; p++) {
+        const theta = a.angle + (p * Math.PI * 2) / 5;
+        const pcU = a.u + Math.cos(theta) * petalR * 0.72;
+        const pcV = a.v + Math.sin(theta) * petalR * 0.72;
+        const contour: OrganicMotifPoint[] = [];
+        for (let k = 0; k < 16; k++) {
+          const phi = (k / 16) * Math.PI * 2;
+          const lx = Math.cos(phi) * petalR * 0.52;
+          const ly = Math.sin(phi) * petalR * 0.34;
+          const rotU = lx * Math.cos(theta) - ly * Math.sin(theta);
+          const rotV = lx * Math.sin(theta) + ly * Math.cos(theta);
+          contour.push({
+            u: Number(clamp01(pcU + rotU).toFixed(3)),
+            v: Number(clamp01(pcV + rotV).toFixed(3)),
+          });
         }
-
-        if (sumW > 0) {
-          const blend = 0.88;
-          rr = rr * (1 - blend) + (sumR / sumW) * blend;
-          gg = gg * (1 - blend) + (sumG / sumW) * blend;
-          bb = bb * (1 - blend) + (sumB / sumW) * blend;
-        }
+        artElements.push({
+          type: 'organic_motif',
+          contour,
+          fillColorHex: secondaryHex,
+          shadeColorHex: shadeHex(secondaryHex, -28),
+          isMetallic: false,
+          reliefHeight: 0.62,
+        });
       }
-
-      outBytes[p4] = Math.max(0, Math.min(255, Math.round(rr)));
-      outBytes[p4 + 1] = Math.max(0, Math.min(255, Math.round(gg)));
-      outBytes[p4 + 2] = Math.max(0, Math.min(255, Math.round(bb)));
-      outBytes[p4 + 3] = 255;
+      artElements.push({
+        type: 'micro_gem',
+        u: clamp01(a.u),
+        v: clamp01(a.v),
+        radius: 0.03,
+        colorHex: accentHex,
+        kind: 'gold_bead',
+      });
     }
   }
 
-  outCtx.putImageData(outImg, 0, 0);
-  try {
-    const webp = outCanvas.toDataURL('image/webp', 0.92);
-    if (webp.startsWith('data:image/webp')) return webp;
-  } catch {
-    // Fallback to PNG below
-  }
-  return outCanvas.toDataURL('image/png');
+  return {
+    version: 10,
+    geometry: {
+      profileHalfWidths,
+      aspectRatio,
+      freeEdgeRatio,
+      tipRoundness,
+      shape,
+    },
+    baseLayer,
+    borderLayer,
+    artElements,
+  };
 }
+
+// -----------------------------------------------------------------------------
+// Stage 1 + Stage 2 Per-Finger Orchestration (< 20ms/finger, < 300ms total)
+// -----------------------------------------------------------------------------
 
 interface FingerRoiAnalysisOutput {
   spec: NailFingerDesignSpec;
   qualityScore: number;
 }
 
-/**
- * High-Resolution (320×480) ROI Segmentation & Analysis for a single finger:
- * - Extracts upright 320×480 ROI directly from the full-res original photo (DIP -> past TIP)
- * - Combines CIELab distance vs PIP->DIP phalanx skin + HSV saturation/luma + Sobel edge magnitude
- *   + anatomical elliptical prior + rejection of wide gold rings outside the distal DIP->TIP plate
- * - Rectifies 512×512 UV texture covering 94% of the plate with surgical glare-only inpainting
- * - Computes qualityScore (sharpness + nail-vs-skin contrast + absence of ring occlusion) for 2-hand selection
- */
 function analyzeSingleNailROI(
   img: HTMLImageElement,
   fingerId: FingerId,
@@ -600,880 +2500,66 @@ function analyzeSingleNailROI(
   const imgH = img.naturalHeight;
   const cfg = FINGER_LANDMARKS[fingerId];
 
-  const defaultMult = Number(Math.max(0.85, Math.min(1.65, cfg.defaultLength)).toFixed(2));
-  const defaultSpec: NailFingerDesignSpec = {
+  const defaultBlueprint = buildBlueprintFromLegacySpec({
     fingerId,
     detectedFromPhoto,
     shape: 'almond',
-    relativeLength: defaultMult,
-    lengthMultiplier: defaultMult,
-    extensionLevel: classifyExtensionFromMultiplier(defaultMult),
-    extensionMm: computeExtensionMmFromMultiplier(defaultMult),
-    tipRoundness: 0.55,
-    aspectRatio: Number((1.15 * defaultMult).toFixed(2)),
+    relativeLength: 1.45,
     relativeWidth: cfg.defaultWidth,
     baseColor: '#E5BEB3',
     secondaryColor: '#FFF7F3',
     accentColor: '#D4AF37',
-    hasMetallicOutline: false,
-    outlineColor: undefined,
-    has3DRelief: false,
     pattern: 'solid_gloss',
     strokeAnchors: [],
     metallicIntensity: 0.12,
-    glossIntensity: 0.92,
-    isImportedReference: true,
-  };
+    glossIntensity: 0.94,
+  });
+  const defaultSpec = buildSpecFromBlueprint(fingerId, defaultBlueprint, detectedFromPhoto);
 
   try {
-    // 1. Sample phalanx skin color strictly along PIP -> DIP (away from any distal plate/ring edge)
-    const { ctx: skinCtx } = createScratchCanvas(28, 28);
-    const sx = (pipNorm.x * 0.55 + dipNorm.x * 0.45) * imgW;
-    const sy = (pipNorm.y * 0.55 + dipNorm.y * 0.45) * imgH;
     const dx = (tipNorm.x - dipNorm.x) * imgW;
     const dy = (tipNorm.y - dipNorm.y) * imgH;
-    const segPx = Math.max(24, Math.hypot(dx, dy));
-    const patch = Math.max(10, Math.round(segPx * 0.24));
+    const segPx = Math.max(18, Math.hypot(dx, dy));
 
-    skinCtx.drawImage(
-      img,
-      Math.max(0, Math.min(imgW - patch, sx - patch / 2)),
-      Math.max(0, Math.min(imgH - patch, sy - patch / 2)),
-      patch,
-      patch,
-      0,
-      0,
-      28,
-      28
-    );
-    const skinPixels = skinCtx.getImageData(0, 0, 28, 28).data;
-    const skinRgbSamples: Array<[number, number, number]> = [];
-    for (let i = 0; i < skinPixels.length; i += 4) {
-      const r = skinPixels[i];
-      const g = skinPixels[i + 1];
-      const b = skinPixels[i + 2];
-      const [, sat] = rgbToHsv(r, g, b);
-      const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-      // Exclude bright metallic jewelry reflections when estimating phalanx skin reference
-      if (!(r > g * 1.06 && g > b * 1.18 && luma > 0.52 && sat > 0.28)) {
-        skinRgbSamples.push([r, g, b]);
-      }
-    }
-    const skinHex = medianRgbColor(skinRgbSamples, '#D8B29D');
-    const skinLab = hexToLab(skinHex);
+    const skin = computeSkinModel(img, pipNorm, dipNorm, segPx);
 
-    // 2. Render high-resolution upright 320×480 ROI centered around nail plate (DIP -> past TIP)
-    const roiW = 320;
-    const roiH = 480;
-    const { ctx: roiCtx } = createScratchCanvas(roiW, roiH);
+    // 128 × 192 aligned ROI (only 24,576 pixels!)
+    const { ctx: roiCtx } = createScratchCanvas(ROI_WIDTH, ROI_HEIGHT);
     const angleRad = Math.atan2(dy, dx) + Math.PI / 2;
-    const anchorX = (dipNorm.x + 0.72 * (tipNorm.x - dipNorm.x)) * imgW;
-    const anchorY = (dipNorm.y + 0.72 * (tipNorm.y - dipNorm.y)) * imgH;
+    const anchorX = (dipNorm.x + 0.70 * (tipNorm.x - dipNorm.x)) * imgW;
+    const anchorY = (dipNorm.y + 0.70 * (tipNorm.y - dipNorm.y)) * imgH;
     const roiSpanH = segPx * 1.98;
-    const scale = roiH / roiSpanH;
+    const scale = ROI_HEIGHT / roiSpanH;
 
     roiCtx.save();
     roiCtx.imageSmoothingEnabled = true;
-    roiCtx.imageSmoothingQuality = 'high';
-    roiCtx.translate(roiW / 2, roiH / 2);
+    roiCtx.imageSmoothingQuality = 'medium';
+    roiCtx.translate(ROI_WIDTH / 2, ROI_HEIGHT / 2);
     roiCtx.scale(scale, scale);
     roiCtx.rotate(-angleRad);
     roiCtx.drawImage(img, -anchorX, -anchorY);
     roiCtx.restore();
 
-    const { data } = roiCtx.getImageData(0, 0, roiW, roiH);
-
-    // Background CIELab from distal upper corners
-    const cornerOffsets = [
-      (roiW * 4 + 4) * 4,
-      (roiW * 4 + roiW - 5) * 4,
-      (roiW * 8 + 8) * 4,
-      (roiW * 8 + roiW - 9) * 4,
-    ];
-    let br = 0;
-    let bg = 0;
-    let bb = 0;
-    for (const off of cornerOffsets) {
-      br += data[off];
-      bg += data[off + 1];
-      bb += data[off + 2];
-    }
-    const bgLab = rgbToLabLike(br / 4, bg / 4, bb / 4);
-
-    // Precompute luma + Sobel edge magnitude across 320×480 ROI
-    const lumaMap = new Float32Array(roiW * roiH);
-    const sobelMap = new Float32Array(roiW * roiH);
-    for (let i = 0; i < roiW * roiH; i++) {
-      const p4 = i * 4;
-      lumaMap[i] = (0.299 * data[p4] + 0.587 * data[p4 + 1] + 0.114 * data[p4 + 2]) / 255;
-    }
-    for (let y = 1; y < roiH - 1; y++) {
-      for (let x = 1; x < roiW - 1; x++) {
-        const tl = lumaMap[(y - 1) * roiW + (x - 1)];
-        const tc = lumaMap[(y - 1) * roiW + x];
-        const tr = lumaMap[(y - 1) * roiW + (x + 1)];
-        const ml = lumaMap[y * roiW + (x - 1)];
-        const mr = lumaMap[y * roiW + (x + 1)];
-        const bl = lumaMap[(y + 1) * roiW + (x - 1)];
-        const bc = lumaMap[(y + 1) * roiW + x];
-        const brp = lumaMap[(y + 1) * roiW + (x + 1)];
-        const gx = tr + 2 * mr + brp - (tl + 2 * ml + bl);
-        const gy = bl + 2 * bc + brp - (tl + 2 * tc + tr);
-        sobelMap[y * roiW + x] = Math.hypot(gx, gy) * 0.25;
-      }
-    }
-
-    // 3. Combined high-precision segmentation:
-    //    CIELab distance vs phalanx skin + HSV saturation/luma + Sobel edges
-    //    + anatomical elliptical prior + rejection of wide gold rings outside distal plate
-    const rowLeft = new Int16Array(roiH).fill(-1);
-    const rowRight = new Int16Array(roiH).fill(-1);
-    const rowWidths = new Float32Array(roiH);
-    let minY = roiH;
-    let maxY = 0;
-    let maxWidth = 0;
-    let activeRows = 0;
-    let ringBandRows = 0;
-
-    // Anatomical plate prior ellipse center (slightly distal from ROI center)
-    const priorCx = roiW * 0.5;
-    const priorCy = roiH * 0.47;
-    const priorRx = roiW * 0.27;
-    const priorRy = roiH * 0.39;
-
-    const isWideGoldBand = (x: number, y: number): boolean => {
-      // Gold rings on proximal/middle phalanx appear near bottom of ROI or outside lateral plate width
-      const inDistalCore = y >= roiH * 0.14 && y <= roiH * 0.78 && Math.abs(x - priorCx) <= roiW * 0.23;
-      if (inDistalCore) return false;
-      const idx = (y * roiW + x) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-      const [, sat, val] = rgbToHsv(r, g, b);
-      return r > g * 1.07 && g > b * 1.18 && val > 0.45 && sat > 0.26;
-    };
-
-    const isNailPixel = (x: number, y: number): boolean => {
-      const idx = (y * roiW + x) * 4;
-      const r = data[idx];
-      const g = data[idx + 1];
-      const b = data[idx + 2];
-
-      if (isWideGoldBand(x, y)) return false;
-
-      const pLab = rgbToLabLike(r, g, b);
-      const dSkin = deltaLab(pLab, skinLab);
-      const dBg = deltaLab(pLab, bgLab);
-      const [, sat, val] = rgbToHsv(r, g, b);
-      const edge = sobelMap[y * roiW + x];
-
-      // Anatomical elliptical prior boosts confidence inside expected nail bed and penalizes far flanks
-      const ellipDist = Math.hypot((x - priorCx) / priorRx, (y - priorCy) / priorRy);
-      const priorBonus = ellipDist <= 1.05 ? 1.8 : Math.max(-4.5, (1.05 - ellipDist) * 7.5);
-
-      const isDeepDarkPolish = val < 0.26 && dBg > 5.0 && ellipDist < 1.15;
-      const isVividOrLightPolish = (sat > 0.20 || val > 0.84) && dSkin > 7.5;
-      const chromaPass = dSkin + priorBonus > 10.5 || isDeepDarkPolish || isVividOrLightPolish;
-      const edgePass = edge > 0.14 && ellipDist < 1.08 && dSkin > 5.5;
-
-      return (chromaPass || edgePass) && (dBg > 6.5 || isDeepDarkPolish);
-    };
-
-    const yScanStart = Math.round(roiH * 0.05);
-    const yScanEnd = Math.round(roiH * 0.89);
-
-    for (let y = yScanStart; y < yScanEnd; y++) {
-      const cx = Math.floor(roiW / 2);
-      let left = cx;
-      let right = cx;
-      let found = false;
-
-      for (let off = 0; off <= Math.round(roiW * 0.14); off++) {
-        if (cx + off < roiW - 8 && isNailPixel(cx + off, y)) {
-          left = cx + off;
-          right = left;
-          found = true;
-          break;
-        }
-        if (cx - off >= 8 && isNailPixel(cx - off, y)) {
-          left = cx - off;
-          right = left;
-          found = true;
-          break;
-        }
-      }
-      if (!found) continue;
-
-      let missL = 0;
-      while (left > 6 && missL < 4) {
-        if (isNailPixel(left - 1, y)) {
-          left--;
-          missL = 0;
-        } else {
-          missL++;
-          left--;
-        }
-      }
-      left += missL;
-
-      let missR = 0;
-      while (right < roiW - 7 && missR < 4) {
-        if (isNailPixel(right + 1, y)) {
-          right++;
-          missR = 0;
-        } else {
-          missR++;
-          right++;
-        }
-      }
-      right -= missR;
-
-      const w = right - left + 1;
-      // Reject excessively wide proximal rows caused by wide rings or overlapping fingers
-      if (y > roiH * 0.72 && w > roiW * 0.56) {
-        ringBandRows++;
-        continue;
-      }
-
-      if (w >= 18 && w <= roiW * 0.68) {
-        rowLeft[y] = left;
-        rowRight[y] = right;
-        rowWidths[y] = w;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-        if (w > maxWidth) maxWidth = w;
-        activeRows++;
-      }
-    }
-
-    if (activeRows < 24 || maxWidth < 24) {
-      minY = Math.round(roiH * 0.18);
-      maxY = Math.round(roiH * 0.80);
-      maxWidth = Math.round(roiW * 0.36);
-      for (let y = minY; y <= maxY; y++) {
-        rowLeft[y] = Math.round(roiW * 0.32);
-        rowRight[y] = Math.round(roiW * 0.68);
-        rowWidths[y] = rowRight[y] - rowLeft[y] + 1;
-      }
-    }
-
-    const nailLength = Math.max(32, maxY - minY);
-
-    const sampleBandWidth = (fracFromCuticle: number): number => {
-      const targetY = Math.round(maxY - nailLength * fracFromCuticle);
-      let acc = 0;
-      let cnt = 0;
-      for (let dyb = -6; dyb <= 6; dyb++) {
-        const yy = Math.max(0, Math.min(roiH - 1, targetY + dyb));
-        if (rowWidths[yy] > 0) {
-          acc += rowWidths[yy];
-          cnt++;
-        }
-      }
-      return cnt > 0 ? acc / cnt : maxWidth;
-    };
-
-    const baseWidth = Math.max(20, sampleBandWidth(0.34), maxWidth * 0.88);
-    const aspectRatio = Number((nailLength / baseWidth).toFixed(2));
-
-    const widthAt76 = sampleBandWidth(0.76);
-    const widthAt86 = sampleBandWidth(0.86);
-    const widthAt95 = sampleBandWidth(0.95);
-
-    const tipTapering = Math.max(0.06, Math.min(1.15, widthAt86 / baseWidth));
-    const tipFlatness = Math.max(0, Math.min(1, widthAt95 / Math.max(8, widthAt86)));
-    const midToTipSlope = Math.max(0, Math.min(1, (widthAt76 - widthAt95) / baseWidth));
-    const apexCurvature = Math.max(
-      0,
-      Math.min(1, (1 - tipFlatness) * 0.65 + midToTipSlope * 0.35)
-    );
-    const tipRoundness = Number(
-      Math.max(0, Math.min(1, (1 - tipFlatness) * 0.72 + (1 - tipTapering) * 0.28)).toFixed(2)
-    );
-
-    let shape: NailShape = 'almond';
-    if (aspectRatio < 1.28) {
-      shape = tipTapering >= 0.84 && apexCurvature < 0.30 ? 'square' : 'natural';
-    } else if (
-      tipTapering < 0.34 ||
-      (aspectRatio >= 1.72 && tipTapering < 0.44 && apexCurvature >= 0.46)
-    ) {
-      shape = 'stiletto';
-    } else if (tipTapering >= 0.80 && apexCurvature < 0.34) {
-      shape = 'square';
-    } else if (tipTapering >= 0.46 && tipTapering < 0.80 && apexCurvature < 0.42) {
-      shape = 'coffin';
-    } else if (tipTapering >= 0.66 && apexCurvature >= 0.36 && aspectRatio < 1.65) {
-      shape = 'oval';
-    } else {
-      shape = 'almond';
-    }
-
-    const { extensionLevel, extensionMm, lengthMultiplier } =
-      classifyExtensionFromAspectRatio(aspectRatio);
-    const relativeLength = lengthMultiplier;
-    const relativeWidth = Number(
-      Math.max(0.78, Math.min(1.30, cfg.defaultWidth * (baseWidth / (roiW * 0.36)))).toFixed(2)
-    );
-
-    // 4. 3-Zone Analysis inside segmented 320×480 plate:
-    //    Zone 1: Central Core (u ∈ [0.16, 0.84], v ∈ [0.14, 0.82]) — dominant polish base (deep colors preserved!)
-    //    Zone 2: Outer 5% Perimeter Ring — metallic/contrasting outline & french tip detection
-    //    Zone 3: Central Elements (Blobs & Strokes) — connected-component PCA eccentricity for floral vs 3D waves
-    const centralZoneSamples: Array<[number, number, number]> = [];
-    const tipSamples: Array<[number, number, number]> = [];
-    const centerAuraSamples: Array<[number, number, number]> = [];
-    const outerAuraSamples: Array<[number, number, number]> = [];
-    const perimeterSamples: Array<[number, number, number]> = [];
-    const lateralPerimeterSamples: Array<[number, number, number]> = [];
-    const perimeterMetallicSamples: Array<[number, number, number]> = [];
-    const accentSamples: Array<[number, number, number]> = [];
-    const metallicPoints: Array<{ u: number; v: number; r: number; g: number; b: number; grad: number }> = [];
-
-    let totalPlatePixels = 0;
-    let perimeterTotalPixels = 0;
-    let lumaSum = 0;
-    let lumaSqSum = 0;
-    let sharpnessAcc = 0;
-    let contrastAcc = 0;
-    let ridgeCount = 0;
-    let ringOcclusionPixels = 0;
-
-    // Sample on a 2px stride for fast, crisp 160×240 statistical analysis (~10x sharper than old 80×120)
-    const stride = 2;
-    for (let y = minY; y <= maxY; y += stride) {
-      const lx = rowLeft[y];
-      const rx = rowRight[y];
-      if (lx < 0 || rx <= lx) continue;
-
-      const v = (maxY - y) / nailLength;
-      const span = rx - lx;
-      if (span < 10) continue;
-
-      for (let x = lx; x <= rx; x += stride) {
-        const p = (y * roiW + x) * 4;
-        const r = data[p];
-        const g = data[p + 1];
-        const b = data[p + 2];
-        const u = (x - lx) / Math.max(1, span);
-
-        const [, sat, val] = rgbToHsv(r, g, b);
-        const lum = lumaMap[y * roiW + x];
-        const grad = sobelMap[y * roiW + x];
-
-        const isPerimeterRing =
-          (u <= 0.08 || u >= 0.92 || v <= 0.06 || v >= 0.94) &&
-          u >= 0.015 &&
-          u <= 0.985;
-
-        if (isPerimeterRing) {
-          const pLab = rgbToLabLike(r, g, b);
-          if (deltaLab(pLab, bgLab) > 8.0 && deltaLab(pLab, skinLab) > 7.5) {
-            perimeterTotalPixels++;
-            perimeterSamples.push([r, g, b]);
-            if (u <= 0.09 || u >= 0.91) {
-              lateralPerimeterSamples.push([r, g, b]);
-            }
-            if (isGoldOrMetallicPixel(r, g, b, grad)) {
-              perimeterMetallicSamples.push([r, g, b]);
-            }
-          }
-          continue;
-        }
-
-        if (u < 0.09 || u > 0.91) continue;
-
-        totalPlatePixels++;
-        lumaSum += lum;
-        lumaSqSum += lum * lum;
-        sharpnessAcc += grad;
-
-        const pLab = rgbToLabLike(r, g, b);
-        contrastAcc += deltaLab(pLab, skinLab);
-
-        if (grad > 0.13) ridgeCount++;
-
-        // Track if a thick bright gold band sits across the nail bed (indicating ring occlusion)
-        if (v < 0.35 && r > g * 1.07 && g > b * 1.18 && val > 0.5 && sat > 0.28) {
-          ringOcclusionPixels++;
-        }
-
-        // Zone 1: Central Core u ∈ [0.16, 0.84], v ∈ [0.14, 0.82] excluding blown specular glare
-        const isPureSpecularGlare = lum > 0.92 && sat < 0.12 && grad < 0.20;
-        if (u >= 0.16 && u <= 0.84 && v >= 0.14 && v <= 0.82 && !isPureSpecularGlare) {
-          centralZoneSamples.push([r, g, b]);
-        }
-
-        if (v >= 0.72 && v <= 0.94 && u >= 0.2 && u <= 0.8 && !isPureSpecularGlare) {
-          tipSamples.push([r, g, b]);
-        }
-
-        const radialDist = Math.hypot((u - 0.5) * 1.4, (v - 0.5) * 1.2);
-        if (radialDist < 0.28 && !isPureSpecularGlare) {
-          centerAuraSamples.push([r, g, b]);
-        } else if (radialDist > 0.44 && !isPureSpecularGlare) {
-          outerAuraSamples.push([r, g, b]);
-        }
-
-        if (isGoldOrMetallicPixel(r, g, b, grad)) {
-          accentSamples.push([r, g, b]);
-          metallicPoints.push({ u, v, r, g, b, grad });
-        }
-      }
-    }
-
-    const baseColor = extractDominantColorCluster(centralZoneSamples, defaultSpec.baseColor);
-    const baseLab = hexToLab(baseColor);
-
-    const tipColor = medianRgbColor(tipSamples, baseColor);
-    const tipLab = hexToLab(tipColor);
-    const centerAuraColor = medianRgbColor(centerAuraSamples, baseColor);
-    const outerAuraColor = medianRgbColor(outerAuraSamples, baseColor);
-
-    // Zone 2: Evaluate perimeter border contrast / metallic rim
-    const perimeterContrastSamples = perimeterSamples.filter(
-      (rgb) => deltaLab(rgbToLabLike(rgb[0], rgb[1], rgb[2]), baseLab) > 13.5
-    );
-    const lateralContrastSamples = lateralPerimeterSamples.filter(
-      (rgb) => deltaLab(rgbToLabLike(rgb[0], rgb[1], rgb[2]), baseLab) > 13.5
-    );
-
-    const perimContrastRatio =
-      perimeterTotalPixels > 0 ? perimeterContrastSamples.length / perimeterTotalPixels : 0;
-    const perimMetallicRatio =
-      perimeterTotalPixels > 0 ? perimeterMetallicSamples.length / perimeterTotalPixels : 0;
-    const hasLateralRim =
-      lateralPerimeterSamples.length >= 10 &&
-      lateralContrastSamples.length / Math.max(1, lateralPerimeterSamples.length) > 0.22;
-
-    const perimeterCandidateColor =
-      perimeterMetallicSamples.length >= 8
-        ? medianRgbColor(perimeterMetallicSamples, baseColor)
-        : perimeterContrastSamples.length >= 8
-          ? medianRgbColor(perimeterContrastSamples, baseColor)
-          : medianRgbColor(perimeterSamples, baseColor);
-    const perimeterLab = hexToLab(perimeterCandidateColor);
-    const perimeterDelta = deltaLab(perimeterLab, baseLab);
-    const perimeterLumaDiff = Math.abs(perimeterLab[0] - baseLab[0]) / 100;
-
-    const baseTipDelta = deltaLab(baseLab, tipLab);
-    const radialDelta = deltaLab(hexToLab(centerAuraColor), hexToLab(outerAuraColor));
-
-    const hasMetallicOutline =
-      (perimMetallicRatio > 0.16 && (perimeterDelta > 11 || perimeterLumaDiff > 0.12)) ||
-      (hasLateralRim && perimContrastRatio > 0.24 && perimeterDelta > 14.5) ||
-      (baseTipDelta > 18 && perimMetallicRatio > 0.12);
-
-    const outlineColor = hasMetallicOutline ? perimeterCandidateColor : undefined;
-
-    // Zone 3: Connected-component analysis at half-res grid (160×240) for crisp floral / 3D wave detection
-    const gridW = Math.floor(roiW / stride);
-    const gridH = Math.floor(roiH / stride);
-    const contrastMask = new Uint8Array(gridW * gridH);
-    const maskPixels: Array<{ gx: number; gy: number; x: number; y: number }> = [];
-
-    for (let gy = 0; gy < gridH; gy++) {
-      const y = gy * stride;
-      if (y < minY || y > maxY) continue;
-      const lx = rowLeft[y];
-      const rx = rowRight[y];
-      if (lx < 0 || rx <= lx) continue;
-      const v = (maxY - y) / nailLength;
-      if (v < 0.08 || v > 0.90) continue;
-      const span = rx - lx;
-      const minX = Math.round(lx + span * 0.10);
-      const maxX = Math.round(rx - span * 0.10);
-
-      for (let gx = 0; gx < gridW; gx++) {
-        const x = gx * stride;
-        if (x < minX || x > maxX) continue;
-        const p = (y * roiW + x) * 4;
-        const r = data[p];
-        const g = data[p + 1];
-        const b = data[p + 2];
-        const [, sat] = rgbToHsv(r, g, b);
-        const lum = lumaMap[y * roiW + x];
-        const grad = sobelMap[y * roiW + x];
-
-        if (lum > 0.92 && sat < 0.11 && grad < 0.18) continue;
-
-        const pLab = rgbToLabLike(r, g, b);
-        const dBase = deltaLab(pLab, baseLab);
-        const isMetal = isGoldOrMetallicPixel(r, g, b, grad);
-        if (dBase > 15.0 || (isMetal && dBase > 10.0)) {
-          contrastMask[gy * gridW + gx] = 1;
-          maskPixels.push({ gx, gy, x, y });
-        }
-      }
-    }
-
-    const visited = new Uint8Array(gridW * gridH);
-    interface DetectedComponent {
-      count: number;
-      cu: number;
-      cv: number;
-      eccentricity: number;
-      angle: number;
-      radius: number;
-      isMetallic: boolean;
-      dominantColor: string;
-      centerDotColor: string | null;
-    }
-    const components: DetectedComponent[] = [];
-
-    for (const seed of maskPixels) {
-      const startIdx = seed.gy * gridW + seed.gx;
-      if (visited[startIdx] || !contrastMask[startIdx]) continue;
-
-      const queue: number[] = [startIdx];
-      visited[startIdx] = 1;
-      const pts: Array<{ u: number; v: number; r: number; g: number; b: number; isMetal: boolean }> = [];
-
-      let head = 0;
-      while (head < queue.length) {
-        const cur = queue[head++];
-        const gy = Math.floor(cur / gridW);
-        const gx = cur - gy * gridW;
-        const cy = gy * stride;
-        const cx = gx * stride;
-        const lx = rowLeft[cy];
-        const rx = rowRight[cy];
-        const span = Math.max(1, rx - lx);
-        const p = (cy * roiW + cx) * 4;
-        const r = data[p];
-        const g = data[p + 1];
-        const b = data[p + 2];
-        const grad = sobelMap[cy * roiW + cx];
-        pts.push({
-          u: (cx - lx) / span,
-          v: (maxY - cy) / nailLength,
-          r,
-          g,
-          b,
-          isMetal: isGoldOrMetallicPixel(r, g, b, grad),
-        });
-
-        for (let oy = -1; oy <= 1; oy++) {
-          for (let ox = -1; ox <= 1; ox++) {
-            if (ox === 0 && oy === 0) continue;
-            const ngx = gx + ox;
-            const ngy = gy + oy;
-            if (ngx < 0 || ngx >= gridW || ngy < 0 || ngy >= gridH) continue;
-            const nIdx = ngy * gridW + ngx;
-            if (!visited[nIdx] && contrastMask[nIdx]) {
-              visited[nIdx] = 1;
-              queue.push(nIdx);
-            }
-          }
-        }
-      }
-
-      if (pts.length < 10) continue;
-
-      let sumU = 0;
-      let sumV = 0;
-      let metalHits = 0;
-      const rgbs: Array<[number, number, number]> = [];
-      for (const pt of pts) {
-        sumU += pt.u;
-        sumV += pt.v;
-        if (pt.isMetal) metalHits++;
-        rgbs.push([pt.r, pt.g, pt.b]);
-      }
-      const cu = sumU / pts.length;
-      const cv = sumV / pts.length;
-
-      let cxx = 0;
-      let cyy = 0;
-      let cxy = 0;
-      for (const pt of pts) {
-        const du = pt.u - cu;
-        const dv = pt.v - cv;
-        cxx += du * du;
-        cyy += dv * dv;
-        cxy += du * dv;
-      }
-      cxx /= pts.length;
-      cyy /= pts.length;
-      cxy /= pts.length;
-
-      const trace = cxx + cyy;
-      const disc = Math.sqrt(Math.max(0, (cxx - cyy) * (cxx - cyy) + 4 * cxy * cxy));
-      const lambda1 = Math.max(1e-6, (trace + disc) * 0.5);
-      const lambda2 = Math.max(0, (trace - disc) * 0.5);
-      const eccentricity = Math.sqrt(Math.max(0, 1 - lambda2 / lambda1));
-      const angle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
-      const radius = Math.max(0.08, Math.min(0.26, Math.sqrt(lambda1) * 2.2));
-
-      const domHex = extractDominantColorCluster(rgbs, '#FFFFFF');
-      const domLab = hexToLab(domHex);
-      const innerDotRgbs: Array<[number, number, number]> = [];
-      for (const pt of pts) {
-        if (Math.hypot(pt.u - cu, pt.v - cv) < radius * 0.45) {
-          const dDom = deltaLab(rgbToLabLike(pt.r, pt.g, pt.b), domLab);
-          if (dDom > 14 || pt.isMetal) {
-            innerDotRgbs.push([pt.r, pt.g, pt.b]);
-          }
-        }
-      }
-
-      components.push({
-        count: pts.length,
-        cu,
-        cv,
-        eccentricity,
-        angle,
-        radius,
-        isMetallic: metalHits / pts.length > 0.36,
-        dominantColor: domHex,
-        centerDotColor:
-          innerDotRgbs.length >= 4 ? medianRgbColor(innerDotRgbs, '#D4AF37') : null,
-      });
-    }
-
-    components.sort((a, b) => b.count - a.count);
-
-    const meanLuma = lumaSum / Math.max(1, totalPlatePixels);
-    const lumaVariance = Math.max(
-      0,
-      lumaSqSum / Math.max(1, totalPlatePixels) - meanLuma * meanLuma
-    );
-    const ridgeDensity = ridgeCount / Math.max(1, totalPlatePixels);
-    const metallicRatio = metallicPoints.length / Math.max(1, totalPlatePixels);
-
-    const meaningfulComponents = components.filter((c) => c.count >= 12);
-    const elongatedStrokeCount = meaningfulComponents.filter(
-      (c) => c.eccentricity >= 0.82 && (c.isMetallic || metallicRatio > 0.025)
-    ).length;
-    const compactBlobCount = meaningfulComponents.filter(
-      (c) => c.eccentricity < 0.84
-    ).length;
-
-    const detectedAnchors: StrokeAnchor[] = meaningfulComponents.slice(0, 4).map((c) => ({
-      u: Number(Math.max(0.14, Math.min(0.86, c.cu)).toFixed(2)),
-      v: Number(Math.max(0.14, Math.min(0.88, c.cv)).toFixed(2)),
-      radius: Number(c.radius.toFixed(2)),
-      angle: Number(c.angle.toFixed(2)),
-    }));
-    const strokeAnchors =
-      detectedAnchors.length > 0 ? detectedAnchors : clusterStrokeAnchors(metallicPoints);
-
-    let pattern: ArtisticPattern = 'solid_gloss';
-    let secondaryColor = tipColor;
-    let accentColor =
-      outlineColor ??
-      (accentSamples.length > 8
-        ? medianRgbColor(accentSamples, '#D4AF37')
-        : '#D4AF37');
-
-    const topBlob = meaningfulComponents[0];
-    const hasInnerFloralDot = meaningfulComponents.some((c) => c.centerDotColor !== null);
-
-    if (
-      (elongatedStrokeCount >= 1 && metallicRatio > 0.025) ||
-      (metallicRatio > 0.045 && ridgeDensity > 0.070 && strokeAnchors.length >= 2 && compactBlobCount === 0)
-    ) {
-      pattern = 'gold_3d_waves';
-      const metalComp = meaningfulComponents.find((c) => c.isMetallic);
-      accentColor =
-        metalComp?.dominantColor ??
-        (accentSamples.length > 6 ? medianRgbColor(accentSamples, '#D4AF37') : accentColor);
-      secondaryColor =
-        hasMetallicOutline && outlineColor
-          ? outlineColor
-          : tipColor !== baseColor
-            ? tipColor
-            : shadeHex(baseColor, 14);
-    } else if (
-      (compactBlobCount >= 1 && topBlob && topBlob.count >= 18 && (hasInnerFloralDot || compactBlobCount >= 2)) ||
-      (meaningfulComponents.length >= 2 && compactBlobCount >= 2 && ridgeDensity > 0.038)
-    ) {
-      pattern = 'floral_accent';
-      const petalBlob = meaningfulComponents.find((c) => !c.isMetallic) ?? topBlob;
-      secondaryColor = petalBlob ? petalBlob.dominantColor : '#FFFDF9';
-      const dotBlob = meaningfulComponents.find((c) => c.centerDotColor !== null);
-      accentColor =
-        dotBlob?.centerDotColor ??
-        outlineColor ??
-        (accentSamples.length > 6 ? medianRgbColor(accentSamples, '#D4AF37') : '#D4AF37');
-    } else if (baseTipDelta > 16 && radialDelta < 18 && meaningfulComponents.length <= 1) {
-      pattern = 'french_tip';
-      secondaryColor = tipColor;
-    } else if (radialDelta > 15 && meaningfulComponents.length === 0) {
-      pattern = 'aura_gradient';
-      secondaryColor = centerAuraColor;
-    } else if (lumaVariance > 0.032 && meanLuma > 0.58 && meaningfulComponents.length === 0) {
-      pattern = 'chrome_mirror';
-      secondaryColor = '#FFFFFF';
-      accentColor = accentSamples.length > 6 ? accentColor : '#F5E7DF';
-    } else {
-      pattern = 'solid_gloss';
-      secondaryColor =
-        hasMetallicOutline && outlineColor ? outlineColor : shadeHex(baseColor, -14);
-    }
-
-    if (hasMetallicOutline && outlineColor && pattern !== 'floral_accent') {
-      accentColor = outlineColor;
-    }
-
-    const metallicIntensity =
-      pattern === 'chrome_mirror'
-        ? 0.92
-        : pattern === 'gold_3d_waves' || hasMetallicOutline
-          ? 0.88
-          : pattern === 'floral_accent'
-            ? 0.48
-            : 0.08;
-
-    const has3DRelief =
-      pattern === 'gold_3d_waves' ||
-      pattern === 'floral_accent' ||
-      hasMetallicOutline ||
-      ridgeDensity > 0.065;
-
-    const uvPatchDataUrl = buildRectifiedNailUVPatch(
-      img,
-      rowLeft,
-      rowRight,
-      minY,
-      maxY,
-      roiW,
-      roiH,
-      anchorX,
-      anchorY,
-      scale,
-      angleRad
-    );
-
-    // Quality score for selecting best specimen across 2 overlapping hands:
-    // rewards sharpness + nail-vs-skin Lab contrast + resolution, penalizes ring occlusion.
-    const avgSharpness = sharpnessAcc / Math.max(1, totalPlatePixels);
-    const avgContrast = contrastAcc / Math.max(1, totalPlatePixels);
-    const ringPenalty = (ringOcclusionPixels / Math.max(1, totalPlatePixels)) * 60 + ringBandRows * 0.4;
-    const qualityScore =
-      avgSharpness * 140 +
-      Math.min(45, avgContrast) * 1.4 +
-      Math.min(120, segPx) * 0.25 -
-      ringPenalty;
+    const { data } = roiCtx.getImageData(0, 0, ROI_WIDTH, ROI_HEIGHT);
+    const { mask, qualityScore } = isolateNailPlateMask(data, ROI_WIDTH, ROI_HEIGHT, skin);
+
+    const blueprint = extractBlueprintFromNailPatch(data, ROI_WIDTH, ROI_HEIGHT, mask, fingerId);
+    const spec = buildSpecFromBlueprint(fingerId, blueprint, detectedFromPhoto);
 
     return {
-      qualityScore,
-      spec: {
-        fingerId,
-        detectedFromPhoto,
-        shape,
-        relativeLength,
-        lengthMultiplier,
-        extensionLevel,
-        extensionMm,
-        tipRoundness,
-        aspectRatio,
-        relativeWidth,
-        baseColor,
-        secondaryColor,
-        accentColor,
-        hasMetallicOutline,
-        outlineColor,
-        has3DRelief,
-        finishStyle: pattern === 'chrome_mirror' ? 'chrome_mirror' : 'glossy_gel',
-        pattern,
-        strokeAnchors:
-          strokeAnchors.length > 0 ? strokeAnchors : defaultAnchorsForPattern(pattern),
-        metallicIntensity,
-        glossIntensity: pattern === 'chrome_mirror' ? 1.0 : 0.94,
-        uvPatchDataUrl,
-        isImportedReference: true,
-      },
+      spec,
+      qualityScore: qualityScore + Math.min(100, segPx) * 0.2,
     };
   } catch {
     return { spec: defaultSpec, qualityScore: 0 };
   }
 }
 
-function extractDominantColorCluster(
-  samples: Array<[number, number, number]>,
-  fallback: string
-): string {
-  if (samples.length === 0) return fallback;
-  if (samples.length < 8) return medianRgbColor(samples, fallback);
-
-  // Coarse 3D RGB quantization (step 20) to isolate dominant base polish even with central nail art
-  const bins = new Map<string, { sumR: number; sumG: number; sumB: number; count: number }>();
-  for (const [r, g, b] of samples) {
-    const key = `${Math.floor(r / 20)}_${Math.floor(g / 20)}_${Math.floor(b / 20)}`;
-    const cur = bins.get(key);
-    if (cur) {
-      cur.sumR += r;
-      cur.sumG += g;
-      cur.sumB += b;
-      cur.count++;
-    } else {
-      bins.set(key, { sumR: r, sumG: g, sumB: b, count: 1 });
-    }
-  }
-
-  let bestBin: { sumR: number; sumG: number; sumB: number; count: number } | null = null;
-  for (const bin of bins.values()) {
-    if (!bestBin || bin.count > bestBin.count) {
-      bestBin = bin;
-    }
-  }
-  if (!bestBin) return medianRgbColor(samples, fallback);
-
-  const seedLab = rgbToLabLike(
-    bestBin.sumR / bestBin.count,
-    bestBin.sumG / bestBin.count,
-    bestBin.sumB / bestBin.count
-  );
-  const clusterSamples = samples.filter(
-    ([r, g, b]) => deltaLab(rgbToLabLike(r, g, b), seedLab) < 16
-  );
-  return medianRgbColor(clusterSamples.length > 0 ? clusterSamples : samples, fallback);
-}
-
-function defaultAnchorsForPattern(pattern: ArtisticPattern): StrokeAnchor[] {
-  if (pattern === 'gold_3d_waves') {
-    return [
-      { u: 0.34, v: 0.34, radius: 0.18, angle: 0.4 },
-      { u: 0.62, v: 0.58, radius: 0.2, angle: -0.35 },
-      { u: 0.46, v: 0.78, radius: 0.16, angle: 0.25 },
-    ];
-  }
-  if (pattern === 'floral_accent') {
-    return [
-      { u: 0.44, v: 0.46, radius: 0.14, angle: 0 },
-      { u: 0.64, v: 0.68, radius: 0.11, angle: 0.5 },
-      { u: 0.32, v: 0.72, radius: 0.1, angle: -0.4 },
-    ];
-  }
-  return [];
-}
-
-function clusterStrokeAnchors(
-  points: Array<{ u: number; v: number; grad: number }>
-): StrokeAnchor[] {
-  if (points.length < 4) return [];
-  const sorted = [...points].sort((a, b) => b.grad - a.grad);
-  const anchors: StrokeAnchor[] = [];
-  for (const pt of sorted) {
-    if (anchors.length >= 4) break;
-    const tooClose = anchors.some((a) => Math.hypot(a.u - pt.u, a.v - pt.v) < 0.18);
-    if (!tooClose) {
-      anchors.push({
-        u: Number(Math.max(0.18, Math.min(0.82, pt.u)).toFixed(2)),
-        v: Number(Math.max(0.18, Math.min(0.86, pt.v)).toFixed(2)),
-        radius: 0.15,
-        angle: Number((((pt.u - 0.5) * 1.4)).toFixed(2)),
-      });
-    }
-  }
-  return anchors;
-}
-
 /**
  * Harmonic Inheritance for Missing Fingers:
- * Propagates uvPatchDataUrl, colors, reliefs, and proportions harmoniously to unseen fingers
- * (e.g., when only 3–4 fingers are visible in a reference photo).
+ * Propagates full V10 `blueprint` (colors, borders, vector `artElements`, geometry profile)
+ * harmoniously to unseen fingers while strictly preserving every detected finger's own
+ * individual blueprint (respecting feature nails / "filha única" and mixed sets!).
  */
 function applyHarmonicInheritance(
   partial: Partial<Record<FingerId, NailFingerDesignSpec>>
@@ -1483,7 +2569,12 @@ function applyHarmonicInheritance(
   );
 
   const ornateDonor =
-    detected.find((s) => s.pattern === 'gold_3d_waves' || s.pattern === 'floral_accent') ??
+    detected.find(
+      (s) =>
+        s.pattern === 'gold_3d_waves' ||
+        s.pattern === 'floral_accent' ||
+        (s.blueprint?.artElements.length ?? 0) > 0
+    ) ??
     detected.find((s) => s.pattern !== 'solid_gloss') ??
     detected[0];
 
@@ -1507,56 +2598,44 @@ function applyHarmonicInheritance(
         ? ornateDonor
         : baseDonor;
 
-    const inheritedPattern: ArtisticPattern =
-      id === 'thumb' || id === 'pinky'
-        ? donor.pattern === 'floral_accent'
-          ? 'aura_gradient'
-          : donor.pattern
-        : donor.pattern;
-
-    const inheritedLengthMult = Number(
-      Math.max(
-        0.85,
-        Math.min(
-          1.65,
-          (donor.lengthMultiplier ?? donor.relativeLength) * (cfg.defaultLength / 1.0)
-        )
-      ).toFixed(2)
+    const donorBp = donor.blueprint ?? buildBlueprintFromLegacySpec(donor);
+    const inheritedFreeEdge = clamp(
+      donorBp.geometry.freeEdgeRatio * (cfg.defaultLength / 1.0),
+      0.12,
+      1.15
     );
+    const suppressFloralOnThumbPinky =
+      (id === 'thumb' || id === 'pinky') && donor.pattern === 'floral_accent';
 
-    result[id] = {
-      ...donor,
-      fingerId: id,
-      detectedFromPhoto: false,
-      relativeLength: inheritedLengthMult,
-      lengthMultiplier: inheritedLengthMult,
-      extensionLevel:
-        donor.extensionLevel ?? classifyExtensionFromMultiplier(inheritedLengthMult),
-      extensionMm: donor.extensionMm ?? computeExtensionMmFromMultiplier(inheritedLengthMult),
-      aspectRatio: donor.aspectRatio,
-      relativeWidth: cfg.defaultWidth,
-      hasMetallicOutline: donor.hasMetallicOutline ?? false,
-      outlineColor: donor.outlineColor,
-      has3DRelief: donor.has3DRelief ?? false,
-      pattern: inheritedPattern,
-      uvPatchDataUrl: donor.uvPatchDataUrl,
-      isImportedReference: donor.isImportedReference ?? true,
-      strokeAnchors:
-        inheritedPattern === 'gold_3d_waves' || inheritedPattern === 'floral_accent'
-          ? donor.strokeAnchors.length > 0
-            ? donor.strokeAnchors
-            : defaultAnchorsForPattern(inheritedPattern)
-          : [],
+    const clonedBp: NailDesignBlueprint = {
+      version: 10,
+      geometry: {
+        ...donorBp.geometry,
+        profileHalfWidths: [...donorBp.geometry.profileHalfWidths] as NailGeometryProfile['profileHalfWidths'],
+        freeEdgeRatio: Number(inheritedFreeEdge.toFixed(2)),
+      },
+      baseLayer: {
+        ...donorBp.baseLayer,
+        gradientMode: suppressFloralOnThumbPinky ? 'radial_aura' : donorBp.baseLayer.gradientMode,
+      },
+      borderLayer: { ...donorBp.borderLayer },
+      artElements: suppressFloralOnThumbPinky
+        ? []
+        : donorBp.artElements.map((el) =>
+            el.type === 'ribbon_stroke'
+              ? { ...el, points: el.points.map((p) => ({ ...p })) }
+              : el.type === 'organic_motif'
+                ? { ...el, contour: el.contour.map((c) => ({ ...c })) }
+                : { ...el }
+          ),
     };
+
+    result[id] = buildSpecFromBlueprint(id, clonedBp, false);
   }
 
   return result;
 }
 
-/**
- * Fallback macro analyzer when MediaPipe doesn't detect full hand landmarks
- * (e.g., extreme macro close-up of 1–3 nails). Analyzes 3 high-res zones and harmonizes all 5 fingers.
- */
 function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResult {
   const macroTargets: Array<{ fingerId: FingerId; cx: number; cy: number }> = [
     { fingerId: 'middle', cx: 0.5, cy: 0.48 },
@@ -1591,259 +2670,87 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
 }
 
 /**
- * Normalizes a partial/full `fingerSpecs` payload returned by `POST /api/vision/reconstruct-reference`
- * into a strict, length-clamped 5-finger `PerFingerAnalysisResult`.
- */
-function normalizeBackendReconstructionResult(
-  payload: Record<string, unknown>
-): PerFingerAnalysisResult | null {
-  const rawSpecs = payload.fingerSpecs as Partial<Record<FingerId, Partial<NailFingerDesignSpec>>> | undefined;
-  if (!rawSpecs || typeof rawSpecs !== 'object') return null;
-
-  const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
-  const detectedFingerIds: FingerId[] = [];
-
-  for (const id of ORDERED_FINGERS) {
-    const raw = rawSpecs[id];
-    if (!raw || typeof raw !== 'object') continue;
-    const cfg = FINGER_LANDMARKS[id];
-    const lengthMultiplier = Number(
-      Math.max(
-        0.85,
-        Math.min(1.65, Number(raw.lengthMultiplier ?? raw.relativeLength ?? cfg.defaultLength))
-      ).toFixed(2)
-    );
-    const shape = normalizeShape(raw.shape, 'almond');
-    const pattern = normalizePattern(raw.pattern, 'solid_gloss');
-    const baseColor = sanitizeHexColor(raw.baseColor, '#5A0A1E');
-    const secondaryColor = sanitizeHexColor(raw.secondaryColor, '#FFFDF9');
-    const accentColor = sanitizeHexColor(raw.accentColor, '#D4AF37');
-    const hasMetallicOutline = Boolean(raw.hasMetallicOutline);
-    const outlineColor = raw.outlineColor ? sanitizeHexColor(raw.outlineColor, accentColor) : undefined;
-    const detectedFromPhoto = raw.detectedFromPhoto !== false;
-
-    if (detectedFromPhoto) {
-      detectedFingerIds.push(id);
-    }
-
-    partial[id] = {
-      fingerId: id,
-      detectedFromPhoto,
-      shape,
-      relativeLength: lengthMultiplier,
-      lengthMultiplier,
-      extensionLevel:
-        (raw.extensionLevel as NailExtensionLevel | undefined) ??
-        classifyExtensionFromMultiplier(lengthMultiplier),
-      extensionMm:
-        typeof raw.extensionMm === 'number'
-          ? Math.max(1.5, Math.min(12.0, Number(raw.extensionMm.toFixed(1))))
-          : computeExtensionMmFromMultiplier(lengthMultiplier),
-      tipRoundness:
-        typeof raw.tipRoundness === 'number'
-          ? Math.max(0, Math.min(1, Number(raw.tipRoundness.toFixed(2))))
-          : undefined,
-      aspectRatio: typeof raw.aspectRatio === 'number' ? raw.aspectRatio : undefined,
-      relativeWidth:
-        typeof raw.relativeWidth === 'number'
-          ? Math.max(0.78, Math.min(1.30, Number(raw.relativeWidth.toFixed(2))))
-          : cfg.defaultWidth,
-      baseColor,
-      secondaryColor,
-      accentColor,
-      hasMetallicOutline,
-      outlineColor,
-      has3DRelief:
-        typeof raw.has3DRelief === 'boolean'
-          ? raw.has3DRelief
-          : pattern === 'gold_3d_waves' || pattern === 'floral_accent' || hasMetallicOutline,
-      reliefDescription: typeof raw.reliefDescription === 'string' ? raw.reliefDescription : undefined,
-      artDescription: typeof raw.artDescription === 'string' ? raw.artDescription : undefined,
-      finishStyle: raw.finishStyle,
-      pattern,
-      strokeAnchors: Array.isArray(raw.strokeAnchors)
-        ? raw.strokeAnchors
-        : defaultAnchorsForPattern(pattern),
-      metallicIntensity:
-        typeof raw.metallicIntensity === 'number'
-          ? Math.max(0, Math.min(1, raw.metallicIntensity))
-          : hasMetallicOutline || pattern === 'gold_3d_waves'
-            ? 0.88
-            : 0.14,
-      glossIntensity:
-        typeof raw.glossIntensity === 'number'
-          ? Math.max(0.4, Math.min(1, raw.glossIntensity))
-          : 0.96,
-      uvPatchDataUrl: typeof raw.uvPatchDataUrl === 'string' ? raw.uvPatchDataUrl : undefined,
-      normalMapDataUrl:
-        typeof raw.normalMapDataUrl === 'string' ? raw.normalMapDataUrl : undefined,
-      displacementMapDataUrl:
-        typeof raw.displacementMapDataUrl === 'string' ? raw.displacementMapDataUrl : undefined,
-      metalnessMapDataUrl:
-        typeof raw.metalnessMapDataUrl === 'string' ? raw.metalnessMapDataUrl : undefined,
-      roughnessMapDataUrl:
-        typeof raw.roughnessMapDataUrl === 'string' ? raw.roughnessMapDataUrl : undefined,
-      isImportedReference: true,
-    };
-  }
-
-  if (Object.keys(partial).length === 0) return null;
-
-  const fingerSpecs = applyHarmonicInheritance(partial);
-  const finalDetected =
-    detectedFingerIds.length > 0
-      ? detectedFingerIds
-      : (Object.keys(partial) as FingerId[]);
-  const primary =
-    fingerSpecs[finalDetected.includes('middle') ? 'middle' : finalDetected[0]] ??
-    fingerSpecs.middle;
-
-  return {
-    fingerSpecs,
-    detectedFingerIds: finalDetected,
-    method: 'mediapipe',
-    primaryShape: normalizeShape(payload.primaryShape, primary.shape),
-    primaryLength: Number(
-      Math.max(
-        0.85,
-        Math.min(1.65, Number(payload.primaryLength ?? primary.lengthMultiplier ?? primary.relativeLength))
-      ).toFixed(2)
-    ),
-    primaryExtensionLevel:
-      (payload.primaryExtensionLevel as NailExtensionLevel | undefined) ?? primary.extensionLevel,
-    primaryAspectRatio:
-      typeof payload.primaryAspectRatio === 'number'
-        ? payload.primaryAspectRatio
-        : primary.aspectRatio,
-    primaryBaseColor: sanitizeHexColor(payload.primaryBaseColor, primary.baseColor),
-    primarySecondaryColor: sanitizeHexColor(
-      payload.primarySecondaryColor,
-      primary.secondaryColor
-    ),
-    primaryAccentColor: sanitizeHexColor(payload.primaryAccentColor, primary.accentColor),
-    primaryPattern: normalizePattern(payload.primaryPattern, primary.pattern),
-  };
-}
-
-async function tryBackendReferenceReconstruction(
-  imageDataUrl: string
-): Promise<PerFingerAnalysisResult | null> {
-  const apiBase = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
-  const endpoint = `${apiBase}/api/vision/reconstruct-reference`;
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 12000);
-
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageDataUrl }),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as Record<string, unknown>;
-    return normalizeBackendReconstructionResult(data);
-  } catch {
-    return null;
-  } finally {
-    window.clearTimeout(timer);
-  }
-}
-
-/**
- * Primary Hybrid Reconstruction Entry-Point (`imageDataUrl`):
- * 1. Calls `POST /api/vision/reconstruct-reference` (respecting `VITE_API_URL`, 12s timeout).
- *    If backend responds 200 OK with reconstructed `fingerSpecs`, returns high-fidelity AI/VLM result directly.
- * 2. Offline / No-API-Key Local High-Res Fallback:
- *    - Runs MediaPipe `HandLandmarker` (`IMAGE` mode, `numHands: 2`) for overlapping 2-hand photos,
- *      scoring each candidate finger specimen by sharpness + nail-vs-skin CIELab contrast + absence of ring occlusion.
- *    - Extracts 320×480 upright ROIs from the full-res image, segments with combined CIELab + HSV + Sobel + elliptical prior,
- *      rectifies 512×512 UV textures (94% plate) preserving deep colors with surgical glare-only inpainting,
- *      and propagates harmonically across all 5 fingers.
+ * V10 100% Local Offline Mathematical Reference Reconstruction (`< 300ms` total, ZERO backend/VLM calls):
+ * - Uses shared MediaPipe `HandLandmarker` singleton (`detectHandsOnImageWithSingleton(img, 2)`).
+ * - Picks the highest-quality specimen for each finger across up to 2 hands.
+ * - Extracts 128×192 aligned ROIs, isolates the nail plate strictly via local skin/background modeling
+ *   and seed-guided region growing, and compiles a pure vector + parametric `NailDesignBlueprint`.
  */
 export async function analyzeReferencePhotoPerFinger(
   imageDataUrl: string
 ): Promise<PerFingerAnalysisResult> {
-  const backendResult = await tryBackendReferenceReconstruction(imageDataUrl);
-  if (backendResult) {
-    return backendResult;
-  }
-
-  const img = await loadImageFromDataUrl(imageDataUrl, 2200);
+  const img = await loadImageFromDataUrl(imageDataUrl, 1600);
   const w = img.naturalWidth;
   const h = img.naturalHeight;
 
-  const landmarker = await getImageHandLandmarker();
-  if (landmarker) {
-    try {
-      const result = landmarker.detect(img);
-      const hands = result.landmarks ?? [];
-      const bestByFinger: Partial<Record<FingerId, FingerRoiAnalysisOutput>> = {};
+  try {
+    const result = await detectHandsOnImageWithSingleton(img, 2);
+    const hands = result.landmarks ?? [];
+    const bestByFinger: Partial<Record<FingerId, FingerRoiAnalysisOutput>> = {};
 
-      for (const hand of hands) {
-        if (!hand || hand.length < 21) continue;
-        for (const fingerId of ORDERED_FINGERS) {
-          const cfg = FINGER_LANDMARKS[fingerId];
-          const tip = hand[cfg.tipIdx];
-          const dip = hand[cfg.dipIdx];
-          const pip = hand[cfg.pipIdx];
+    for (const hand of hands) {
+      if (!hand || hand.length < 21) continue;
+      for (const fingerId of ORDERED_FINGERS) {
+        const cfg = FINGER_LANDMARKS[fingerId];
+        const tip = hand[cfg.tipIdx];
+        const dip = hand[cfg.dipIdx];
+        const pip = hand[cfg.pipIdx];
 
-          if (
-            tip.x < 0.02 ||
-            tip.x > 0.98 ||
-            tip.y < 0.02 ||
-            tip.y > 0.98 ||
-            dip.x < 0.015 ||
-            dip.x > 0.985 ||
-            dip.y < 0.015 ||
-            dip.y > 0.985
-          ) {
-            continue;
-          }
+        if (
+          tip.x < 0.02 ||
+          tip.x > 0.98 ||
+          tip.y < 0.02 ||
+          tip.y > 0.98 ||
+          dip.x < 0.015 ||
+          dip.x > 0.985 ||
+          dip.y < 0.015 ||
+          dip.y > 0.985
+        ) {
+          continue;
+        }
 
-          const segPx = Math.hypot((tip.x - dip.x) * w, (tip.y - dip.y) * h);
-          if (segPx < 18) continue;
+        const segPx = Math.hypot((tip.x - dip.x) * w, (tip.y - dip.y) * h);
+        if (segPx < 16) continue;
 
-          const candidate = analyzeSingleNailROI(img, fingerId, pip, dip, tip, true);
-          const existing = bestByFinger[fingerId];
-          if (!existing || candidate.qualityScore > existing.qualityScore) {
-            bestByFinger[fingerId] = candidate;
-          }
+        const candidate = analyzeSingleNailROI(img, fingerId, pip, dip, tip, true);
+        const existing = bestByFinger[fingerId];
+        if (!existing || candidate.qualityScore > existing.qualityScore) {
+          bestByFinger[fingerId] = candidate;
         }
       }
-
-      const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
-      const detectedFingerIds: FingerId[] = [];
-      for (const id of ORDERED_FINGERS) {
-        const chosen = bestByFinger[id];
-        if (chosen) {
-          partial[id] = chosen.spec;
-          detectedFingerIds.push(id);
-        }
-      }
-
-      if (detectedFingerIds.length > 0) {
-        const fingerSpecs = applyHarmonicInheritance(partial);
-        const primary =
-          fingerSpecs[detectedFingerIds.includes('middle') ? 'middle' : detectedFingerIds[0]];
-
-        return {
-          fingerSpecs,
-          detectedFingerIds,
-          method: 'mediapipe',
-          primaryShape: primary.shape,
-          primaryLength: primary.lengthMultiplier ?? primary.relativeLength,
-          primaryExtensionLevel: primary.extensionLevel,
-          primaryAspectRatio: primary.aspectRatio,
-          primaryBaseColor: primary.baseColor,
-          primarySecondaryColor: primary.secondaryColor,
-          primaryAccentColor: primary.accentColor,
-          primaryPattern: primary.pattern,
-        };
-      }
-    } catch {
-      // Fall through to macro analyzer
     }
+
+    const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
+    const detectedFingerIds: FingerId[] = [];
+    for (const id of ORDERED_FINGERS) {
+      const chosen = bestByFinger[id];
+      if (chosen) {
+        partial[id] = chosen.spec;
+        detectedFingerIds.push(id);
+      }
+    }
+
+    if (detectedFingerIds.length > 0) {
+      const fingerSpecs = applyHarmonicInheritance(partial);
+      const primary =
+        fingerSpecs[detectedFingerIds.includes('middle') ? 'middle' : detectedFingerIds[0]];
+
+      return {
+        fingerSpecs,
+        detectedFingerIds,
+        method: 'mediapipe',
+        primaryShape: primary.shape,
+        primaryLength: primary.lengthMultiplier ?? primary.relativeLength,
+        primaryExtensionLevel: primary.extensionLevel,
+        primaryAspectRatio: primary.aspectRatio,
+        primaryBaseColor: primary.baseColor,
+        primarySecondaryColor: primary.secondaryColor,
+        primaryAccentColor: primary.accentColor,
+        primaryPattern: primary.pattern,
+      };
+    }
+  } catch {
+    // Fall through to macro zone analyzer
   }
 
   return analyzeMacroZonesFallback(img);
@@ -1859,13 +2766,23 @@ export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAn
 
 /**
  * Converts any Studio Catalog `NailDesign` into a cohesive 5-finger `NailFingerDesignSpec` map
- * so every Studio preset ALSO renders through the exact same 1024×1024 PBR pipeline.
+ * backed by pure V10 `NailDesignBlueprint` definitions.
  */
 export function buildFingerSpecsFromStudioDesign(
   design: NailDesign
 ): Record<FingerId, NailFingerDesignSpec> {
   if (design.fingerSpecs) {
-    return design.fingerSpecs;
+    const out = {} as Record<FingerId, NailFingerDesignSpec>;
+    for (const id of ORDERED_FINGERS) {
+      const spec = design.fingerSpecs[id];
+      if (spec) {
+        out[id] = spec.blueprint
+          ? spec
+          : { ...spec, blueprint: buildBlueprintFromLegacySpec(spec) };
+      }
+    }
+    if (Object.keys(out).length === 5) return out;
+    if (Object.keys(out).length > 0) return applyHarmonicInheritance(out);
   }
 
   const baseColor = design.baseColor || '#E5BEB3';
@@ -1877,33 +2794,52 @@ export function buildFingerSpecsFromStudioDesign(
   else if (design.patternType === 'chrome') pattern = 'chrome_mirror';
   else if (design.patternType === 'gold-foil' || design.patternType === 'marble')
     pattern = 'gold_3d_waves';
-  else if (design.patternType === 'ombre' || design.patternType === 'aurora' || design.patternType === 'cat-eye')
+  else if (
+    design.patternType === 'ombre' ||
+    design.patternType === 'aurora' ||
+    design.patternType === 'cat-eye'
+  ) {
     pattern = 'aura_gradient';
+  }
 
   const shape: NailShape = design.detectedShape ?? 'almond';
-  const baseLen = Math.max(0.85, Math.min(1.65, design.detectedLength ?? 1.05));
+  const baseFreeEdge = clamp(
+    (design.detectedLength !== undefined
+      ? normalizeRelativeLengthV10(design.detectedLength) - 1
+      : 0.42),
+    0.12,
+    1.15
+  );
+
   const metallicIntensity =
     design.finish === 'chrome' || pattern === 'chrome_mirror'
       ? 0.9
       : pattern === 'gold_3d_waves' || design.finish === 'glitter'
         ? 0.86
         : 0.1;
-  const glossIntensity = design.finish === 'velvet' ? 0.56 : 0.96;
+  const glossIntensity = design.finish === 'velvet' ? 0.48 : 0.96;
+  const finishStyle: NailFinishV10 =
+    design.finish === 'velvet'
+      ? 'velvet_matte'
+      : design.finish === 'chrome' || pattern === 'chrome_mirror'
+        ? 'chrome_mirror'
+        : design.patternType === 'cat-eye'
+          ? 'cat_eye'
+          : 'glossy_gel';
 
   const map = {} as Record<FingerId, NailFingerDesignSpec>;
   for (const id of ORDERED_FINGERS) {
     const cfg = FINGER_LANDMARKS[id];
-    const fingerLenMult = Number(
-      Math.max(0.85, Math.min(1.65, baseLen * cfg.defaultLength)).toFixed(2)
-    );
-    map[id] = {
+    const ext = classifyExtensionFromFreeEdgeRatio(baseFreeEdge * cfg.defaultLength);
+    const seedSpec: NailFingerDesignSpec = {
       fingerId: id,
       detectedFromPhoto: false,
       shape,
-      relativeLength: fingerLenMult,
-      lengthMultiplier: fingerLenMult,
-      extensionLevel: classifyExtensionFromMultiplier(fingerLenMult),
-      extensionMm: computeExtensionMmFromMultiplier(fingerLenMult),
+      relativeLength: ext.relativeLength,
+      lengthMultiplier: ext.relativeLength,
+      freeEdgeRatio: ext.freeEdgeRatio,
+      extensionLevel: ext.extensionLevel,
+      extensionMm: ext.extensionMm,
       relativeWidth: cfg.defaultWidth,
       baseColor,
       secondaryColor,
@@ -1911,34 +2847,57 @@ export function buildFingerSpecsFromStudioDesign(
       hasMetallicOutline: false,
       outlineColor: undefined,
       has3DRelief: pattern === 'gold_3d_waves',
+      finishStyle,
       pattern,
       strokeAnchors: defaultAnchorsForPattern(pattern),
       metallicIntensity,
       glossIntensity,
     };
+    map[id] = {
+      ...seedSpec,
+      blueprint: buildBlueprintFromLegacySpec(seedSpec),
+    };
   }
   return map;
 }
 
-/**
- * Alias exported for callers referencing `buildFallbackStudioFingerSpecs`.
- */
 export const buildFallbackStudioFingerSpecs = buildFingerSpecsFromStudioDesign;
 
-function hexToLab(hex: string): [number, number, number] {
-  const clean = hex.replace('#', '');
-  if (clean.length !== 6) return [70, 0, 0];
-  const n = parseInt(clean, 16);
-  return rgbToLabLike((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+function defaultAnchorsForPattern(pattern: ArtisticPattern): StrokeAnchor[] {
+  if (pattern === 'gold_3d_waves') {
+    return [
+      { u: 0.34, v: 0.34, radius: 0.18, angle: 0.4 },
+      { u: 0.62, v: 0.58, radius: 0.2, angle: -0.35 },
+      { u: 0.46, v: 0.78, radius: 0.16, angle: 0.25 },
+    ];
+  }
+  if (pattern === 'floral_accent') {
+    return [
+      { u: 0.44, v: 0.46, radius: 0.14, angle: 0 },
+      { u: 0.64, v: 0.68, radius: 0.11, angle: 0.5 },
+      { u: 0.32, v: 0.72, radius: 0.1, angle: -0.4 },
+    ];
+  }
+  return [];
 }
 
-function shadeHex(hex: string, amount: number): string {
-  const clean = hex.replace('#', '');
-  if (clean.length !== 6) return hex;
-  const num = parseInt(clean, 16);
-  return rgbToHex(
-    ((num >> 16) & 0xff) + amount,
-    ((num >> 8) & 0xff) + amount,
-    (num & 0xff) + amount
-  );
+function sanitizeHexColor(hex: unknown, fallback: string): string {
+  if (typeof hex !== 'string') return fallback;
+  const trimmed = hex.trim();
+  if (/^#[0-9A-Fa-f]{6}$/.test(trimmed)) return trimmed.toUpperCase();
+  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    const r = trimmed[1];
+    const g = trimmed[2];
+    const b = trimmed[3];
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return fallback;
+}
+
+const VALID_SHAPES: NailShape[] = ['natural', 'oval', 'almond', 'square', 'coffin', 'stiletto'];
+function normalizeShape(shape: unknown, fallback: NailShape = 'almond'): NailShape {
+  if (typeof shape === 'string' && VALID_SHAPES.includes(shape as NailShape)) {
+    return shape as NailShape;
+  }
+  return fallback;
 }
