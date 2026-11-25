@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { NailFingerDesignSpec } from '../types/nail';
+import type { NailFingerDesignSpec } from './perFingerVisionAnalyzer';
 
 export interface ProceduralPBRBundle {
   specHash: string;
@@ -45,10 +45,22 @@ function makeTextureSurface(w: number, h: number): {
   return { canvas: el, ctx };
 }
 
+function hashShortString(str: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
 export function hashFingerSpec(spec: NailFingerDesignSpec): string {
   const anchors = spec.strokeAnchors
     .map((a) => `${a.u.toFixed(2)},${a.v.toFixed(2)},${a.radius.toFixed(2)},${a.angle.toFixed(2)}`)
     .join(';');
+  const patchSig = spec.uvPatchDataUrl
+    ? `${spec.uvPatchDataUrl.length}:${hashShortString(spec.uvPatchDataUrl)}`
+    : '';
   return [
     spec.pattern,
     spec.baseColor,
@@ -57,6 +69,7 @@ export function hashFingerSpec(spec: NailFingerDesignSpec): string {
     spec.metallicIntensity.toFixed(2),
     spec.glossIntensity.toFixed(2),
     anchors,
+    patchSig,
   ].join('|');
 }
 
@@ -608,6 +621,261 @@ export function synthesizeProceduralPBRBundle(
     }
   }
   pbrBundleCache.set(specHash, bundle);
+
+  // Hybrid Mode for Imported Reference Photos:
+  // Procedural base above renders immediately on frame 0; load uvPatchDataUrl once off-RAF
+  // and compose rectified photo detail + automatic metallic/3D relief PBR maps on onload.
+  if (spec.uvPatchDataUrl) {
+    let disposed = false;
+    const origDispose = bundle.dispose;
+    bundle.dispose = () => {
+      disposed = true;
+      origDispose();
+    };
+
+    const patchImg = new Image();
+    patchImg.onload = () => {
+      if (disposed) return;
+
+      const patchW = 256;
+      const patchH = 256;
+      const { ctx: patchCtx } = makeSurface(patchW, patchH);
+      patchCtx.drawImage(patchImg, 0, 0, patchW, patchH);
+      const srcData = patchCtx.getImageData(0, 0, patchW, patchH).data;
+
+      // 1. Analyze 256x256 rectified patch pixels for local contrast, metallic gold/silver/gems & 3D reliefs
+      const patchLuma = new Float32Array(patchW * patchH);
+      for (let i = 0; i < patchW * patchH; i++) {
+        const p4 = i * 4;
+        patchLuma[i] =
+          (0.299 * srcData[p4] + 0.587 * srcData[p4 + 1] + 0.114 * srcData[p4 + 2]) / 255;
+      }
+
+      const [baseR, baseG, baseB] = parseHex(spec.baseColor || '#E5BEB3');
+      const baseLuma = (0.299 * baseR + 0.587 * baseG + 0.114 * baseB) / 255;
+
+      const { canvas: upPatchCanvas, ctx: upPatchCtx } = makeTextureSurface(w, h);
+      const { ctx: reliefHeightCtx } = makeSurface(patchW, patchH);
+      const { ctx: reliefMetalCtx } = makeSurface(patchW, patchH);
+      const { ctx: reliefRoughCtx } = makeSurface(patchW, patchH);
+
+      const hPatchImg = reliefHeightCtx.createImageData(patchW, patchH);
+      const mPatchImg = reliefMetalCtx.createImageData(patchW, patchH);
+      const rPatchImg = reliefRoughCtx.createImageData(patchW, patchH);
+
+      // Build feathered + contrast-enhanced 256x256 albedo patch + PBR relief/metal/roughness masks
+      const { ctx: cleanPatchCtx } = makeSurface(patchW, patchH);
+      const cleanPatchImg = cleanPatchCtx.createImageData(patchW, patchH);
+
+      for (let py = 0; py < patchH; py++) {
+        const vNorm = 1 - py / (patchH - 1); // 0 = cuticle bottom, 1 = tip top
+        // Feather ~6% along cuticle base & lateral sidewalls into baseColor for zero visible seam
+        const edgeV = Math.min(1, vNorm / 0.065);
+        for (let px = 0; px < patchW; px++) {
+          const uNorm = px / (patchW - 1);
+          const edgeU = Math.min(1, Math.min(uNorm, 1 - uNorm) / 0.065);
+          const feather = Math.min(edgeU, edgeV);
+          const smoothFeather = feather * feather * (3 - 2 * feather);
+
+          const idx = py * patchW + px;
+          const p4 = idx * 4;
+          const r = srcData[p4];
+          const g = srcData[p4 + 1];
+          const b = srcData[p4 + 2];
+
+          const l = patchLuma[idx];
+          const lL = patchLuma[py * patchW + Math.max(0, px - 1)];
+          const lR = patchLuma[py * patchW + Math.min(patchW - 1, px + 1)];
+          const lU = patchLuma[Math.max(0, py - 1) * patchW + px];
+          const lD = patchLuma[Math.min(patchH - 1, py + 1) * patchW + px];
+          const grad = Math.hypot(lR - lL, lD - lU);
+          const localAvg = (lL + lR + lU + lD) * 0.25;
+          const highFreq = Math.abs(l - localAvg);
+
+          // Gentle local contrast & crispness boost on real nail art
+          const lumOffset = (l - 0.5) * 18 + (l - localAvg) * 32;
+          const enhR = clampByte(r + lumOffset);
+          const enhG = clampByte(g + lumOffset);
+          const enhB = clampByte(b + lumOffset);
+
+          cleanPatchImg.data[p4] = clampByte(baseR * (1 - smoothFeather) + enhR * smoothFeather);
+          cleanPatchImg.data[p4 + 1] = clampByte(baseG * (1 - smoothFeather) + enhG * smoothFeather);
+          cleanPatchImg.data[p4 + 2] = clampByte(baseB * (1 - smoothFeather) + enhB * smoothFeather);
+          cleanPatchImg.data[p4 + 3] = clampByte(smoothFeather * 255);
+
+          // Automatic detection of metallic gold/silver, gems, or 3D reliefs
+          const maxC = Math.max(r, g, b);
+          const minC = Math.min(r, g, b);
+          const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+          const isWarmGold = r > g * 1.04 && g > b * 1.12 && l > 0.36 && sat > 0.18;
+          const isSilverOrGem =
+            sat < 0.18 && l > 0.70 && (grad > 0.11 || highFreq > 0.045 || l - baseLuma > 0.22);
+          const isPearlAccent = l > 0.76 && grad > 0.09;
+          const chromaDiff =
+            (Math.abs(r - baseR) + Math.abs(g - baseG) + Math.abs(b - baseB)) / (255 * 3);
+
+          const isMetallicDetail =
+            (isWarmGold && (grad > 0.05 || chromaDiff > 0.12)) ||
+            isSilverOrGem ||
+            isPearlAccent;
+
+          const reliefStrength = Math.min(
+            1,
+            (isMetallicDetail ? 0.55 : 0) + grad * 2.2 + highFreq * 4.5 + (chromaDiff > 0.22 ? 0.25 : 0)
+          );
+
+          const hVal = clampByte(100 + reliefStrength * 155);
+          hPatchImg.data[p4] = hVal;
+          hPatchImg.data[p4 + 1] = hVal;
+          hPatchImg.data[p4 + 2] = hVal;
+          hPatchImg.data[p4 + 3] = 255;
+
+          const mVal = isMetallicDetail
+            ? clampByte(180 + Math.min(1, grad * 2.0 + (isWarmGold ? 0.45 : 0.3)) * 75)
+            : clampByte(spec.pattern === 'chrome_mirror' ? 195 : 0);
+          mPatchImg.data[p4] = mVal;
+          mPatchImg.data[p4 + 1] = mVal;
+          mPatchImg.data[p4 + 2] = mVal;
+          mPatchImg.data[p4 + 3] = 255;
+
+          const roughFloat = isMetallicDetail
+            ? Math.max(0.08, Math.min(0.20, 0.18 - grad * 0.35))
+            : baseRough;
+          const rVal = clampByte(roughFloat * 255);
+          rPatchImg.data[p4] = rVal;
+          rPatchImg.data[p4 + 1] = rVal;
+          rPatchImg.data[p4 + 2] = rVal;
+          rPatchImg.data[p4 + 3] = 255;
+        }
+      }
+
+      cleanPatchCtx.putImageData(cleanPatchImg, 0, 0);
+      reliefHeightCtx.putImageData(hPatchImg, 0, 0);
+      reliefMetalCtx.putImageData(mPatchImg, 0, 0);
+      reliefRoughCtx.putImageData(rPatchImg, 0, 0);
+
+      // Composite feathered patch smoothly onto 1024x1024 albedoMap
+      upPatchCtx.clearRect(0, 0, w, h);
+      upPatchCtx.imageSmoothingEnabled = true;
+      upPatchCtx.imageSmoothingQuality = 'high';
+      upPatchCtx.drawImage(
+        cleanPatchCtx.canvas as CanvasImageSource,
+        0,
+        0,
+        patchW,
+        patchH,
+        0,
+        0,
+        w,
+        h
+      );
+
+      albedoCtx.save();
+      albedoCtx.drawImage(upPatchCanvas, 0, 0, w, h);
+      albedoCtx.restore();
+
+      // Upscale height, metalness & roughness onto 1024x1024 PBR canvases
+      const { ctx: upHeightCtx } = makeSurface(w, h);
+      upHeightCtx.imageSmoothingEnabled = true;
+      upHeightCtx.imageSmoothingQuality = 'high';
+      upHeightCtx.drawImage(
+        reliefHeightCtx.canvas as CanvasImageSource,
+        0,
+        0,
+        patchW,
+        patchH,
+        0,
+        0,
+        w,
+        h
+      );
+      const upHeightData = upHeightCtx.getImageData(0, 0, w, h).data;
+
+      metalCtx.save();
+      metalCtx.imageSmoothingEnabled = true;
+      metalCtx.imageSmoothingQuality = 'high';
+      metalCtx.drawImage(
+        reliefMetalCtx.canvas as CanvasImageSource,
+        0,
+        0,
+        patchW,
+        patchH,
+        0,
+        0,
+        w,
+        h
+      );
+      metalCtx.restore();
+
+      roughCtx.save();
+      roughCtx.imageSmoothingEnabled = true;
+      roughCtx.imageSmoothingQuality = 'high';
+      roughCtx.drawImage(
+        reliefRoughCtx.canvas as CanvasImageSource,
+        0,
+        0,
+        patchW,
+        patchH,
+        0,
+        0,
+        w,
+        h
+      );
+      roughCtx.restore();
+
+      // Regenerate Sobel Normal Map & Bump Map from updated 1024x1024 heightfield
+      const hybridNormalStrength = 3.8;
+      const sampleUpH = (x: number, y: number): number => {
+        const cx = x < 0 ? 0 : x >= w ? w - 1 : x;
+        const cy = y < 0 ? 0 : y >= h ? h - 1 : y;
+        return upHeightData[(cy * w + cx) * 4] / 255;
+      };
+
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const p4 = (y * w + x) * 4;
+          const tl = sampleUpH(x - 1, y - 1);
+          const tc = sampleUpH(x, y - 1);
+          const tr = sampleUpH(x + 1, y - 1);
+          const ml = sampleUpH(x - 1, y);
+          const mr = sampleUpH(x + 1, y);
+          const bl = sampleUpH(x - 1, y + 1);
+          const bc = sampleUpH(x, y + 1);
+          const br = sampleUpH(x + 1, y + 1);
+
+          const gx = tr + 2 * mr + br - (tl + 2 * ml + bl);
+          const gy = bl + 2 * bc + br - (tl + 2 * tc + tr);
+          const nx = -gx * hybridNormalStrength;
+          const ny = gy * hybridNormalStrength;
+          const nz = 1.0;
+          const invLen = 1 / Math.hypot(nx, ny, nz);
+
+          normalData.data[p4] = clampByte((nx * invLen * 0.5 + 0.5) * 255);
+          normalData.data[p4 + 1] = clampByte((ny * invLen * 0.5 + 0.5) * 255);
+          normalData.data[p4 + 2] = clampByte((nz * invLen * 0.5 + 0.5) * 255);
+          normalData.data[p4 + 3] = 255;
+
+          const hb = upHeightData[p4];
+          bumpData.data[p4] = hb;
+          bumpData.data[p4 + 1] = hb;
+          bumpData.data[p4 + 2] = hb;
+          bumpData.data[p4 + 3] = 255;
+        }
+      }
+
+      normalCtx.putImageData(normalData, 0, 0);
+      bumpCtx.putImageData(bumpData, 0, 0);
+
+      // Upload updated textures cleanly outside RAF
+      map.needsUpdate = true;
+      normalMap.needsUpdate = true;
+      bumpMap.needsUpdate = true;
+      roughnessMap.needsUpdate = true;
+      metalnessMap.needsUpdate = true;
+    };
+    patchImg.src = spec.uvPatchDataUrl;
+  }
+
   return bundle;
 }
 

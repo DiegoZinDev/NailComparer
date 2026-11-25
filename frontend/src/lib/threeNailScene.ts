@@ -7,6 +7,7 @@ import {
 } from './perFingerVisionAnalyzer';
 import {
   type ProceduralPBRBundle,
+  hashFingerSpec,
   synthesizeProceduralPBRBundle,
 } from './proceduralPBRSynthesizer';
 import type { ImageLayoutRect } from './nailRenderer';
@@ -28,12 +29,14 @@ export interface AmbientLightSample {
 }
 
 const SHAPE_LENGTH_MULT: Record<NailShape, number> = {
-  natural: 0.9,
-  square: 1.02,
-  almond: 1.1,
-  coffin: 1.18,
-  stiletto: 1.26,
+  natural: 1.0,
+  square: 1.22,
+  almond: 1.32,
+  coffin: 1.38,
+  stiletto: 1.48,
 };
+
+const HANDEDNESS_LOCK_FRAMES = 8;
 
 const ANATOMICAL_DISTAL_METERS: Record<FingerId, number> = {
   thumb: 0.029,
@@ -157,45 +160,46 @@ function createUndersideOcclusionTexture(): THREE.CanvasTexture {
   if (ctx) {
     // Base longitudinal gradient: v=1 (top of canvas, free tip) -> v=0 (bottom of canvas, hyponychium/skin base)
     const baseGrad = ctx.createLinearGradient(0, 0, 0, size);
-    baseGrad.addColorStop(0.0, '#FBF3EE'); // Milky pearl translucent free edge (v = 1)
-    baseGrad.addColorStop(0.38, '#F2DFD5'); // Soft rosy cream gel body
-    baseGrad.addColorStop(0.72, '#C89888'); // Warm translucent transition near hyponychium
-    baseGrad.addColorStop(0.9, '#8E5A4D'); // Deep warm skin-pocket AO shadow
-    baseGrad.addColorStop(1.0, '#5E362E'); // Hyponychium crease occlusion (v = 0)
+    baseGrad.addColorStop(0.0, '#FCF6F1'); // Translucent natural ivory/gel free edge (v = 1)
+    baseGrad.addColorStop(0.35, '#F4E5DC'); // Soft milky rosy-ivory gel body
+    baseGrad.addColorStop(0.68, '#CC9C8B'); // Warm translucent transition near hyponychium
+    baseGrad.addColorStop(0.88, '#8D584A'); // Deep warm hyponychium skin-pocket shadow
+    baseGrad.addColorStop(1.0, '#5A3128'); // Hyponychium crease occlusion (v = 0)
     ctx.fillStyle = baseGrad;
     ctx.fillRect(0, 0, size, size);
 
     // Subtle longitudinal micro-striations along v for authentic sculpted gel/nail underside fiber depth
     for (let x = 0; x < size; x += 2) {
       const wave = Math.sin(x * 0.45) * 0.5 + Math.cos(x * 1.15) * 0.5;
-      const alpha = 0.028 + Math.abs(wave) * 0.022;
+      const alpha = 0.025 + Math.abs(wave) * 0.02;
       ctx.fillStyle = wave >= 0 ? `rgba(255, 250, 246, ${alpha})` : `rgba(110, 68, 58, ${alpha})`;
       ctx.fillRect(x, 0, 1, size);
     }
 
-    // Soft lateral inner-margin occlusion darkening along u=0 and u=1 (C-curve sidewall shadow)
+    // Subtle internal C-curve sidewall shading along u near 0 and 1
     const sideGrad = ctx.createLinearGradient(0, 0, size, 0);
-    sideGrad.addColorStop(0.0, 'rgba(68, 36, 30, 0.52)');
-    sideGrad.addColorStop(0.14, 'rgba(84, 46, 38, 0.16)');
-    sideGrad.addColorStop(0.35, 'rgba(84, 46, 38, 0.0)');
-    sideGrad.addColorStop(0.65, 'rgba(84, 46, 38, 0.0)');
-    sideGrad.addColorStop(0.86, 'rgba(84, 46, 38, 0.16)');
-    sideGrad.addColorStop(1.0, 'rgba(68, 36, 30, 0.52)');
+    sideGrad.addColorStop(0.0, 'rgba(62, 32, 26, 0.58)');
+    sideGrad.addColorStop(0.12, 'rgba(84, 46, 38, 0.22)');
+    sideGrad.addColorStop(0.30, 'rgba(84, 46, 38, 0.04)');
+    sideGrad.addColorStop(0.50, 'rgba(84, 46, 38, 0.0)');
+    sideGrad.addColorStop(0.70, 'rgba(84, 46, 38, 0.04)');
+    sideGrad.addColorStop(0.88, 'rgba(84, 46, 38, 0.22)');
+    sideGrad.addColorStop(1.0, 'rgba(62, 32, 26, 0.58)');
     ctx.fillStyle = sideGrad;
     ctx.fillRect(0, 0, size, size);
 
-    // Warm radial hyponychium pocket AO at bottom-center (v -> 0)
+    // Warm hyponychium shadow at junction with finger pulp (v -> 0, canvas bottom)
     const hyponychiumAO = ctx.createRadialGradient(
       size * 0.5,
-      size * 1.02,
-      size * 0.05,
+      size * 1.01,
+      size * 0.04,
       size * 0.5,
-      size * 0.92,
-      size * 0.58
+      size * 0.90,
+      size * 0.62
     );
-    hyponychiumAO.addColorStop(0.0, 'rgba(52, 24, 20, 0.58)');
-    hyponychiumAO.addColorStop(0.55, 'rgba(78, 38, 32, 0.24)');
-    hyponychiumAO.addColorStop(1.0, 'rgba(78, 38, 32, 0.0)');
+    hyponychiumAO.addColorStop(0.0, 'rgba(48, 22, 18, 0.68)');
+    hyponychiumAO.addColorStop(0.45, 'rgba(76, 36, 28, 0.34)');
+    hyponychiumAO.addColorStop(1.0, 'rgba(76, 36, 28, 0.0)');
     ctx.fillStyle = hyponychiumAO;
     ctx.fillRect(0, 0, size, size);
   }
@@ -290,6 +294,10 @@ interface FingerRig {
   currentQuat: THREE.Quaternion;
   currentScale: THREE.Vector3;
   filteredDorsalNormal: THREE.Vector3;
+  normalFlipConfirmCount: number;
+  hasPrevRaw2D: boolean;
+  prevRawDip2D: { x: number; y: number };
+  prevRawTip2D: { x: number; y: number };
 }
 
 /**
@@ -325,7 +333,13 @@ export class ThreeNailScene {
   private handScaleFilter = new OneEuroFilter(0.9, 0.03, 1.0);
   private ready = false;
 
+  // Handedness hysteresis lock (requires HANDEDNESS_LOCK_FRAMES consecutive frames to switch Left <-> Right)
+  private lockedHandedness: 'Left' | 'Right' | null = null;
+  private pendingHandedness: 'Left' | 'Right' | null = null;
+  private pendingHandednessFrames = 0;
+
   // Design & PBR bundle cache — ensures zero texture creation or canvas drawing inside RAF
+  private lastDesignRef: NailDesign | null = null;
   private activeDesignKey = '';
   private cachedFingerSpecs: Record<FingerId, NailFingerDesignSpec> | null = null;
   private cachedPBRBundles = new Map<FingerId, ProceduralPBRBundle>();
@@ -503,6 +517,10 @@ export class ThreeNailScene {
           currentQuat: new THREE.Quaternion(),
           currentScale: new THREE.Vector3(1, 1, 1),
           filteredDorsalNormal: new THREE.Vector3(0, 0, 1),
+          normalFlipConfirmCount: 0,
+          hasPrevRaw2D: false,
+          prevRawDip2D: { x: 0, y: 0 },
+          prevRawTip2D: { x: 0, y: 0 },
         });
       }
 
@@ -557,6 +575,8 @@ export class ThreeNailScene {
     rig.proximalOccluder.mesh.visible = false;
     rig.middleOccluder.mesh.visible = false;
     rig.distalOccluder.mesh.visible = false;
+    rig.hasPrevRaw2D = false;
+    rig.normalFlipConfirmCount = 0;
     if (rig.initialized) {
       rig.initialized = false;
       rig.posFilters[0].reset();
@@ -576,6 +596,9 @@ export class ThreeNailScene {
       this.hideRig(rig);
     }
     this.handScaleFilter.reset();
+    this.lockedHandedness = null;
+    this.pendingHandedness = null;
+    this.pendingHandednessFrames = 0;
     this.renderer.clear();
   }
 
@@ -599,8 +622,16 @@ export class ThreeNailScene {
   }
 
   private computeDesignKey(design: NailDesign): string {
-    const fingerSpecsPart = design.fingerSpecs ? JSON.stringify(design.fingerSpecs) : '';
-    return `${design.id}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ?? ''}|${fingerSpecsPart}`;
+    let fingerSpecsPart = '';
+    if (design.fingerSpecs) {
+      const specs = design.fingerSpecs as Record<FingerId, NailFingerDesignSpec>;
+      fingerSpecsPart = ORDERED_FINGERS.map((id) => {
+        const s = specs[id];
+        if (!s) return '';
+        return `${id}:${s.shape}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}`;
+      }).join('~');
+    }
+    return `${design.id}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ? design.imageDataUrl.length : 0}|${fingerSpecsPart}`;
   }
 
   private paintMetallicOutlineOnBundle(
@@ -690,11 +721,16 @@ export class ThreeNailScene {
   }
 
   private ensureDesignPBRCache(design: NailDesign): void {
+    if (design === this.lastDesignRef && this.cachedFingerSpecs) {
+      return;
+    }
     const key = this.computeDesignKey(design);
     if (key === this.activeDesignKey && this.cachedFingerSpecs) {
+      this.lastDesignRef = design;
       return;
     }
 
+    this.lastDesignRef = design;
     this.activeDesignKey = key;
     const specs = buildFingerSpecsFromStudioDesign(design);
     this.cachedFingerSpecs = specs;
@@ -778,8 +814,8 @@ export class ThreeNailScene {
       occ.pos.copy(this.tmpOccCenter);
       occ.quat.copy(this.tmpOccQuat);
     } else {
-      occ.pos.lerp(this.tmpOccCenter, Math.max(0.35, slerpAlpha));
-      occ.quat.slerp(this.tmpOccQuat, Math.max(0.35, slerpAlpha));
+      occ.pos.lerp(this.tmpOccCenter, slerpAlpha);
+      occ.quat.slerp(this.tmpOccQuat, slerpAlpha);
     }
 
     occ.mesh.position.copy(occ.pos);
@@ -893,6 +929,31 @@ export class ThreeNailScene {
       Math.min(18000, this.handScaleFilter.filter(rawPxPerMeter, dt, 1.5))
     );
 
+    // Handedness hysteresis lock (8 consecutive frames required to flip Left <-> Right)
+    const rawHandedness = poses.find((p) => p.handedness)?.handedness ?? null;
+    if (rawHandedness) {
+      if (this.lockedHandedness === null) {
+        this.lockedHandedness = rawHandedness;
+        this.pendingHandedness = null;
+        this.pendingHandednessFrames = 0;
+      } else if (rawHandedness === this.lockedHandedness) {
+        this.pendingHandedness = null;
+        this.pendingHandednessFrames = 0;
+      } else {
+        if (this.pendingHandedness === rawHandedness) {
+          this.pendingHandednessFrames++;
+        } else {
+          this.pendingHandedness = rawHandedness;
+          this.pendingHandednessFrames = 1;
+        }
+        if (this.pendingHandednessFrames >= HANDEDNESS_LOCK_FRAMES) {
+          this.lockedHandedness = rawHandedness;
+          this.pendingHandedness = null;
+          this.pendingHandednessFrames = 0;
+        }
+      }
+    }
+
     for (const pose of poses) {
       const rig = this.fingerRigs.get(pose.id);
       // Strictly 1 unique rig per FingerId; ignore duplicate finger poses in the same frame
@@ -924,6 +985,20 @@ export class ThreeNailScene {
           .addScaledVector(this.tmpVecA.copy(this.tmpPip).sub(this.tmpDip), 1.35);
       }
 
+      // Raw 2D screen displacement check for Zero-Jitter Lock (< 1.2 px stationary lock)
+      const dipMove2D = rig.hasPrevRaw2D
+        ? Math.hypot(this.tmpDip.x - rig.prevRawDip2D.x, this.tmpDip.y - rig.prevRawDip2D.y)
+        : 999;
+      const tipMove2D = rig.hasPrevRaw2D
+        ? Math.hypot(this.tmpTip.x - rig.prevRawTip2D.x, this.tmpTip.y - rig.prevRawTip2D.y)
+        : 999;
+      const isStationary = rig.hasPrevRaw2D && dipMove2D < 1.2 && tipMove2D < 1.2;
+      rig.prevRawDip2D.x = this.tmpDip.x;
+      rig.prevRawDip2D.y = this.tmpDip.y;
+      rig.prevRawTip2D.x = this.tmpTip.x;
+      rig.prevRawTip2D.y = this.tmpTip.y;
+      rig.hasPrevRaw2D = true;
+
       // Finger axis Y = normalize(TIP - DIP) in full 3D (x, y, z)
       // NEVER reject or scale based on dist2D(DIP, TIP) so pointing at the lens never triggers triangular explosion!
       this.tmpAxisY.copy(this.tmpTip).sub(this.tmpDip);
@@ -935,6 +1010,8 @@ export class ThreeNailScene {
       }
       seenIds.add(pose.id);
       this.tmpAxisY.normalize();
+
+      const effectiveHandedness = this.lockedHandedness ?? pose.handedness ?? 'Right';
 
       // True 3D dorsal palm normal (never forced toward +Z when palm turns to face camera!)
       if (pose.palmNormal) {
@@ -948,7 +1025,7 @@ export class ThreeNailScene {
 
         // Convert vIndex x vPinky into outward dorsal normal (+Z local = back of hand, -Z local = palm)
         // for both Left/Right hands and mirrorX true/false
-        if (((pose.handedness ?? 'Right') === 'Right') !== mirrorX) {
+        if (((effectiveHandedness ?? 'Right') === 'Right') !== mirrorX) {
           this.tmpPalmNormal.negate();
         }
 
@@ -971,17 +1048,31 @@ export class ThreeNailScene {
         this.tmpPalmNormal.set(0, 0, 1);
       }
 
-      // Stabilize dorsalNormal via angular deadband (< 0.035 rad) + velocity-adaptive lerp
+      // Guard against isolated 1-frame spurious dorsalNormal inversion (dot < -0.5)
+      // while keeping gradual real hand rotation 100% fluid
       if (!rig.initialized) {
         rig.filteredDorsalNormal.copy(this.tmpPalmNormal);
+        rig.normalFlipConfirmCount = 0;
       } else {
         const dotN = Math.max(-1, Math.min(1, rig.filteredDorsalNormal.dot(this.tmpPalmNormal)));
-        const angleN = Math.acos(dotN);
-        const normalAlpha =
-          angleN < 0.035
-            ? 0.08
-            : Math.min(0.78, 0.22 + ((angleN - 0.035) / 0.28) * 0.56);
-        rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, normalAlpha).normalize();
+        if (dotN < -0.5) {
+          rig.normalFlipConfirmCount++;
+          if (rig.normalFlipConfirmCount < 3) {
+            this.tmpPalmNormal.copy(rig.filteredDorsalNormal);
+          } else {
+            rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, 0.35).normalize();
+            rig.normalFlipConfirmCount = 0;
+          }
+        } else {
+          rig.normalFlipConfirmCount = 0;
+          const angleN = Math.acos(dotN);
+          const normalAlpha = isStationary
+            ? 0.04
+            : angleN < 0.035
+              ? 0.08
+              : Math.min(0.78, 0.22 + ((angleN - 0.035) / 0.28) * 0.56);
+          rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, normalAlpha).normalize();
+        }
       }
       this.tmpPalmNormal.copy(rig.filteredDorsalNormal);
 
@@ -1024,7 +1115,7 @@ export class ThreeNailScene {
       const fingerSpec = this.cachedFingerSpecs?.[pose.id];
       const specLengthMult = Math.max(
         0.85,
-        Math.min(1.85, fingerSpec?.lengthMultiplier ?? fingerSpec?.relativeLength ?? 1.0)
+        Math.min(1.65, fingerSpec?.lengthMultiplier ?? fingerSpec?.relativeLength ?? 1.0)
       );
 
       const anatomicalW = pxPerMeter * (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138);
@@ -1037,32 +1128,29 @@ export class ThreeNailScene {
 
       const anatomicalDistal3D = pxPerMeter * (ANATOMICAL_DISTAL_METERS[pose.id] ?? 0.021);
       const stabilizedDistal3D = anatomicalDistal3D * 0.72 + segLen3D * 0.28;
-      const clampedBaseH = Math.max(
-        nailW * 1.12,
-        Math.min(nailW * 2.45, stabilizedDistal3D * 0.92)
+      // Natural nail plate (1.0x) = 0.58 * dist3D(DIP, TIP), absolute ceiling 1.65x
+      const naturalBaseH = 0.58 * stabilizedDistal3D;
+      const finalLengthMult = Math.min(
+        1.65,
+        Math.max(0.85, specLengthMult * shapeMult * adjustment.extensionLength)
       );
-      const nailH =
-        clampedBaseH *
-        specLengthMult *
-        adjustment.scale *
-        adjustment.extensionLength *
-        shapeMult;
+      const nailH = naturalBaseH * finalLengthMult * adjustment.scale;
       const nailDepth = nailW;
 
-      // Seat nail with 2mm cuticle embedding inside dorsal finger capsule while dorsal body clears capsule cleanly
-      const distalOccluderRadius = 1.12 * (nailW * 0.5);
-      const embed2mmPx = Math.min(
-        distalOccluderRadius * 0.24,
-        Math.max(1.5, 0.002 * pxPerMeter)
+      // Physical Z-Buffer Clearance:
+      // Ventral-shifted distal occluder (-0.22 * fingerThickness) + guaranteed >= 2.5px positive Z clearance
+      const fingerThickness = nailW * 0.96;
+      const distalOccluderRadius = Math.max(nailW * 0.52, fingerThickness * 0.50);
+      const ventralShift = 0.22 * fingerThickness;
+      const dorsalOffset = Math.max(
+        0.52 * fingerThickness,
+        distalOccluderRadius - ventralShift + 2.5
       );
-      const dorsalOffset = distalOccluderRadius - embed2mmPx * 0.35;
 
       this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, dorsalOffset);
       this.tmpTargetScale.set(nailW, nailH, nailDepth);
 
-      // High-stability One-Euro Filter:
-      // XY locked with minCutoff: 0.85, beta: 0.04, deadband: 0.35px
-      // Z wrist-relative smoothed with minCutoff: 0.65, beta: 0.02, deadband: 0.45px
+      // High-stability One-Euro Filter + Zero-Jitter Lock when stationary (< 1.2px raw movement)
       const wasInitialized = rig.initialized;
       let slerpAlpha = 0.22;
 
@@ -1080,9 +1168,19 @@ export class ThreeNailScene {
         rig.currentQuat.copy(this.tmpTargetQuat);
         rig.initialized = true;
       } else {
-        const fx = rig.posFilters[0].filter(this.tmpTargetPos.x, dt, 0.35);
-        const fy = rig.posFilters[1].filter(this.tmpTargetPos.y, dt, 0.35);
-        const fz = rig.posFilters[2].filter(this.tmpTargetPos.z, dt, 0.45);
+        const fedTargetX = isStationary
+          ? rig.currentPos.x * 0.92 + this.tmpTargetPos.x * 0.08
+          : this.tmpTargetPos.x;
+        const fedTargetY = isStationary
+          ? rig.currentPos.y * 0.92 + this.tmpTargetPos.y * 0.08
+          : this.tmpTargetPos.y;
+        const fedTargetZ = isStationary
+          ? rig.currentPos.z * 0.92 + this.tmpTargetPos.z * 0.08
+          : this.tmpTargetPos.z;
+
+        const fx = rig.posFilters[0].filter(fedTargetX, dt, isStationary ? 0.5 : 0.35);
+        const fy = rig.posFilters[1].filter(fedTargetY, dt, isStationary ? 0.5 : 0.35);
+        const fz = rig.posFilters[2].filter(fedTargetZ, dt, isStationary ? 0.6 : 0.45);
         const moveDist = Math.hypot(
           fx - rig.currentPos.x,
           fy - rig.currentPos.y,
@@ -1090,11 +1188,21 @@ export class ThreeNailScene {
         );
         rig.currentPos.set(fx, fy, fz);
 
+        const fedScaleX = isStationary
+          ? rig.currentScale.x * 0.92 + this.tmpTargetScale.x * 0.08
+          : this.tmpTargetScale.x;
+        const fedScaleY = isStationary
+          ? rig.currentScale.y * 0.92 + this.tmpTargetScale.y * 0.08
+          : this.tmpTargetScale.y;
+        const fedScaleZ = isStationary
+          ? rig.currentScale.z * 0.92 + this.tmpTargetScale.z * 0.08
+          : this.tmpTargetScale.z;
+
         const scaleDeadband = Math.max(0.18, nailW * 0.006);
         rig.currentScale.set(
-          rig.scaleFilters[0].filter(this.tmpTargetScale.x, dt, scaleDeadband),
-          rig.scaleFilters[1].filter(this.tmpTargetScale.y, dt, scaleDeadband),
-          rig.scaleFilters[2].filter(this.tmpTargetScale.z, dt, scaleDeadband)
+          rig.scaleFilters[0].filter(fedScaleX, dt, scaleDeadband),
+          rig.scaleFilters[1].filter(fedScaleY, dt, scaleDeadband),
+          rig.scaleFilters[2].filter(fedScaleZ, dt, scaleDeadband)
         );
 
         const angleDelta = rig.currentQuat.angleTo(this.tmpTargetQuat);
@@ -1107,6 +1215,9 @@ export class ThreeNailScene {
           // Low-latency adaptive slerp when hand turns deliberately
           const velocityNorm = Math.min(1, posSpeed * 0.16 + rotSpeed * 0.28);
           slerpAlpha = 0.24 + velocityNorm * (0.78 - 0.24);
+        }
+        if (isStationary) {
+          slerpAlpha *= 0.12;
         }
         rig.currentQuat.slerp(this.tmpTargetQuat, slerpAlpha);
       }
@@ -1140,6 +1251,7 @@ export class ThreeNailScene {
         (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138) / ANATOMICAL_WIDTH_METERS.index;
       const proximalRadius = distalOccluderRadius * 1.14 * Math.max(0.88, Math.min(1.12, fingerWidthRatio));
       const middleRadius = distalOccluderRadius * 1.06 * Math.max(0.9, Math.min(1.1, fingerWidthRatio));
+      const occSlerpAlpha = isStationary ? slerpAlpha : Math.max(0.35, slerpAlpha);
 
       // 1. Proximal phalanx (MCP -> PIP)
       this.updatePhalanxOccluder(
@@ -1147,7 +1259,7 @@ export class ThreeNailScene {
         this.tmpMcp,
         this.tmpPip,
         proximalRadius,
-        slerpAlpha,
+        occSlerpAlpha,
         wasInitialized
       );
 
@@ -1157,20 +1269,26 @@ export class ThreeNailScene {
         this.tmpPip,
         this.tmpDip,
         middleRadius,
-        slerpAlpha,
+        occSlerpAlpha,
         wasInitialized
       );
 
-      // 3. Distal phalanx (DIP -> TIP + 18%): extends +18% beyond TIP landmark to cover full fleshy fingertip pulp
+      // 3. Distal phalanx (DIP -> TIP + 4%): ends strictly at TIP + 0.04*(TIP-DIP) and shifted ventrally (-0.22 * fingerThickness)
       this.tmpVecA
         .copy(this.tmpDip)
-        .addScaledVector(this.tmpVecB.copy(this.tmpTip).sub(this.tmpDip), 1.18);
+        .addScaledVector(this.tmpAxisZ, -ventralShift);
+      this.tmpVecB
+        .copy(this.tmpTip)
+        .sub(this.tmpDip)
+        .multiplyScalar(1.04)
+        .add(this.tmpDip)
+        .addScaledVector(this.tmpAxisZ, -ventralShift);
       this.updatePhalanxOccluder(
         rig.distalOccluder,
-        this.tmpDip,
         this.tmpVecA,
+        this.tmpVecB,
         distalOccluderRadius,
-        slerpAlpha,
+        occSlerpAlpha,
         wasInitialized
       );
     }

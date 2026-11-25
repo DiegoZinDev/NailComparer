@@ -20,6 +20,8 @@ export type NailFingerDesignSpec = BaseNailFingerDesignSpec & {
   lengthMultiplier?: number;
   hasMetallicOutline?: boolean;
   outlineColor?: string;
+  uvPatchDataUrl?: string;
+  isImportedReference?: boolean;
 };
 
 export type ExtendedNailFingerDesignSpec = NailFingerDesignSpec;
@@ -209,35 +211,288 @@ function classifyExtensionFromAspectRatio(aspectRatio: number): {
     const t = Math.max(0, Math.min(1, (ar - 0.85) / (1.30 - 0.85)));
     return {
       extensionLevel: 'Curta/Natural',
-      lengthMultiplier: Number((0.85 + t * (1.02 - 0.85)).toFixed(2)),
+      lengthMultiplier: Number(Math.min(1.65, 0.85 + t * (1.02 - 0.85)).toFixed(2)),
     };
   }
   if (ar < 1.72) {
     const t = Math.max(0, Math.min(1, (ar - 1.30) / (1.72 - 1.30)));
     return {
       extensionLevel: 'Pouco Alongada',
-      lengthMultiplier: Number((1.05 + t * (1.25 - 1.05)).toFixed(2)),
+      lengthMultiplier: Number(Math.min(1.65, 1.04 + t * (1.22 - 1.04)).toFixed(2)),
     };
   }
   if (ar < 2.25) {
     const t = Math.max(0, Math.min(1, (ar - 1.72) / (2.25 - 1.72)));
     return {
       extensionLevel: 'Alongada',
-      lengthMultiplier: Number((1.28 + t * (1.52 - 1.28)).toFixed(2)),
+      lengthMultiplier: Number(Math.min(1.65, 1.24 + t * (1.44 - 1.24)).toFixed(2)),
     };
   }
   const t = Math.max(0, Math.min(1, (ar - 2.25) / (3.10 - 2.25)));
   return {
     extensionLevel: 'Muito Alongada (Extrema)',
-    lengthMultiplier: Number((1.55 + t * (1.85 - 1.55)).toFixed(2)),
+    lengthMultiplier: Number(Math.min(1.65, 1.46 + t * (1.65 - 1.46)).toFixed(2)),
   };
 }
 
 function classifyExtensionFromMultiplier(lengthMultiplier: number): NailExtensionLevel {
   if (lengthMultiplier <= 1.03) return 'Curta/Natural';
-  if (lengthMultiplier <= 1.26) return 'Pouco Alongada';
-  if (lengthMultiplier <= 1.53) return 'Alongada';
+  if (lengthMultiplier <= 1.23) return 'Pouco Alongada';
+  if (lengthMultiplier <= 1.45) return 'Alongada';
   return 'Muito Alongada (Extrema)';
+}
+
+/**
+ * Generates a rectified 256×256 UV patch strictly from the central 70% of the segmented nail plate
+ * using bilinear sampling directly from the source image, followed by chromaticity-preserving
+ * Retinex / high-pass lighting equalization to suppress harsh shadows and blown highlights.
+ * Orientation: u = 0..1 (left->right), v = 0..1 (cuticle at canvas bottom -> tip at canvas top).
+ */
+function buildRectifiedNailUVPatch(
+  img: HTMLImageElement,
+  rowLeft: Int16Array,
+  rowRight: Int16Array,
+  minY: number,
+  maxY: number,
+  roiW: number,
+  roiH: number,
+  anchorX: number,
+  anchorY: number,
+  scale: number,
+  angleRad: number
+): string | undefined {
+  const nailLen = maxY - minY;
+  if (nailLen < 8) return undefined;
+
+  const imgW = img.naturalWidth;
+  const imgH = img.naturalHeight;
+  if (!imgW || !imgH) return undefined;
+
+  // Smooth segmented left/right boundaries across Y to prevent jagged scanlines
+  const smoothL = new Float32Array(roiH);
+  const smoothR = new Float32Array(roiH);
+  for (let y = minY; y <= maxY; y++) {
+    let accL = 0;
+    let accR = 0;
+    let cnt = 0;
+    for (let dy = -2; dy <= 2; dy++) {
+      const yy = Math.max(minY, Math.min(maxY, y + dy));
+      if (rowLeft[yy] >= 0 && rowRight[yy] > rowLeft[yy]) {
+        accL += rowLeft[yy];
+        accR += rowRight[yy];
+        cnt++;
+      }
+    }
+    smoothL[y] = cnt > 0 ? accL / cnt : roiW * 0.34;
+    smoothR[y] = cnt > 0 ? accR / cnt : roiW * 0.66;
+  }
+
+  const cosA = Math.cos(angleRad);
+  const sinA = Math.sin(angleRad);
+  const roiToImg = (rx: number, ry: number): [number, number] => {
+    const ux = (rx - roiW * 0.5) / scale;
+    const uy = (ry - roiH * 0.5) / scale;
+    return [anchorX + cosA * ux - sinA * uy, anchorY + sinA * ux + cosA * uy];
+  };
+
+  // Compute tight source bounding box covering the central 70% plate region
+  let minSrcX = imgW;
+  let maxSrcX = 0;
+  let minSrcY = imgH;
+  let maxSrcY = 0;
+  const yStart = minY + nailLen * 0.15;
+  const yEnd = maxY - nailLen * 0.15;
+  for (const ry of [yStart, (yStart + yEnd) * 0.5, yEnd]) {
+    const yi = Math.max(minY, Math.min(maxY, Math.round(ry)));
+    const l = smoothL[yi];
+    const r = smoothR[yi];
+    const span = r - l;
+    for (const rx of [l + span * 0.15, r - span * 0.15]) {
+      const [sx, sy] = roiToImg(rx, ry);
+      if (sx < minSrcX) minSrcX = sx;
+      if (sx > maxSrcX) maxSrcX = sx;
+      if (sy < minSrcY) minSrcY = sy;
+      if (sy > maxSrcY) maxSrcY = sy;
+    }
+  }
+
+  const pad = 6;
+  const bx = Math.max(0, Math.floor(minSrcX - pad));
+  const by = Math.max(0, Math.floor(minSrcY - pad));
+  const bx2 = Math.min(imgW, Math.ceil(maxSrcX + pad));
+  const by2 = Math.min(imgH, Math.ceil(maxSrcY + pad));
+  const bw = Math.max(4, bx2 - bx);
+  const bh = Math.max(4, by2 - by);
+
+  const { ctx: cropCtx } = createScratchCanvas(bw, bh);
+  cropCtx.drawImage(img, bx, by, bw, bh, 0, 0, bw, bh);
+  const srcData = cropCtx.getImageData(0, 0, bw, bh).data;
+
+  const size = 256;
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = size;
+  outCanvas.height = size;
+  const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
+  if (!outCtx) return undefined;
+
+  const outImg = outCtx.createImageData(size, size);
+  const patchRGB = new Float32Array(size * size * 3);
+  const patchLuma = new Float32Array(size * size);
+
+  // 1. Bilinear sampling strictly over central 70% of nail plate (uPlate, vPlate ∈ [0.15, 0.85])
+  for (let py = 0; py < size; py++) {
+    // py = 0 is top of canvas (v = 1 tip), py = size-1 is bottom of canvas (v = 0 cuticle)
+    const v = 1 - py / (size - 1);
+    const vPlate = 0.15 + v * 0.70;
+    const ry = maxY - vPlate * nailLen;
+    const y0 = Math.max(minY, Math.min(maxY, Math.floor(ry)));
+    const y1 = Math.max(minY, Math.min(maxY, y0 + 1));
+    const fy = Math.max(0, Math.min(1, ry - y0));
+
+    const l0 = smoothL[y0];
+    const r0 = smoothR[y0];
+    const l1 = smoothL[y1];
+    const r1 = smoothR[y1];
+    const lx = l0 + (l1 - l0) * fy;
+    const rx = r0 + (r1 - r0) * fy;
+    const span = Math.max(2, rx - lx);
+
+    for (let px = 0; px < size; px++) {
+      const u = px / (size - 1);
+      const uPlate = 0.15 + u * 0.70;
+      const rxf = lx + uPlate * span;
+      const [sxAbs, syAbs] = roiToImg(rxf, ry);
+
+      const sx = Math.max(0, Math.min(bw - 1.001, sxAbs - bx));
+      const sy = Math.max(0, Math.min(bh - 1.001, syAbs - by));
+      const ix = Math.floor(sx);
+      const iy = Math.floor(sy);
+      const tx = sx - ix;
+      const ty = sy - iy;
+
+      const idx00 = (iy * bw + ix) * 4;
+      const idx10 = (iy * bw + Math.min(bw - 1, ix + 1)) * 4;
+      const idx01 = (Math.min(bh - 1, iy + 1) * bw + ix) * 4;
+      const idx11 = (Math.min(bh - 1, iy + 1) * bw + Math.min(bw - 1, ix + 1)) * 4;
+
+      const w00 = (1 - tx) * (1 - ty);
+      const w10 = tx * (1 - ty);
+      const w01 = (1 - tx) * ty;
+      const w11 = tx * ty;
+
+      const r =
+        srcData[idx00] * w00 +
+        srcData[idx10] * w10 +
+        srcData[idx01] * w01 +
+        srcData[idx11] * w11;
+      const g =
+        srcData[idx00 + 1] * w00 +
+        srcData[idx10 + 1] * w10 +
+        srcData[idx01 + 1] * w01 +
+        srcData[idx11 + 1] * w11;
+      const b =
+        srcData[idx00 + 2] * w00 +
+        srcData[idx10 + 2] * w10 +
+        srcData[idx01 + 2] * w01 +
+        srcData[idx11 + 2] * w11;
+
+      const pIdx = py * size + px;
+      patchRGB[pIdx * 3] = r;
+      patchRGB[pIdx * 3 + 1] = g;
+      patchRGB[pIdx * 3 + 2] = b;
+      patchLuma[pIdx] = 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+  }
+
+  // 2. Separable low-frequency illumination field estimation (2-pass box blur radius = 28)
+  const boxBlur = (src: Float32Array, radius: number): Float32Array => {
+    const tmp = new Float32Array(size * size);
+    const dst = new Float32Array(size * size);
+    const win = radius * 2 + 1;
+
+    // Horizontal pass
+    for (let y = 0; y < size; y++) {
+      let sum = 0;
+      for (let k = -radius; k <= radius; k++) {
+        sum += src[y * size + Math.max(0, Math.min(size - 1, k))];
+      }
+      for (let x = 0; x < size; x++) {
+        tmp[y * size + x] = sum / win;
+        const addX = Math.min(size - 1, x + radius + 1);
+        const remX = Math.max(0, x - radius);
+        sum += src[y * size + addX] - src[y * size + remX];
+      }
+    }
+
+    // Vertical pass
+    for (let x = 0; x < size; x++) {
+      let sum = 0;
+      for (let k = -radius; k <= radius; k++) {
+        sum += tmp[Math.max(0, Math.min(size - 1, k)) * size + x];
+      }
+      for (let y = 0; y < size; y++) {
+        dst[y * size + x] = sum / win;
+        const addY = Math.min(size - 1, y + radius + 1);
+        const remY = Math.max(0, y - radius);
+        sum += tmp[addY * size + x] - tmp[remY * size + x];
+      }
+    }
+    return dst;
+  };
+
+  const blurPass1 = boxBlur(patchLuma, 28);
+  const lowFreqLuma = boxBlur(blurPass1, 20);
+
+  let lumaMean = 0;
+  for (let i = 0; i < patchLuma.length; i++) lumaMean += patchLuma[i];
+  lumaMean /= patchLuma.length;
+  const targetMean = Math.max(55, Math.min(205, lumaMean));
+
+  // 3. Chromaticity-preserving Retinex lighting normalization + gentle specular glare roll-off
+  const outBytes = outImg.data;
+  for (let i = 0; i < size * size; i++) {
+    const r = patchRGB[i * 3];
+    const g = patchRGB[i * 3 + 1];
+    const b = patchRGB[i * 3 + 2];
+    const lum = patchLuma[i];
+    const low = Math.max(18, lowFreqLuma[i]);
+
+    // Gentle inverse illumination gain (exponent 0.56 keeps dark/light polish identity intact)
+    const ratio = targetMean / low;
+    const gain = Math.max(0.72, Math.min(1.38, Math.pow(ratio, 0.56)));
+
+    let rr = r * gain;
+    let gg = g * gain;
+    let bb = b * gain;
+
+    // Gentle glare compression for blown-out low-saturation specular streaks
+    const maxC = Math.max(r, g, b);
+    const minC = Math.min(r, g, b);
+    const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+    if (lum > 230 && sat < 0.14) {
+      const glareMix = Math.min(0.45, ((lum - 230) / 25) * 0.45);
+      const localTarget = Math.min(218, low * gain);
+      const scaleGlare = localTarget / Math.max(1, lum * gain);
+      rr = rr * (1 - glareMix) + rr * scaleGlare * glareMix;
+      gg = gg * (1 - glareMix) + gg * scaleGlare * glareMix;
+      bb = bb * (1 - glareMix) + bb * scaleGlare * glareMix;
+    }
+
+    const p4 = i * 4;
+    outBytes[p4] = Math.max(0, Math.min(255, Math.round(rr)));
+    outBytes[p4 + 1] = Math.max(0, Math.min(255, Math.round(gg)));
+    outBytes[p4 + 2] = Math.max(0, Math.min(255, Math.round(bb)));
+    outBytes[p4 + 3] = 255;
+  }
+
+  outCtx.putImageData(outImg, 0, 0);
+  try {
+    const webp = outCanvas.toDataURL('image/webp', 0.90);
+    if (webp.startsWith('data:image/webp')) return webp;
+  } catch {
+    // Fallback to PNG below
+  }
+  return outCanvas.toDataURL('image/png');
 }
 
 /**
@@ -257,7 +512,7 @@ function analyzeSingleNailROI(
   const imgH = img.naturalHeight;
   const cfg = FINGER_LANDMARKS[fingerId];
 
-  const defaultMult = Number(Math.max(0.85, Math.min(1.85, cfg.defaultLength)).toFixed(2));
+  const defaultMult = Number(Math.max(0.85, Math.min(1.65, cfg.defaultLength)).toFixed(2));
   const defaultSpec: NailFingerDesignSpec = {
     fingerId,
     detectedFromPhoto,
@@ -276,6 +531,7 @@ function analyzeSingleNailROI(
     strokeAnchors: [],
     metallicIntensity: 0.12,
     glossIntensity: 0.92,
+    isImportedReference: true,
   };
 
   try {
@@ -907,6 +1163,20 @@ function analyzeSingleNailROI(
             ? 0.45
             : 0.08;
 
+    const uvPatchDataUrl = buildRectifiedNailUVPatch(
+      img,
+      rowLeft,
+      rowRight,
+      minY,
+      maxY,
+      roiW,
+      roiH,
+      anchorX,
+      anchorY,
+      scale,
+      angleRad
+    );
+
     return {
       fingerId,
       detectedFromPhoto,
@@ -928,6 +1198,8 @@ function analyzeSingleNailROI(
           : defaultAnchorsForPattern(pattern),
       metallicIntensity,
       glossIntensity: pattern === 'chrome_mirror' ? 1.0 : 0.94,
+      uvPatchDataUrl,
+      isImportedReference: true,
     };
   } catch {
     return defaultSpec;
@@ -1065,7 +1337,7 @@ function applyHarmonicInheritance(
       Math.max(
         0.85,
         Math.min(
-          1.85,
+          1.65,
           (donor.lengthMultiplier ?? donor.relativeLength) * (cfg.defaultLength / 1.0)
         )
       ).toFixed(2)
@@ -1084,6 +1356,8 @@ function applyHarmonicInheritance(
       hasMetallicOutline: donor.hasMetallicOutline ?? false,
       outlineColor: donor.outlineColor,
       pattern: inheritedPattern,
+      uvPatchDataUrl: donor.uvPatchDataUrl,
+      isImportedReference: donor.isImportedReference ?? true,
       strokeAnchors:
         inheritedPattern === 'gold_3d_waves' || inheritedPattern === 'floral_accent'
           ? donor.strokeAnchors.length > 0
@@ -1233,7 +1507,7 @@ export function buildFingerSpecsFromStudioDesign(
     pattern = 'aura_gradient';
 
   const shape: NailShape = design.detectedShape ?? 'almond';
-  const baseLen = Math.max(0.85, Math.min(1.85, design.detectedLength ?? 1.05));
+  const baseLen = Math.max(0.85, Math.min(1.65, design.detectedLength ?? 1.05));
   const metallicIntensity =
     design.finish === 'chrome' || pattern === 'chrome_mirror'
       ? 0.9
@@ -1246,7 +1520,7 @@ export function buildFingerSpecsFromStudioDesign(
   for (const id of ORDERED_FINGERS) {
     const cfg = FINGER_LANDMARKS[id];
     const fingerLenMult = Number(
-      Math.max(0.85, Math.min(1.85, baseLen * cfg.defaultLength)).toFixed(2)
+      Math.max(0.85, Math.min(1.65, baseLen * cfg.defaultLength)).toFixed(2)
     );
     map[id] = {
       fingerId: id,

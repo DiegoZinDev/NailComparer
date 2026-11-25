@@ -10,47 +10,44 @@ const ROWS = 30;
  */
 export function evalNailHalfWidth(v: number, shape: NailShape): number {
   const cuticleCurve =
-    v < 0.18 ? 0.22 + 0.28 * Math.sin((v / 0.18) * (Math.PI / 2)) : 0.5;
+    v < 0.14 ? 0.30 + 0.20 * Math.sin((v / 0.14) * (Math.PI / 2)) : 0.5;
+
+  // Keep 100% of full base width across the entire natural nail bed (v <= 0.55)
+  // so no side skin is ever exposed; lateral tapering begins strictly past v > 0.55.
+  if (v <= 0.55) {
+    return cuticleCurve;
+  }
 
   if (shape === 'natural') {
     if (v > 0.68) {
       const t = (v - 0.68) / 0.32;
       return 0.5 * Math.sqrt(Math.max(0.02, 1 - t * t));
     }
-    return cuticleCurve;
+    return 0.5;
   }
 
   if (shape === 'square') {
     if (v > 0.92) {
       const t = (v - 0.92) / 0.08;
-      return 0.48 * (1 - 0.14 * t * t);
+      return 0.5 * (1 - 0.12 * t * t);
     }
-    return Math.min(0.49, cuticleCurve * 0.98);
+    return 0.5;
   }
 
   if (shape === 'coffin') {
-    if (v > 0.34) {
-      const t = (v - 0.34) / 0.66;
-      const base = 0.5 * (1 - 0.46 * Math.pow(t, 1.18));
-      return v > 0.96 ? base * (1 - ((v - 0.96) / 0.04) * 0.12) : base;
-    }
-    return cuticleCurve;
+    const t = (v - 0.55) / 0.45;
+    const base = 0.5 * (1 - 0.48 * Math.pow(t, 1.15));
+    return v > 0.96 ? base * (1 - ((v - 0.96) / 0.04) * 0.10) : base;
   }
 
   if (shape === 'stiletto') {
-    if (v > 0.28) {
-      const t = (v - 0.28) / 0.72;
-      return Math.max(0.022, 0.5 * Math.pow(1 - t, 1.15));
-    }
-    return cuticleCurve;
+    const t = (v - 0.55) / 0.45;
+    return Math.max(0.028, 0.5 * Math.pow(1 - t, 1.18));
   }
 
   // Almond (default)
-  if (v > 0.38) {
-    const t = (v - 0.38) / 0.62;
-    return Math.max(0.03, 0.5 * Math.pow(Math.cos(t * (Math.PI / 2)), 0.78));
-  }
-  return cuticleCurve;
+  const t = (v - 0.55) / 0.45;
+  return Math.max(0.035, 0.5 * Math.pow(Math.cos(t * (Math.PI / 2)), 0.72));
 }
 
 /**
@@ -71,12 +68,12 @@ function evalGelApexZ(v: number, lengthRatio: number): number {
 
 /**
  * Evaluates sculpted gel thickness (between dorsal and ventral shells).
- * ≈ 0.048 at structural apex, ≈ 0.036 at free edge, tapering flush at cuticle (v = 0).
+ * ≈ 0.048 at structural apex, ≈ 0.036 at free edge, tapering softly at cuticle (v = 0).
  */
 function evalShellThickness(v: number): number {
   if (v < 0.14) {
     const t = v / 0.14;
-    return 0.008 + 0.040 * (t * t * (3 - 2 * t));
+    return 0.010 + 0.038 * (t * t * (3 - 2 * t));
   }
   if (v <= 0.38) {
     return 0.048;
@@ -86,11 +83,11 @@ function evalShellThickness(v: number): number {
 }
 
 /**
- * Volumetric 3D Nail Mesh with Real Hollow/Concave Underside (V5):
+ * Volumetric 3D Nail Mesh with Real Hollow/Concave Underside (V8):
  * Returns a multi-material closed 3D `THREE.BufferGeometry` with 2 geometry groups:
- * - Group 0 (`materialIndex: 0`): Dorsal sculpted gel shell (24 × 30 grid) + closed lateral & free-edge thickness walls
- * - Group 1 (`materialIndex: 1`): Concave hollowed underside (`v ∈ [0.42, 1.0]`) arching inward along the transverse C-curve
- *   so sideways / underside tilts reveal the authentic translucent milky-gel underside of a salon extension!
+ * - Group 0 (`materialIndex: 0`): Dorsal sculpted gel shell (24 × 30 grid) + closed lateral, proximal & free-edge thickness walls
+ * - Group 1 (`materialIndex: 1`): Concave hollowed underside (`v ∈ [0.36, 1.0]`) arching inward along the transverse C-curve
+ *   with continuous subtle lateral sidewall thickness so sideways / palm-facing tilts reveal an authentic sculpted gel underside!
  *
  * Local coordinate convention:
  * - Origin `(0, 0, 0)` is centered at the proximal cuticle base
@@ -107,7 +104,7 @@ export function createVolumetricNailGeometry(
   const rows = ROWS;
   const stride = cols + 1;
   const gridVertexCount = (rows + 1) * stride;
-  const hollowStartRow = Math.round(rows * 0.42); // v >= 0.42 is free-edge extension underside
+  const hollowStartRow = Math.round(rows * 0.36); // v ~ 0.36 starts smooth concave underside
 
   const topPositions: number[] = [];
   const topUVs: number[] = [];
@@ -120,16 +117,15 @@ export function createVolumetricNailGeometry(
     const apexZ = evalGelApexZ(v, lengthRatio);
     const thickness = evalShellThickness(v);
 
-    // Smoothly plunge proximal cuticle margin (v < 0.14) into -Z so v = 0 sits ~2mm embedded inside
-    // the dorsal finger capsule, while v >= 0.14 emerges smoothly above the skin without gaps or steps.
+    // Ultra-gentle cuticle seating (<= 0.015) so cuticle seats organically without sinking into Z-buffer
     const cuticleTuck =
       v < 0.14
-        ? -0.105 * Math.pow(Math.cos((v / 0.14) * (Math.PI / 2)), 1.4)
+        ? -0.014 * Math.pow(Math.cos((v / 0.14) * (Math.PI / 2)), 1.4)
         : 0;
 
-    // Extra concave hollow arch beneath the free edge (v ∈ [0.42, 1.0])
+    // Smooth concave hollow arch beneath the free edge (v ∈ [0.36, 1.0])
     const hollowProgress =
-      v <= 0.42 ? 0 : Math.sin(Math.min(1, (v - 0.42) / 0.58) * (Math.PI / 2));
+      v <= 0.36 ? 0 : Math.sin(Math.min(1, (v - 0.36) / 0.64) * (Math.PI / 2));
 
     // Clean longitudinal UV for Group 1 underside: v ∈ [0, 1] from hyponychium base to free-edge tip
     const vUnderside =
@@ -141,16 +137,17 @@ export function createVolumetricNailGeometry(
       const x = s * halfW;
       const y = v * lengthRatio;
 
-      // Smooth lateral thickness taper to exactly 0 at u = 0 and u = 1 so dorsal & ventral shells fuse cleanly
+      // Subtle continuous lateral edge thickness (never paper-thin 0 at u=0/1)
+      const edgeMin = v < 0.14 ? 0.18 : 0.28;
       const lateralTaper =
-        c === 0 || c === cols ? 0 : Math.pow(Math.max(0, Math.sin(Math.PI * uParam)), 0.55);
+        edgeMin + (1 - edgeMin) * Math.pow(Math.max(0, Math.sin(Math.PI * uParam)), 0.55);
 
       // Transverse C-Curve (Arco C)
       const zCCurve = -cCurveDepth * (1 - Math.cos(s * Math.PI * 0.48));
       const zTop = zCCurve + apexZ + cuticleTuck;
 
-      // Ventral concave hollow: center thins slightly more than lateral sidewalls for real C-tunnel depth
-      const centerConcavity = (1 - s * s) * 0.014 * hollowProgress * lateralTaper;
+      // Ventral concave hollow: center arches gently upward (+Z) relative to sidewalls for authentic C-tunnel depth
+      const centerConcavity = (1 - s * s) * 0.016 * hollowProgress;
       const zBot = zTop - thickness * lateralTaper + centerConcavity;
 
       const uTop = Math.max(0.01, Math.min(0.99, 0.5 + x * 0.96));
@@ -198,8 +195,7 @@ export function createVolumetricNailGeometry(
     }
   }
 
-  // Dedicated duplicated vertices for crisp free-edge & proximal thickness wall normals (Group 0)
-  // Note: lateral edges (u = 0 and u = 1) taper to thickness = 0 so dorsal & ventral shells meet cleanly.
+  // Dedicated duplicated vertices for crisp free-edge, lateral, & proximal thickness wall normals (Group 0)
   const pushRimQuad = (topA: number, topB: number, botA: number, botB: number) => {
     const base = positions.length / 3;
     const copyVert = (srcIdx: number) => {
@@ -225,10 +221,24 @@ export function createVolumetricNailGeometry(
     pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
   }
 
-  // 4) Proximal cuticle base cap (r = 0, walking c = 0 -> cols) to guarantee a watertight closed shell
+  // 4) Proximal cuticle base cap (r = 0, walking c = 0 -> cols)
   for (let c = 0; c < cols; c++) {
     const t0 = c;
     const t1 = c + 1;
+    pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
+  }
+
+  // 5) Left lateral thickness wall (c = 0, walking r = rows -> 0)
+  for (let r = rows; r > 0; r--) {
+    const t0 = r * stride;
+    const t1 = (r - 1) * stride;
+    pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
+  }
+
+  // 6) Right lateral thickness wall (c = cols, walking r = 0 -> rows)
+  for (let r = 0; r < rows; r++) {
+    const t0 = r * stride + cols;
+    const t1 = (r + 1) * stride + cols;
     pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
   }
 
