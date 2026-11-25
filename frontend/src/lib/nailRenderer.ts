@@ -57,6 +57,7 @@ export const MEDIAPIPE_FINGER_PAIRS: Array<{
 
 const SHAPE_LENGTH_FACTOR: Record<NailShape, number> = {
   natural: 0.88,
+  oval: 0.96,
   square: 1.0,
   almond: 1.08,
   coffin: 1.16,
@@ -125,6 +126,13 @@ function traceCuticleAnchoredNailPath(
     ctx.bezierCurveTo(hw * 0.94, -h * 0.86, hw * 0.62, -h, 0, -h);
     ctx.bezierCurveTo(-hw * 0.62, -h, -hw * 0.94, -h * 0.86, -hw * 0.95, -h * 0.56);
     ctx.bezierCurveTo(-hw * 0.96, -h * 0.14, -hw * 0.72, 0, 0, 0);
+  } else if (shape === 'oval') {
+    // Classic rounded oval silhouette
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(hw * 0.72, 0, hw * 0.97, -h * 0.14, hw * 0.96, -h * 0.50);
+    ctx.bezierCurveTo(hw * 0.95, -h * 0.82, hw * 0.54, -h * 1.0, 0, -h * 1.0);
+    ctx.bezierCurveTo(-hw * 0.54, -h * 1.0, -hw * 0.95, -h * 0.82, -hw * 0.96, -h * 0.50);
+    ctx.bezierCurveTo(-hw * 0.97, -h * 0.14, -hw * 0.72, 0, 0, 0);
   } else if (shape === 'square') {
     // Crisp salon square extension with softly beveled corners
     ctx.moveTo(0, 0);

@@ -1,5 +1,30 @@
 import * as THREE from 'three';
-import { createVolumetricNailGeometry, evalNailHalfWidth } from './nail3DGeometry';
+import {
+  FINGER_LANDMARK_INDICES,
+  HAND_LANDMARK_COUNT,
+  HandSkeletonFilter,
+  WRIST,
+  computeFingerAnatomicalBasis,
+  computeFingerMetricDimensions,
+  projectHandToPerspectiveMeters,
+} from './handKinematics';
+import {
+  createCuticleContactSkirtGeometry,
+  createVolumetricNailGeometry,
+  evalNailHalfWidth,
+} from './nail3DGeometry';
+import type { ImageLayoutRect } from './nailRenderer';
+import {
+  type CuticleSkirtMaterialBundle,
+  type DirectionalAmbientLightSample,
+  type UndersideMaterialBundle,
+  applyDorsalMaterialOpacity,
+  createCuticleContactSkirtMaterial,
+  createDorsalNailMaterial,
+  createStudioRoomEnvMap,
+  createUndersideNailMaterial,
+  updateUndersideMaterialTint,
+} from './nailShaderMaterials';
 import {
   ORDERED_FINGERS,
   buildFingerSpecsFromStudioDesign,
@@ -10,405 +35,148 @@ import {
   hashFingerSpec,
   synthesizeProceduralPBRBundle,
 } from './proceduralPBRSynthesizer';
-import type { ImageLayoutRect } from './nailRenderer';
 import type {
   FingerId,
-  FingerPose,
+  HandSkeletonFrame,
   NailAdjustment,
   NailDesign,
   NailShape,
 } from '../types/nail';
 
-export interface AmbientLightSample {
-  /** Normalized skin/room tint RGB (0..1) */
-  r: number;
-  g: number;
-  b: number;
-  /** Normalized room luminance (0..1) */
-  luma: number;
-}
-
-const SHAPE_LENGTH_MULT: Record<NailShape, number> = {
-  natural: 1.0,
-  square: 1.22,
-  almond: 1.32,
-  coffin: 1.38,
-  stiletto: 1.48,
-};
-
-const HANDEDNESS_LOCK_FRAMES = 8;
-
-const ANATOMICAL_DISTAL_METERS: Record<FingerId, number> = {
-  thumb: 0.029,
-  index: 0.021,
-  middle: 0.023,
-  ring: 0.021,
-  pinky: 0.0175,
-};
-
-const ANATOMICAL_WIDTH_METERS: Record<FingerId, number> = {
-  thumb: 0.0175,
-  index: 0.0138,
-  middle: 0.0144,
-  ring: 0.0132,
-  pinky: 0.0108,
-};
-
-const PALM_WRIST_TO_MIDDLE_MCP_METERS = 0.085;
+const PERSPECTIVE_FOV_DEG = 58;
+const PERSPECTIVE_NEAR = 0.01;
+const PERSPECTIVE_FAR = 10.0;
 
 /**
- * Generates an in-memory Softbox Studio Environment Map using THREE.PMREMGenerator
- * (zero external HDRI network calls, works 100% offline!).
+ * 7-point perimeter polygon for the volumetric closed palm/metacarpal occluder:
+ * WRIST(0) -> THUMB_CMC(1) -> THUMB_MCP(2) -> INDEX_MCP(5) -> MIDDLE_MCP(9) -> RING_MCP(13) -> PINKY_MCP(17)
  */
-function createStudioEnvironmentMap(renderer: THREE.WebGLRenderer): THREE.Texture {
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  pmrem.compileEquirectangularShader();
+const PALM_POLYGON_INDICES = [0, 1, 2, 5, 9, 13, 17] as const;
+const PALM_VERTS_PER_FACE = PALM_POLYGON_INDICES.length; // 7
+const PALM_CENTER_DORSAL_IDX = PALM_VERTS_PER_FACE * 2; // 14
+const PALM_CENTER_PALMAR_IDX = PALM_VERTS_PER_FACE * 2 + 1; // 15
+const PALM_TOTAL_VERTICES = PALM_VERTS_PER_FACE * 2 + 2; // 16
 
-  const envScene = new THREE.Scene();
-  envScene.background = new THREE.Color(0x181316);
-
-  // Overhead warm beauty softbox strip
-  const softboxGeo = new THREE.PlaneGeometry(14, 7);
-  const softboxMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(2.6, 2.45, 2.32),
-    side: THREE.DoubleSide,
-  });
-  const topSoftbox = new THREE.Mesh(softboxGeo, softboxMat);
-  topSoftbox.position.set(-1.5, 6.5, 5.0);
-  topSoftbox.lookAt(0, 0, 0);
-  envScene.add(topSoftbox);
-
-  // Secondary cool/neutral side rim light panel for glossy gel edge catchlights
-  const rimGeo = new THREE.PlaneGeometry(6, 12);
-  const rimMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(1.45, 1.5, 1.65),
-    side: THREE.DoubleSide,
-  });
-  const sidePanel = new THREE.Mesh(rimGeo, rimMat);
-  sidePanel.position.set(7.0, 1.0, 3.0);
-  sidePanel.lookAt(0, 0, 0);
-  envScene.add(sidePanel);
-
-  // Warm rose-gold bounce floor
-  const floorGeo = new THREE.PlaneGeometry(18, 18);
-  const floorMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(0.55, 0.38, 0.34),
-    side: THREE.DoubleSide,
-  });
-  const floor = new THREE.Mesh(floorGeo, floorMat);
-  floor.position.set(0, -6.5, 0);
-  floor.rotation.x = -Math.PI / 2;
-  envScene.add(floor);
-
-  const envRT = pmrem.fromScene(envScene, 0.035);
-
-  softboxGeo.dispose();
-  softboxMat.dispose();
-  rimGeo.dispose();
-  rimMat.dispose();
-  floorGeo.dispose();
-  floorMat.dispose();
-  pmrem.dispose();
-
-  return envRT.texture;
-}
-
-/**
- * Generates a soft elliptical warm ambient-occlusion shadow texture (`rgba(26,12,12,0.34)`)
- * seated strictly beneath each nail bed (`renderOrder: 1`).
- */
-function createAOShadowTexture(): THREE.CanvasTexture {
-  const size = 128;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (ctx) {
-    ctx.clearRect(0, 0, size, size);
-    const grad = ctx.createRadialGradient(
-      size * 0.5,
-      size * 0.5,
-      size * 0.06,
-      size * 0.5,
-      size * 0.5,
-      size * 0.48
-    );
-    grad.addColorStop(0, 'rgba(26, 12, 12, 0.34)');
-    grad.addColorStop(0.55, 'rgba(26, 12, 12, 0.18)');
-    grad.addColorStop(1, 'rgba(26, 12, 12, 0)');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, size, size);
-  }
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.needsUpdate = true;
-  return tex;
-}
-
-/**
- * Generates a dedicated 256×256 procedural underside occlusion + milky translucent gel texture ONCE
- * at initialization (never inside RAF):
- * - Warm deep skin-contact AO shadow near hyponychium base (v -> 0, canvas bottom) and inner lateral margins
- * - Smooth gradient lightening to natural milky rosy-pearl translucent gel with subtle longitudinal striations (v -> 1, canvas top)
- */
-function createUndersideOcclusionTexture(): THREE.CanvasTexture {
-  const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-
-  if (ctx) {
-    // Base longitudinal gradient: v=1 (top of canvas, free tip) -> v=0 (bottom of canvas, hyponychium/skin base)
-    const baseGrad = ctx.createLinearGradient(0, 0, 0, size);
-    baseGrad.addColorStop(0.0, '#FCF6F1'); // Translucent natural ivory/gel free edge (v = 1)
-    baseGrad.addColorStop(0.35, '#F4E5DC'); // Soft milky rosy-ivory gel body
-    baseGrad.addColorStop(0.68, '#CC9C8B'); // Warm translucent transition near hyponychium
-    baseGrad.addColorStop(0.88, '#8D584A'); // Deep warm hyponychium skin-pocket shadow
-    baseGrad.addColorStop(1.0, '#5A3128'); // Hyponychium crease occlusion (v = 0)
-    ctx.fillStyle = baseGrad;
-    ctx.fillRect(0, 0, size, size);
-
-    // Subtle longitudinal micro-striations along v for authentic sculpted gel/nail underside fiber depth
-    for (let x = 0; x < size; x += 2) {
-      const wave = Math.sin(x * 0.45) * 0.5 + Math.cos(x * 1.15) * 0.5;
-      const alpha = 0.025 + Math.abs(wave) * 0.02;
-      ctx.fillStyle = wave >= 0 ? `rgba(255, 250, 246, ${alpha})` : `rgba(110, 68, 58, ${alpha})`;
-      ctx.fillRect(x, 0, 1, size);
-    }
-
-    // Subtle internal C-curve sidewall shading along u near 0 and 1
-    const sideGrad = ctx.createLinearGradient(0, 0, size, 0);
-    sideGrad.addColorStop(0.0, 'rgba(62, 32, 26, 0.58)');
-    sideGrad.addColorStop(0.12, 'rgba(84, 46, 38, 0.22)');
-    sideGrad.addColorStop(0.30, 'rgba(84, 46, 38, 0.04)');
-    sideGrad.addColorStop(0.50, 'rgba(84, 46, 38, 0.0)');
-    sideGrad.addColorStop(0.70, 'rgba(84, 46, 38, 0.04)');
-    sideGrad.addColorStop(0.88, 'rgba(84, 46, 38, 0.22)');
-    sideGrad.addColorStop(1.0, 'rgba(62, 32, 26, 0.58)');
-    ctx.fillStyle = sideGrad;
-    ctx.fillRect(0, 0, size, size);
-
-    // Warm hyponychium shadow at junction with finger pulp (v -> 0, canvas bottom)
-    const hyponychiumAO = ctx.createRadialGradient(
-      size * 0.5,
-      size * 1.01,
-      size * 0.04,
-      size * 0.5,
-      size * 0.90,
-      size * 0.62
-    );
-    hyponychiumAO.addColorStop(0.0, 'rgba(48, 22, 18, 0.68)');
-    hyponychiumAO.addColorStop(0.45, 'rgba(76, 36, 28, 0.34)');
-    hyponychiumAO.addColorStop(1.0, 'rgba(76, 36, 28, 0.0)');
-    ctx.fillStyle = hyponychiumAO;
-    ctx.fillRect(0, 0, size, size);
-  }
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.wrapS = THREE.ClampToEdgeWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-/**
- * Adaptive One-Euro Filter (Casiez et al.) with optional sub-pixel deadband
- * to eliminate micro-jitter at rest while preserving near-zero latency during fast hand movement.
- */
-class OneEuroFilter {
-  private minCutoff: number;
-  private beta: number;
-  private dCutoff: number;
-  private initialized = false;
-  private xPrev = 0;
-  private dxPrev = 0;
-
-  constructor(minCutoff = 1.2, beta = 0.05, dCutoff = 1.0) {
-    this.minCutoff = minCutoff;
-    this.beta = beta;
-    this.dCutoff = dCutoff;
-  }
-
-  private static alpha(dt: number, cutoff: number): number {
-    const tau = 1.0 / (2.0 * Math.PI * cutoff);
-    return 1.0 / (1.0 + tau / Math.max(1e-4, dt));
-  }
-
-  public reset(): void {
-    this.initialized = false;
-    this.xPrev = 0;
-    this.dxPrev = 0;
-  }
-
-  public filter(x: number, dt: number, deadband = 0): number {
-    if (!this.initialized || dt <= 0) {
-      this.initialized = true;
-      this.xPrev = x;
-      this.dxPrev = 0;
-      return x;
-    }
-
-    const safeDt = Math.max(1e-4, dt);
-    const delta = x - this.xPrev;
-    // Soft sub-pixel deadband suppresses stationary MediaPipe micro-oscillations without step artifacts
-    const effectiveDelta =
-      deadband > 0 && Math.abs(delta) < deadband
-        ? delta * (Math.abs(delta) / deadband) * 0.2
-        : delta;
-    const targetX = this.xPrev + effectiveDelta;
-
-    const dx = effectiveDelta / safeDt;
-    const aD = OneEuroFilter.alpha(safeDt, this.dCutoff);
-    const dxHat = aD * dx + (1.0 - aD) * this.dxPrev;
-
-    const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
-    const a = OneEuroFilter.alpha(safeDt, cutoff);
-    const xHat = a * targetX + (1.0 - a) * this.xPrev;
-
-    this.xPrev = xHat;
-    this.dxPrev = dxHat;
-    return xHat;
-  }
-}
-
-interface PhalanxOccluderRig {
-  mesh: THREE.Mesh;
-  pos: THREE.Vector3;
-  quat: THREE.Quaternion;
+function clamp(v: number, min: number, max: number): number {
+  return v < min ? min : v > max ? max : v;
 }
 
 interface FingerRig {
+  fingerId: FingerId;
   nailMesh: THREE.Mesh;
   dorsalMaterial: THREE.MeshPhysicalMaterial;
-  aoShadowMesh: THREE.Mesh;
-  aoShadowMaterial: THREE.MeshBasicMaterial;
-  proximalOccluder: PhalanxOccluderRig;
-  middleOccluder: PhalanxOccluderRig;
-  distalOccluder: PhalanxOccluderRig;
+  undersideBundle: UndersideMaterialBundle;
+  cuticleSkirtMesh: THREE.Mesh;
+  proximalRodMesh: THREE.Mesh;
+  middleRodMesh: THREE.Mesh;
+  distalRodMesh: THREE.Mesh;
+  mcpJointMesh: THREE.Mesh;
+  pipJointMesh: THREE.Mesh;
+  dipJointMesh: THREE.Mesh;
+  distalPulpMesh: THREE.Mesh;
   currentSpecHash: string;
-  initialized: boolean;
-  posFilters: [OneEuroFilter, OneEuroFilter, OneEuroFilter];
-  scaleFilters: [OneEuroFilter, OneEuroFilter, OneEuroFilter];
-  currentPos: THREE.Vector3;
-  currentQuat: THREE.Quaternion;
-  currentScale: THREE.Vector3;
-  filteredDorsalNormal: THREE.Vector3;
-  normalFlipConfirmCount: number;
-  hasPrevRaw2D: boolean;
-  prevRawDip2D: { x: number; y: number };
-  prevRawTip2D: { x: number; y: number };
 }
 
 /**
- * Three.js + Procedural V5 Per-Finger PBR 3D Nail Scene Engine:
- * - Strictly 1 unique volumetric 3D nail rig per finger (`Map<FingerId, FingerRig>` with exactly 5 rigs)
- * - Multi-material volumetric geometry:
- *   Group 0 = Dorsal sculpted gel shell + closed lateral/free-edge walls (per-finger 1024×1024 PBR MeshPhysicalMaterial)
- *   Group 1 = Concave hollowed translucent milky-gel underside (`#F0E2D8`, `DoubleSide`)
- * - Subtle warm AO contact shadow skirt (`renderOrder: 2`, `depthWrite: false`) beneath each nail
- * - 3 invisible physical phalanx depth occluder cylinders per finger (`MCP->PIP`, `PIP->DIP`, `DIP->TIP`, `renderOrder: 1`,
- *   `colorWrite: false, depthWrite: true`) centered on the 3D phalanx axes and ending exactly at `TIP`
- *   for accurate cross-finger occlusion and palm-facing underside reveal!
+ * Three.js V9 Photorealistic Volumetric AR 3D Nail Scene Engine:
+ * - Calibrated `PerspectiveCamera(58, cssW / cssH, 0.01, 10.0)` at origin `(0, 0, 0)` looking `-Z`
+ * - Single-phase pre-kinematic `HandSkeletonFilter` + `projectHandToPerspectiveMeters` invariant:
+ *   all 5 nail rigs AND all hand occluders (palm + phalanges + joints + distal pulps) read from
+ *   the exact same filtered 21-point 3D metric coordinate array per frame
+ * - Per-finger independent SO(3) anatomical basis (`det === +1`) & dorsal surface attachment
+ *   (`cuticlePos + axisZ * (phalanxRadiusMeters * 0.88)`)
+ * - Zero `requestAnimationFrame` allocations: pre-allocated palm occluder vertex buffer, shared
+ *   unit cylinder/sphere occluder geometries, and off-RAF cached PBR + geometry maps
  */
 export class ThreeNailScene {
   private renderer: THREE.WebGLRenderer | null = null;
   private scene: THREE.Scene;
-  private camera: THREE.OrthographicCamera;
+  private camera: THREE.PerspectiveCamera;
   private envMap: THREE.Texture | null = null;
 
   private dirLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
   private rimLight: THREE.DirectionalLight;
 
-  private geometries = new Map<NailShape, THREE.BufferGeometry>();
-  private undersideTexture: THREE.CanvasTexture;
-  private undersideMaterial: THREE.MeshPhysicalMaterial;
-  private aoShadowGeometry: THREE.PlaneGeometry;
-  private aoShadowTexture: THREE.CanvasTexture;
+  private readonly skeletonFilter = new HandSkeletonFilter();
+  private readonly projectedPoints: THREE.Vector3[] = Array.from(
+    { length: HAND_LANDMARK_COUNT },
+    () => new THREE.Vector3()
+  );
+
+  // Cached geometries outside RAF (keyed by shape + tipRoundness)
+  private nailGeometries = new Map<string, THREE.BufferGeometry>();
+  private skirtGeometries = new Map<NailShape, THREE.BufferGeometry>();
+
+  // Shared conformal cuticle skirt material & volumetric occluder primitives
+  private skirtMaterialBundle: CuticleSkirtMaterialBundle;
   private occluderMaterial: THREE.MeshBasicMaterial;
-  private occluderGeometry: THREE.CapsuleGeometry;
+  private unitCylinderGeo: THREE.CylinderGeometry;
+  private unitSphereGeo: THREE.SphereGeometry;
+
+  // Pre-allocated closed extruded palm occluder mesh (zero per-frame BufferGeometry allocation)
+  private palmOccluderGeo: THREE.BufferGeometry;
+  private palmPositions: Float32Array;
+  private palmPositionAttr: THREE.BufferAttribute;
+  private palmOccluderMesh: THREE.Mesh;
 
   private fingerRigs = new Map<FingerId, FingerRig>();
-  private handScaleFilter = new OneEuroFilter(0.9, 0.03, 1.0);
   private ready = false;
 
-  // Handedness hysteresis lock (requires HANDEDNESS_LOCK_FRAMES consecutive frames to switch Left <-> Right)
-  private lockedHandedness: 'Left' | 'Right' | null = null;
-  private pendingHandedness: 'Left' | 'Right' | null = null;
-  private pendingHandednessFrames = 0;
-
-  // Design & PBR bundle cache — ensures zero texture creation or canvas drawing inside RAF
+  // Design & PBR bundle cache — zero texture synthesis inside RAF
   private lastDesignRef: NailDesign | null = null;
   private activeDesignKey = '';
   private cachedFingerSpecs: Record<FingerId, NailFingerDesignSpec> | null = null;
   private cachedPBRBundles = new Map<FingerId, ProceduralPBRBundle>();
 
-  // Reusable math scratch objects (zero per-frame GC churn at 60fps)
-  private tmpTip = new THREE.Vector3();
-  private tmpDip = new THREE.Vector3();
-  private tmpPip = new THREE.Vector3();
-  private tmpMcp = new THREE.Vector3();
-  private tmpWrist = new THREE.Vector3();
-  private tmpCuticle = new THREE.Vector3();
-  private tmpPalmNormal = new THREE.Vector3();
-  private tmpAxisY = new THREE.Vector3();
-  private tmpAxisX = new THREE.Vector3();
-  private tmpAxisZ = new THREE.Vector3();
-  private tmpMatrix = new THREE.Matrix4();
-  private tmpTargetQuat = new THREE.Quaternion();
+  // Reusable math scratch objects (zero per-frame GC churn)
+  private tmpBasisMatrix = new THREE.Matrix4();
   private tmpRotOffsetQuat = new THREE.Quaternion();
-  private tmpTargetPos = new THREE.Vector3();
-  private tmpTargetScale = new THREE.Vector3();
-  private tmpOccStart = new THREE.Vector3();
-  private tmpOccEnd = new THREE.Vector3();
-  private tmpOccDir = new THREE.Vector3();
-  private tmpOccCenter = new THREE.Vector3();
-  private tmpOccQuat = new THREE.Quaternion();
-  private tmpOccUp = new THREE.Vector3(0, 1, 0);
-  private tmpAoPos = new THREE.Vector3();
-  private tmpVecA = new THREE.Vector3();
-  private tmpVecB = new THREE.Vector3();
+  private tmpAxisX = new THREE.Vector3();
+  private tmpAxisY = new THREE.Vector3();
+  private tmpAxisZ = new THREE.Vector3();
+  private tmpCuticlePos = new THREE.Vector3();
+  private tmpNailPos = new THREE.Vector3();
+  private tmpNailQuat = new THREE.Quaternion();
+  private tmpRodDir = new THREE.Vector3();
+  private tmpRodCenter = new THREE.Vector3();
+  private tmpRodQuat = new THREE.Quaternion();
+  private tmpUpY = new THREE.Vector3(0, 1, 0);
+  private tmpPulpPos = new THREE.Vector3();
+  private tmpPalmEdgeA = new THREE.Vector3();
+  private tmpPalmEdgeB = new THREE.Vector3();
+  private tmpPalmNormal = new THREE.Vector3();
+  private tmpPalmCenter = new THREE.Vector3();
+  private tmpPalmCross = new THREE.Vector3();
 
   constructor(canvas: HTMLCanvasElement) {
     this.scene = new THREE.Scene();
-    // Right-handed 1:1 pixel OrthographicCamera: left=0, right=cssW, top=cssH, bottom=0, near=-1000, far=1000
-    // det(Projection) > 0 preserves Three.js FrontSide winding without inversion.
-    this.camera = new THREE.OrthographicCamera(0, 1, 1, 0, -1000, 1000);
-    this.camera.position.set(0, 0, 500);
-    this.camera.lookAt(0, 0, 0);
+
+    const initAspect =
+      canvas.clientWidth > 0 && canvas.clientHeight > 0
+        ? canvas.clientWidth / canvas.clientHeight
+        : 9 / 16;
+    this.camera = new THREE.PerspectiveCamera(
+      PERSPECTIVE_FOV_DEG,
+      initAspect,
+      PERSPECTIVE_NEAR,
+      PERSPECTIVE_FAR
+    );
+    this.camera.position.set(0, 0, 0);
+    this.camera.lookAt(0, 0, -1);
 
     this.dirLight = new THREE.DirectionalLight(0xfff6ef, 1.55);
-    this.dirLight.position.set(-220, 380, 760);
+    this.dirLight.position.set(-0.35, 0.75, 0.9);
     this.scene.add(this.dirLight);
 
-    this.rimLight = new THREE.DirectionalLight(0xf3e8ff, 0.65);
-    this.rimLight.position.set(340, -140, 520);
+    this.rimLight = new THREE.DirectionalLight(0xf3e8ff, 0.6);
+    this.rimLight.position.set(0.7, -0.25, 0.65);
     this.scene.add(this.rimLight);
 
     this.hemiLight = new THREE.HemisphereLight(0xfff5ee, 0x5c3e36, 1.15);
     this.scene.add(this.hemiLight);
 
-    // Group 1 Material: Concave hollowed translucent milky-gel underside with internal AO occlusion map
-    this.undersideTexture = createUndersideOcclusionTexture();
-    this.undersideMaterial = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#FFFFFF'),
-      map: this.undersideTexture,
-      roughness: 0.28,
-      metalness: 0.0,
-      clearcoat: 0.45,
-      clearcoatRoughness: 0.24,
-      ior: 1.48,
-      reflectivity: 0.45,
-      transparent: true,
-      opacity: 0.92,
-      depthWrite: true,
-      depthTest: true,
-      side: THREE.FrontSide,
-    });
-
-    this.aoShadowGeometry = new THREE.PlaneGeometry(1.06, 0.98);
-    this.aoShadowTexture = createAOShadowTexture();
+    this.skirtMaterialBundle = createCuticleContactSkirtMaterial();
 
     this.occluderMaterial = new THREE.MeshBasicMaterial({
       colorWrite: false,
@@ -416,111 +184,115 @@ export class ThreeNailScene {
       depthTest: true,
       side: THREE.FrontSide,
     });
-    // CapsuleGeometry(0.5, 1.0): base radius = 0.5, base total height = 2.0 -> scaleXZ = radius * 2, scaleY = totalLen * 0.5
-    this.occluderGeometry = new THREE.CapsuleGeometry(0.5, 1.0, 8, 16);
+
+    // Shared unit primitives: Cylinder(radius=1, height=1), Sphere(radius=1)
+    this.unitCylinderGeo = new THREE.CylinderGeometry(1, 1, 1, 12, 1, false);
+    this.unitSphereGeo = new THREE.SphereGeometry(1, 12, 10);
+
+    // Pre-allocated closed extruded 7-gon palm occluder (16 vertices: 7 dorsal + 7 palmar + 2 centers)
+    this.palmPositions = new Float32Array(PALM_TOTAL_VERTICES * 3);
+    this.palmPositionAttr = new THREE.BufferAttribute(this.palmPositions, 3);
+    this.palmPositionAttr.setUsage(THREE.DynamicDrawUsage);
+
+    const palmIndices: number[] = [];
+    const n = PALM_VERTS_PER_FACE;
+    // Dorsal face fan (counter-clockwise looking along +palmNormal)
+    for (let i = 0; i < n; i++) {
+      const next = (i + 1) % n;
+      palmIndices.push(PALM_CENTER_DORSAL_IDX, i, next);
+    }
+    // Palmar face fan (reversed winding for outward -palmNormal)
+    for (let i = 0; i < n; i++) {
+      const next = (i + 1) % n;
+      palmIndices.push(PALM_CENTER_PALMAR_IDX, n + next, n + i);
+    }
+    // Closed side walls connecting dorsal ring (0..n-1) and palmar ring (n..2n-1)
+    for (let i = 0; i < n; i++) {
+      const next = (i + 1) % n;
+      const d0 = i;
+      const d1 = next;
+      const p0 = n + i;
+      const p1 = n + next;
+      palmIndices.push(d0, p0, p1);
+      palmIndices.push(d0, p1, d1);
+    }
+
+    this.palmOccluderGeo = new THREE.BufferGeometry();
+    this.palmOccluderGeo.setAttribute('position', this.palmPositionAttr);
+    this.palmOccluderGeo.setIndex(palmIndices);
+
+    this.palmOccluderMesh = new THREE.Mesh(this.palmOccluderGeo, this.occluderMaterial);
+    this.palmOccluderMesh.renderOrder = 1;
+    this.palmOccluderMesh.frustumCulled = false;
+    this.palmOccluderMesh.visible = false;
+    this.scene.add(this.palmOccluderMesh);
 
     try {
       const renderer = new THREE.WebGLRenderer({
         canvas,
         alpha: true,
         antialias: true,
-        preserveDrawingBuffer: true,
         powerPreference: 'high-performance',
+        preserveDrawingBuffer: true,
       });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
       renderer.setClearColor(0x000000, 0);
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.08;
+      renderer.toneMappingExposure = 1.06;
       this.renderer = renderer;
 
-      this.envMap = createStudioEnvironmentMap(renderer);
+      this.envMap = createStudioRoomEnvMap(renderer);
       this.scene.environment = this.envMap;
 
-      const initialGeo = this.getOrCreateGeometry('almond');
+      const defaultNailGeo = this.getOrCreateNailGeometry('almond', 0.5);
+      const defaultSkirtGeo = this.getOrCreateSkirtGeometry('almond');
 
-      const makeOccluderRig = (): PhalanxOccluderRig => {
-        const mesh = new THREE.Mesh(this.occluderGeometry, this.occluderMaterial);
+      const makeOccluderMesh = (geo: THREE.BufferGeometry): THREE.Mesh => {
+        const mesh = new THREE.Mesh(geo, this.occluderMaterial);
         mesh.renderOrder = 1;
+        mesh.frustumCulled = false;
         mesh.visible = false;
         this.scene.add(mesh);
-        return {
-          mesh,
-          pos: new THREE.Vector3(),
-          quat: new THREE.Quaternion(),
-        };
+        return mesh;
       };
 
-      // Pre-allocate strictly 5 unique finger rigs (thumb, index, middle, ring, pinky)
       for (const id of ORDERED_FINGERS) {
-        const proximalOccluder = makeOccluderRig();
-        const middleOccluder = makeOccluderRig();
-        const distalOccluder = makeOccluderRig();
+        const dorsalMaterial = createDorsalNailMaterial(this.envMap);
+        const undersideBundle = createUndersideNailMaterial(this.envMap, '#E6D5C8');
 
-        const aoShadowMaterial = new THREE.MeshBasicMaterial({
-          map: this.aoShadowTexture,
-          transparent: true,
-          opacity: 1.0,
-          depthWrite: false,
-          depthTest: true,
-          side: THREE.DoubleSide,
-        });
+        const cuticleSkirtMesh = new THREE.Mesh(
+          defaultSkirtGeo,
+          this.skirtMaterialBundle.material
+        );
+        cuticleSkirtMesh.renderOrder = 2;
+        cuticleSkirtMesh.frustumCulled = false;
+        cuticleSkirtMesh.visible = false;
+        this.scene.add(cuticleSkirtMesh);
 
-        const aoShadowMesh = new THREE.Mesh(this.aoShadowGeometry, aoShadowMaterial);
-        aoShadowMesh.renderOrder = 2;
-        aoShadowMesh.visible = false;
-        this.scene.add(aoShadowMesh);
-
-        const dorsalMaterial = new THREE.MeshPhysicalMaterial({
-          color: 0xffffff,
-          roughness: 1.0, // modulated by 1024x1024 roughnessMap
-          metalness: 1.0, // modulated by 1024x1024 metalnessMap
-          clearcoat: 1.0,
-          clearcoatRoughness: 0.04,
-          ior: 1.52,
-          reflectivity: 0.92,
-          envMapIntensity: 1.38,
-          normalScale: new THREE.Vector2(1.15, 1.15),
-          bumpScale: 0.028,
-          transparent: true,
-          depthWrite: true,
-          depthTest: true,
-          side: THREE.FrontSide,
-        });
-
-        const nailMesh = new THREE.Mesh(initialGeo, [dorsalMaterial, this.undersideMaterial]);
+        const nailMesh = new THREE.Mesh(defaultNailGeo, [
+          dorsalMaterial,
+          undersideBundle.material,
+        ]);
         nailMesh.renderOrder = 2;
+        nailMesh.frustumCulled = false;
         nailMesh.visible = false;
         this.scene.add(nailMesh);
 
         this.fingerRigs.set(id, {
+          fingerId: id,
           nailMesh,
           dorsalMaterial,
-          aoShadowMesh,
-          aoShadowMaterial,
-          proximalOccluder,
-          middleOccluder,
-          distalOccluder,
+          undersideBundle,
+          cuticleSkirtMesh,
+          proximalRodMesh: makeOccluderMesh(this.unitCylinderGeo),
+          middleRodMesh: makeOccluderMesh(this.unitCylinderGeo),
+          distalRodMesh: makeOccluderMesh(this.unitCylinderGeo),
+          mcpJointMesh: makeOccluderMesh(this.unitSphereGeo),
+          pipJointMesh: makeOccluderMesh(this.unitSphereGeo),
+          dipJointMesh: makeOccluderMesh(this.unitSphereGeo),
+          distalPulpMesh: makeOccluderMesh(this.unitSphereGeo),
           currentSpecHash: '',
-          initialized: false,
-          posFilters: [
-            new OneEuroFilter(0.85, 0.04, 1.0), // X: locked 2D anchor with 0.35px deadband
-            new OneEuroFilter(0.85, 0.04, 1.0), // Y: locked 2D anchor with 0.35px deadband
-            new OneEuroFilter(0.65, 0.02, 1.0), // Z: strongly smoothed wrist-relative depth
-          ],
-          scaleFilters: [
-            new OneEuroFilter(0.95, 0.03, 1.0),
-            new OneEuroFilter(0.95, 0.03, 1.0),
-            new OneEuroFilter(0.85, 0.025, 1.0),
-          ],
-          currentPos: new THREE.Vector3(),
-          currentQuat: new THREE.Quaternion(),
-          currentScale: new THREE.Vector3(1, 1, 1),
-          filteredDorsalNormal: new THREE.Vector3(0, 0, 1),
-          normalFlipConfirmCount: 0,
-          hasPrevRaw2D: false,
-          prevRawDip2D: { x: 0, y: 0 },
-          prevRawTip2D: { x: 0, y: 0 },
         });
       }
 
@@ -534,11 +306,31 @@ export class ThreeNailScene {
     return this.ready && this.renderer !== null;
   }
 
-  private getOrCreateGeometry(shape: NailShape): THREE.BufferGeometry {
-    let geo = this.geometries.get(shape);
+  public resetTracking(): void {
+    this.skeletonFilter.reset();
+    this.hideAll();
+  }
+
+  private getOrCreateNailGeometry(
+    shape: NailShape,
+    tipRoundness?: number
+  ): THREE.BufferGeometry {
+    const roundedQ =
+      tipRoundness !== undefined ? Math.round(clamp(tipRoundness, 0, 1) * 20) / 20 : 0.5;
+    const key = `${shape}:${roundedQ.toFixed(2)}`;
+    let geo = this.nailGeometries.get(key);
     if (!geo) {
-      geo = createVolumetricNailGeometry(shape, 1.0);
-      this.geometries.set(shape, geo);
+      geo = createVolumetricNailGeometry(shape, { tipRoundness: roundedQ });
+      this.nailGeometries.set(key, geo);
+    }
+    return geo;
+  }
+
+  private getOrCreateSkirtGeometry(shape: NailShape): THREE.BufferGeometry {
+    let geo = this.skirtGeometries.get(shape);
+    if (!geo) {
+      geo = createCuticleContactSkirtGeometry(shape);
+      this.skirtGeometries.set(shape, geo);
     }
     return geo;
   }
@@ -548,87 +340,58 @@ export class ThreeNailScene {
     if (!renderer) return;
 
     const clampedDpr = Math.min(dpr, 1.5);
-    const targetW = Math.max(1, Math.round(cssW * clampedDpr));
-    const targetH = Math.max(1, Math.round(cssH * clampedDpr));
-    const dom = renderer.domElement;
-    if (dom.width !== targetW || dom.height !== targetH) {
-      renderer.setPixelRatio(clampedDpr);
-      renderer.setSize(cssW, cssH, false);
-    }
-
     const safeW = Math.max(1, cssW);
     const safeH = Math.max(1, cssH);
-    this.camera.left = 0;
-    this.camera.right = safeW;
-    this.camera.top = safeH;
-    this.camera.bottom = 0;
-    this.camera.near = -1000;
-    this.camera.far = 1000;
-    this.camera.position.set(0, 0, 500);
-    this.camera.lookAt(0, 0, 0);
-    this.camera.updateProjectionMatrix();
+    const targetW = Math.max(1, Math.round(safeW * clampedDpr));
+    const targetH = Math.max(1, Math.round(safeH * clampedDpr));
+    const dom = renderer.domElement;
+
+    if (dom.width !== targetW || dom.height !== targetH) {
+      renderer.setPixelRatio(clampedDpr);
+      renderer.setSize(safeW, safeH, false);
+    }
+
+    const aspect = safeW / safeH;
+    if (Math.abs(this.camera.aspect - aspect) > 1e-4) {
+      this.camera.aspect = aspect;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   private hideRig(rig: FingerRig): void {
     rig.nailMesh.visible = false;
-    rig.aoShadowMesh.visible = false;
-    rig.proximalOccluder.mesh.visible = false;
-    rig.middleOccluder.mesh.visible = false;
-    rig.distalOccluder.mesh.visible = false;
-    rig.hasPrevRaw2D = false;
-    rig.normalFlipConfirmCount = 0;
-    if (rig.initialized) {
-      rig.initialized = false;
-      rig.posFilters[0].reset();
-      rig.posFilters[1].reset();
-      rig.posFilters[2].reset();
-      rig.scaleFilters[0].reset();
-      rig.scaleFilters[1].reset();
-      rig.scaleFilters[2].reset();
-      rig.filteredDorsalNormal.set(0, 0, 1);
+    rig.cuticleSkirtMesh.visible = false;
+    rig.proximalRodMesh.visible = false;
+    rig.middleRodMesh.visible = false;
+    rig.distalRodMesh.visible = false;
+    rig.mcpJointMesh.visible = false;
+    rig.pipJointMesh.visible = false;
+    rig.dipJointMesh.visible = false;
+    rig.distalPulpMesh.visible = false;
+  }
+
+  private hideAll(): void {
+    this.palmOccluderMesh.visible = false;
+    for (const rig of this.fingerRigs.values()) {
+      this.hideRig(rig);
     }
   }
 
   public clear(cssW: number, cssH: number, dpr: number): void {
     if (!this.renderer) return;
     this.syncViewport(cssW, cssH, dpr);
-    for (const rig of this.fingerRigs.values()) {
-      this.hideRig(rig);
-    }
-    this.handScaleFilter.reset();
-    this.lockedHandedness = null;
-    this.pendingHandedness = null;
-    this.pendingHandednessFrames = 0;
+    this.hideAll();
     this.renderer.clear();
-  }
-
-  /**
-   * Projects normalized MediaPipe landmark (x, y, z) 1:1 into Orthographic screen-pixel coordinates
-   * accounting for exact `object-fit: cover` crop (`rect`), with `z` relative to wrist/base centered near 0.
-   */
-  private landmarkToScene(
-    pt: { x: number; y: number; z?: number },
-    rect: ImageLayoutRect,
-    cssH: number,
-    mirrorX: boolean,
-    refZ: number,
-    out: THREE.Vector3
-  ): THREE.Vector3 {
-    const nx = mirrorX ? 1 - pt.x : pt.x;
-    const px = rect.drawX + nx * rect.drawW;
-    const py = cssH - (rect.drawY + pt.y * rect.drawH);
-    const pz = -((pt.z ?? 0) - refZ) * rect.drawW * 0.95;
-    return out.set(px, py, pz);
   }
 
   private computeDesignKey(design: NailDesign): string {
     let fingerSpecsPart = '';
     if (design.fingerSpecs) {
-      const specs = design.fingerSpecs as Record<FingerId, NailFingerDesignSpec>;
+      const specs = design.fingerSpecs;
       fingerSpecsPart = ORDERED_FINGERS.map((id) => {
         const s = specs[id];
         if (!s) return '';
-        return `${id}:${s.shape}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}`;
+        return `${id}:${s.shape}:${(s.extensionMm ?? 0).toFixed(1)}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}`;
       }).join('~');
     }
     return `${design.id}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ? design.imageDataUrl.length : 0}|${fingerSpecsPart}`;
@@ -642,7 +405,6 @@ export class ThreeNailScene {
     const traceSilhouette = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
       const steps = 40;
       ctx.beginPath();
-      // Left edge from cuticle (v=0.05) to free tip (v=0.985)
       for (let i = 0; i <= steps; i++) {
         const v = 0.05 + (i / steps) * 0.935;
         const hw = evalNailHalfWidth(v, shape) * 0.91;
@@ -652,7 +414,6 @@ export class ThreeNailScene {
         if (i === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
-      // Right edge from free tip (v=0.985) back to cuticle (v=0.05)
       for (let i = steps; i >= 0; i--) {
         const v = 0.05 + (i / steps) * 0.935;
         const hw = evalNailHalfWidth(v, shape) * 0.91;
@@ -740,7 +501,6 @@ export class ThreeNailScene {
       const spec = specs[id];
       const bundle = synthesizeProceduralPBRBundle(spec);
 
-      // Paint metallic perimeter outline once inside cache (never inside RAF)
       if (spec.hasMetallicOutline && spec.outlineColor) {
         this.paintMetallicOutlineOnBundle(bundle, spec.shape, spec.outlineColor);
       }
@@ -748,642 +508,398 @@ export class ThreeNailScene {
       this.cachedPBRBundles.set(id, bundle);
 
       const rig = this.fingerRigs.get(id);
-      if (rig && rig.currentSpecHash !== bundle.specHash) {
+      if (!rig) continue;
+
+      if (rig.currentSpecHash !== bundle.specHash) {
         rig.dorsalMaterial.map = bundle.map;
         rig.dorsalMaterial.normalMap = bundle.normalMap;
         rig.dorsalMaterial.bumpMap = bundle.bumpMap;
+        rig.dorsalMaterial.displacementMap = bundle.displacementMap;
         rig.dorsalMaterial.roughnessMap = bundle.roughnessMap;
         rig.dorsalMaterial.metalnessMap = bundle.metalnessMap;
         rig.dorsalMaterial.alphaMap = bundle.alphaMap;
-        rig.dorsalMaterial.needsUpdate = true;
-        rig.currentSpecHash = bundle.specHash;
 
         const isRelief =
+          Boolean(spec.has3DRelief) ||
           spec.pattern === 'gold_3d_waves' ||
           spec.pattern === 'floral_accent' ||
           Boolean(spec.hasMetallicOutline);
-        const isChrome = spec.pattern === 'chrome_mirror';
-        const isVelvet = spec.glossIntensity < 0.65;
+        const isChrome =
+          spec.pattern === 'chrome_mirror' || spec.finishStyle === 'chrome_mirror';
+        const isVelvet =
+          spec.finishStyle === 'velvet_matte' ||
+          (!spec.finishStyle && spec.glossIntensity < 0.65);
 
-        const nScale = isRelief ? 1.55 : isChrome ? 0.85 : 1.05;
+        rig.dorsalMaterial.displacementScale = spec.has3DRelief ? 0.0005 : 0.00022;
+        rig.dorsalMaterial.displacementBias = 0;
+
+        const nScale = isRelief ? 1.45 : isChrome ? 0.85 : 1.05;
         rig.dorsalMaterial.normalScale.set(nScale, nScale);
-        rig.dorsalMaterial.bumpScale = isRelief ? 0.042 : 0.018;
+        rig.dorsalMaterial.bumpScale = isRelief ? 0.00045 : 0.00018;
         rig.dorsalMaterial.clearcoat = isVelvet ? 0.42 : 1.0;
         rig.dorsalMaterial.clearcoatRoughness = isVelvet
           ? 0.34
           : isChrome
             ? 0.025
-            : 0.04;
+            : 0.035;
         rig.dorsalMaterial.envMapIntensity = isChrome
           ? 1.9
           : isVelvet
             ? 0.9
-            : 1.4;
+            : 1.45;
+        rig.dorsalMaterial.needsUpdate = true;
+        rig.currentSpecHash = bundle.specHash;
       }
+
+      updateUndersideMaterialTint(rig.undersideBundle, spec.baseColor || '#E6D5C8');
     }
   }
 
-  private updatePhalanxOccluder(
-    occ: PhalanxOccluderRig,
+  private positionCylinderSegment(
+    mesh: THREE.Mesh,
     start: THREE.Vector3,
     end: THREE.Vector3,
-    radius: number,
-    slerpAlpha: number,
-    initialized: boolean
+    radiusMeters: number
   ): void {
-    this.tmpOccStart.copy(start);
-    this.tmpOccEnd.copy(end);
-    this.tmpOccDir.copy(this.tmpOccEnd).sub(this.tmpOccStart);
-    const totalLen = this.tmpOccDir.length();
-
-    if (totalLen < 1.5) {
-      occ.mesh.visible = false;
+    this.tmpRodDir.subVectors(end, start);
+    const len = this.tmpRodDir.length();
+    if (len < 1e-4) {
+      mesh.visible = false;
       return;
     }
 
-    this.tmpOccDir.divideScalar(totalLen);
-    this.tmpOccQuat.setFromUnitVectors(this.tmpOccUp, this.tmpOccDir);
+    this.tmpRodDir.divideScalar(len);
+    this.tmpRodQuat.setFromUnitVectors(this.tmpUpY, this.tmpRodDir);
+    this.tmpRodCenter.copy(start).addScaledVector(this.tmpRodDir, len * 0.5);
 
-    // CapsuleGeometry(0.5, 1.0): base radius = 0.5, base total height = 2.0
-    // => scaleXZ = radius * 2, scaleY = totalLen * 0.5 centers capsule strictly between start & end
-    this.tmpOccCenter
-      .copy(this.tmpOccStart)
-      .addScaledVector(this.tmpOccDir, totalLen * 0.5);
-
-    if (!initialized) {
-      occ.pos.copy(this.tmpOccCenter);
-      occ.quat.copy(this.tmpOccQuat);
-    } else {
-      occ.pos.lerp(this.tmpOccCenter, slerpAlpha);
-      occ.quat.slerp(this.tmpOccQuat, slerpAlpha);
-    }
-
-    occ.mesh.position.copy(occ.pos);
-    occ.mesh.quaternion.copy(occ.quat);
-    occ.mesh.scale.set(radius * 2, totalLen * 0.5, radius * 2);
-    occ.mesh.visible = true;
+    mesh.position.copy(this.tmpRodCenter);
+    mesh.quaternion.copy(this.tmpRodQuat);
+    // Uniform X/Z scale on unit cylinder
+    mesh.scale.set(radiusMeters, len, radiusMeters);
+    mesh.visible = true;
   }
 
-  public renderNails(
+  private positionJointSphere(
+    mesh: THREE.Mesh,
+    center: THREE.Vector3,
+    radiusMeters: number
+  ): void {
+    mesh.position.copy(center);
+    mesh.scale.setScalar(radiusMeters);
+    mesh.visible = true;
+  }
+
+  /**
+   * Updates the pre-allocated closed extruded 7-gon palm occluder directly in `this.palmPositions`
+   * (zero per-frame heap allocation) using the exact same `this.projectedPoints` array.
+   */
+  private updatePalmOccluder(
+    points3D: readonly THREE.Vector3[],
+    palmThicknessMeters: number
+  ): void {
+    const wrist = points3D[WRIST];
+    const indexMcp = points3D[5];
+    const pinkyMcp = points3D[17];
+
+    if (!wrist || !indexMcp || !pinkyMcp) {
+      this.palmOccluderMesh.visible = false;
+      return;
+    }
+
+    // Compute centroid of the 7-point palm polygon
+    this.tmpPalmCenter.set(0, 0, 0);
+    for (let i = 0; i < PALM_VERTS_PER_FACE; i++) {
+      const pt = points3D[PALM_POLYGON_INDICES[i]];
+      if (!pt) {
+        this.palmOccluderMesh.visible = false;
+        return;
+      }
+      this.tmpPalmCenter.add(pt);
+    }
+    this.tmpPalmCenter.divideScalar(PALM_VERTS_PER_FACE);
+
+    // Compute palm face normal and ensure winding matches polygon order
+    this.tmpPalmEdgeA.subVectors(indexMcp, wrist);
+    this.tmpPalmEdgeB.subVectors(pinkyMcp, wrist);
+    this.tmpPalmNormal.crossVectors(this.tmpPalmEdgeA, this.tmpPalmEdgeB);
+    if (this.tmpPalmNormal.lengthSq() < 1e-8) {
+      this.palmOccluderMesh.visible = false;
+      return;
+    }
+    this.tmpPalmNormal.normalize();
+
+    // Verify polygon winding relative to tmpPalmNormal using triangle (center -> v0 -> v1)
+    const v0 = points3D[PALM_POLYGON_INDICES[0]];
+    const v1 = points3D[PALM_POLYGON_INDICES[1]];
+    this.tmpPalmEdgeA.subVectors(v0, this.tmpPalmCenter);
+    this.tmpPalmEdgeB.subVectors(v1, this.tmpPalmCenter);
+    this.tmpPalmCross.crossVectors(this.tmpPalmEdgeA, this.tmpPalmEdgeB);
+    if (this.tmpPalmCross.dot(this.tmpPalmNormal) < 0) {
+      this.tmpPalmNormal.negate();
+    }
+
+    const halfThick = clamp(palmThicknessMeters * 0.5, 0.007, 0.018);
+    const n = PALM_VERTS_PER_FACE;
+
+    for (let i = 0; i < n; i++) {
+      const p = points3D[PALM_POLYGON_INDICES[i]];
+      const dOff = i * 3;
+      const pOff = (n + i) * 3;
+
+      this.palmPositions[dOff] = p.x + this.tmpPalmNormal.x * halfThick;
+      this.palmPositions[dOff + 1] = p.y + this.tmpPalmNormal.y * halfThick;
+      this.palmPositions[dOff + 2] = p.z + this.tmpPalmNormal.z * halfThick;
+
+      this.palmPositions[pOff] = p.x - this.tmpPalmNormal.x * halfThick;
+      this.palmPositions[pOff + 1] = p.y - this.tmpPalmNormal.y * halfThick;
+      this.palmPositions[pOff + 2] = p.z - this.tmpPalmNormal.z * halfThick;
+    }
+
+    const cdOff = PALM_CENTER_DORSAL_IDX * 3;
+    this.palmPositions[cdOff] = this.tmpPalmCenter.x + this.tmpPalmNormal.x * halfThick;
+    this.palmPositions[cdOff + 1] = this.tmpPalmCenter.y + this.tmpPalmNormal.y * halfThick;
+    this.palmPositions[cdOff + 2] = this.tmpPalmCenter.z + this.tmpPalmNormal.z * halfThick;
+
+    const cpOff = PALM_CENTER_PALMAR_IDX * 3;
+    this.palmPositions[cpOff] = this.tmpPalmCenter.x - this.tmpPalmNormal.x * halfThick;
+    this.palmPositions[cpOff + 1] = this.tmpPalmCenter.y - this.tmpPalmNormal.y * halfThick;
+    this.palmPositions[cpOff + 2] = this.tmpPalmCenter.z - this.tmpPalmNormal.z * halfThick;
+
+    this.palmPositionAttr.needsUpdate = true;
+    this.palmOccluderGeo.computeBoundingSphere();
+    this.palmOccluderMesh.visible = true;
+  }
+
+  public renderHandFrame(
     cssW: number,
     cssH: number,
     dpr: number,
     rect: ImageLayoutRect,
-    poses: FingerPose[],
-    design: NailDesign,
+    frame: HandSkeletonFrame | null,
+    design: NailDesign | null,
     adjustment: NailAdjustment,
-    ambient: AmbientLightSample,
+    ambient: DirectionalAmbientLightSample,
     mirrorX = false,
     deltaTimeSec = 1 / 60
   ): void {
     const renderer = this.renderer;
     if (!renderer || !this.ready) return;
 
-    this.syncViewport(cssW, cssH, dpr);
-    if (poses.length === 0) {
+    if (!frame || !design || frame.landmarks.length < HAND_LANDMARK_COUNT || frame.worldLandmarks.length < HAND_LANDMARK_COUNT) {
       this.clear(cssW, cssH, dpr);
       return;
     }
 
-    const dt = Math.min(0.05, Math.max(0.001, deltaTimeSec));
+    this.syncViewport(cssW, cssH, dpr);
 
-    // Synthesize / bind PBR textures ONLY when design or fingerSpecs actually change
+    const dt = clamp(Number.isFinite(deltaTimeSec) ? deltaTimeSec : 1 / 60, 0.001, 0.05);
+
+    // 1. Single-phase pre-kinematic continuous One-Euro filtering across all 21 2D + 21 world landmarks
+    const filtered = this.skeletonFilter.update(frame, dt);
+
+    // 2. Single calibrated perspective projection shared by ALL 5 nails AND ALL hand occluders
+    const projection = projectHandToPerspectiveMeters(
+      filtered.landmarks2D,
+      filtered.worldLandmarks,
+      rect,
+      cssW,
+      cssH,
+      PERSPECTIVE_FOV_DEG,
+      mirrorX,
+      this.projectedPoints
+    );
+    const points3D = projection.points3D;
+
+    // 3. Cached off-RAF PBR texture synthesis & material binding
     this.ensureDesignPBRCache(design);
 
-    // Adaptive Scene Lighting synced with live skin RGB & luminance
-    const lumExposure = Math.max(0.7, Math.min(1.35, 0.72 + ambient.luma * 0.85));
+    // 4. Directional Room Lighting & Adaptive Skin-Tone Fill
+    const lumExposure = clamp(0.74 + ambient.luma * 0.78, 0.72, 1.32);
+    const azX = clamp(ambient.lightAzimuthX, -1, 1);
+    const elY = clamp(ambient.lightElevationY, 0.15, 0.95);
+    this.dirLight.position.set(azX * 1.4, elY * 1.6, 1.0);
+    this.dirLight.intensity = 1.48 * lumExposure;
+
+    this.rimLight.position.set(-azX * 1.1, -0.35, 0.7);
+    this.rimLight.intensity = 0.56 * lumExposure;
+
     this.hemiLight.color.setRGB(
-      Math.min(1, 0.72 + ambient.r * 0.35),
-      Math.min(1, 0.7 + ambient.g * 0.35),
-      Math.min(1, 0.68 + ambient.b * 0.35)
+      Math.min(1, 0.74 + ambient.r * 0.32),
+      Math.min(1, 0.72 + ambient.g * 0.32),
+      Math.min(1, 0.7 + ambient.b * 0.32)
     );
     this.hemiLight.groundColor.setRGB(
-      ambient.r * 0.65,
-      ambient.g * 0.55,
+      ambient.r * 0.62,
+      ambient.g * 0.54,
       ambient.b * 0.5
     );
     this.hemiLight.intensity = 0.95 * lumExposure;
-    this.dirLight.intensity = 1.45 * lumExposure;
-    renderer.toneMappingExposure = 0.95 + ambient.luma * 0.25;
-    this.undersideMaterial.opacity = Math.min(0.92, adjustment.opacity * 0.96);
+    renderer.toneMappingExposure = 0.94 + ambient.luma * 0.24;
 
-    const shapeMult = SHAPE_LENGTH_MULT[adjustment.shape] ?? 1.0;
-    const geo = this.getOrCreateGeometry(adjustment.shape);
-    const seenIds = new Set<FingerId>();
+    const fineExtMult = clamp(adjustment.extensionLength, 0.85, 1.15);
+    const fineWidthMult = clamp(adjustment.scale, 0.85, 1.2);
+    const rotRad = (-adjustment.rotationDeg * Math.PI) / 180;
 
-    // True anatomical hand scale (pxPerMeter) from 3D palm span wrist -> middle.mcp (~8.5 cm)
-    // with median wrist -> finger.mcp fallback, smoothed via dedicated OneEuroFilter(0.9, 0.03).
-    const middlePose = poses.find((p) => p.id === 'middle');
-    const refWristZ =
-      middlePose?.wrist?.z ??
-      poses.find((p) => p.wrist)?.wrist?.z ??
-      poses.find((p) => p.mcp)?.mcp?.z ??
-      0;
+    let refPalmThicknessMeters = 0.022;
 
-    let rawPalmLen3D = 0;
-    if (middlePose?.wrist && middlePose?.mcp) {
-      this.landmarkToScene(middlePose.wrist, rect, cssH, mirrorX, refWristZ, this.tmpWrist);
-      this.landmarkToScene(middlePose.mcp, rect, cssH, mirrorX, refWristZ, this.tmpMcp);
-      rawPalmLen3D = this.tmpWrist.distanceTo(this.tmpMcp);
-    }
+    // 5. Per-finger independent anatomical basis, metric dimensions, nail + skirt + occluders
+    for (const fingerId of ORDERED_FINGERS) {
+      const rig = this.fingerRigs.get(fingerId);
+      if (!rig) continue;
 
-    if (rawPalmLen3D < 8) {
-      const palmSamples: number[] = [];
-      for (const p of poses) {
-        if (p.wrist && p.mcp) {
-          this.landmarkToScene(p.wrist, rect, cssH, mirrorX, refWristZ, this.tmpWrist);
-          this.landmarkToScene(p.mcp, rect, cssH, mirrorX, refWristZ, this.tmpMcp);
-          const d = this.tmpWrist.distanceTo(this.tmpMcp);
-          if (d >= 8) palmSamples.push(d);
-        }
-      }
-      if (palmSamples.length > 0) {
-        palmSamples.sort((a, b) => a - b);
-        rawPalmLen3D = palmSamples[Math.floor(palmSamples.length / 2)];
-      }
-    }
+      const idxSpec = FINGER_LANDMARK_INDICES[fingerId];
+      const mcpPt = points3D[idxSpec.mcp];
+      const pipPt = points3D[idxSpec.pip];
+      const dipPt = points3D[idxSpec.dip];
+      const tipPt = points3D[idxSpec.tip];
 
-    let rawPxPerMeter: number;
-    if (rawPalmLen3D >= 8) {
-      rawPxPerMeter = rawPalmLen3D / PALM_WRIST_TO_MIDDLE_MCP_METERS;
-    } else {
-      const fallbackPxPerM: number[] = [];
-      for (const p of poses) {
-        const pwZ = p.wrist?.z ?? refWristZ;
-        this.landmarkToScene(p.tip, rect, cssH, mirrorX, pwZ, this.tmpTip);
-        this.landmarkToScene(p.dip, rect, cssH, mirrorX, pwZ, this.tmpDip);
-        const d3 = this.tmpTip.distanceTo(this.tmpDip);
-        const distM = ANATOMICAL_DISTAL_METERS[p.id] ?? 0.021;
-        if (d3 >= 4) fallbackPxPerM.push(d3 / distM);
-      }
-      if (fallbackPxPerM.length > 0) {
-        fallbackPxPerM.sort((a, b) => a - b);
-        rawPxPerMeter = fallbackPxPerM[Math.floor(fallbackPxPerM.length / 2)];
-      } else {
-        rawPxPerMeter = (rect.drawW * 0.24) / PALM_WRIST_TO_MIDDLE_MCP_METERS;
-      }
-    }
-
-    const pxPerMeter = Math.max(
-      180,
-      Math.min(18000, this.handScaleFilter.filter(rawPxPerMeter, dt, 1.5))
-    );
-
-    // Handedness hysteresis lock (8 consecutive frames required to flip Left <-> Right)
-    const rawHandedness = poses.find((p) => p.handedness)?.handedness ?? null;
-    if (rawHandedness) {
-      if (this.lockedHandedness === null) {
-        this.lockedHandedness = rawHandedness;
-        this.pendingHandedness = null;
-        this.pendingHandednessFrames = 0;
-      } else if (rawHandedness === this.lockedHandedness) {
-        this.pendingHandedness = null;
-        this.pendingHandednessFrames = 0;
-      } else {
-        if (this.pendingHandedness === rawHandedness) {
-          this.pendingHandednessFrames++;
-        } else {
-          this.pendingHandedness = rawHandedness;
-          this.pendingHandednessFrames = 1;
-        }
-        if (this.pendingHandednessFrames >= HANDEDNESS_LOCK_FRAMES) {
-          this.lockedHandedness = rawHandedness;
-          this.pendingHandedness = null;
-          this.pendingHandednessFrames = 0;
-        }
-      }
-    }
-
-    for (const pose of poses) {
-      const rig = this.fingerRigs.get(pose.id);
-      // Strictly 1 unique rig per FingerId; ignore duplicate finger poses in the same frame
-      if (!rig || seenIds.has(pose.id)) continue;
-
-      rig.dorsalMaterial.opacity = adjustment.opacity;
-
-      if (rig.nailMesh.geometry !== geo) {
-        rig.nailMesh.geometry = geo;
-      }
-
-      const poseRefZ = pose.wrist?.z ?? refWristZ;
-
-      // Project all 4 phalanx joints (MCP, PIP, DIP, TIP) 1:1 into Orthographic pixel space
-      this.landmarkToScene(pose.tip, rect, cssH, mirrorX, poseRefZ, this.tmpTip);
-      this.landmarkToScene(pose.dip, rect, cssH, mirrorX, poseRefZ, this.tmpDip);
-      if (pose.pip) {
-        this.landmarkToScene(pose.pip, rect, cssH, mirrorX, poseRefZ, this.tmpPip);
-      } else {
-        this.tmpPip
-          .copy(this.tmpDip)
-          .addScaledVector(this.tmpVecA.copy(this.tmpDip).sub(this.tmpTip), 1.25);
-      }
-      if (pose.mcp) {
-        this.landmarkToScene(pose.mcp, rect, cssH, mirrorX, poseRefZ, this.tmpMcp);
-      } else {
-        this.tmpMcp
-          .copy(this.tmpPip)
-          .addScaledVector(this.tmpVecA.copy(this.tmpPip).sub(this.tmpDip), 1.35);
-      }
-
-      // Raw 2D screen displacement check for Zero-Jitter Lock (< 1.2 px stationary lock)
-      const dipMove2D = rig.hasPrevRaw2D
-        ? Math.hypot(this.tmpDip.x - rig.prevRawDip2D.x, this.tmpDip.y - rig.prevRawDip2D.y)
-        : 999;
-      const tipMove2D = rig.hasPrevRaw2D
-        ? Math.hypot(this.tmpTip.x - rig.prevRawTip2D.x, this.tmpTip.y - rig.prevRawTip2D.y)
-        : 999;
-      const isStationary = rig.hasPrevRaw2D && dipMove2D < 1.2 && tipMove2D < 1.2;
-      rig.prevRawDip2D.x = this.tmpDip.x;
-      rig.prevRawDip2D.y = this.tmpDip.y;
-      rig.prevRawTip2D.x = this.tmpTip.x;
-      rig.prevRawTip2D.y = this.tmpTip.y;
-      rig.hasPrevRaw2D = true;
-
-      // Finger axis Y = normalize(TIP - DIP) in full 3D (x, y, z)
-      // NEVER reject or scale based on dist2D(DIP, TIP) so pointing at the lens never triggers triangular explosion!
-      this.tmpAxisY.copy(this.tmpTip).sub(this.tmpDip);
-      const segLen3D = this.tmpAxisY.length();
-
-      if (segLen3D < 3) {
+      if (!mcpPt || !pipPt || !dipPt || !tipPt) {
         this.hideRig(rig);
         continue;
       }
-      seenIds.add(pose.id);
-      this.tmpAxisY.normalize();
 
-      const effectiveHandedness = this.lockedHandedness ?? pose.handedness ?? 'Right';
+      const spec = this.cachedFingerSpecs?.[fingerId];
+      const activeShape: NailShape = spec?.shape ?? adjustment.shape;
+      const tipRoundness = spec?.tipRoundness;
 
-      // True 3D dorsal palm normal (never forced toward +Z when palm turns to face camera!)
-      if (pose.palmNormal) {
-        if (mirrorX) {
-          // Reflecting all 3 axes (-x, -y, -z) preserves cross product sign
-          this.tmpPalmNormal.set(pose.palmNormal.x, pose.palmNormal.y, pose.palmNormal.z);
-        } else {
-          // Negating Y and Z preserves X sign and flips Y, Z of cross product
-          this.tmpPalmNormal.set(pose.palmNormal.x, -pose.palmNormal.y, -pose.palmNormal.z);
-        }
-
-        // Convert vIndex x vPinky into outward dorsal normal (+Z local = back of hand, -Z local = palm)
-        // for both Left/Right hands and mirrorX true/false
-        if (((effectiveHandedness ?? 'Right') === 'Right') !== mirrorX) {
-          this.tmpPalmNormal.negate();
-        }
-
-        if (this.tmpPalmNormal.lengthSq() < 1e-4) {
-          this.tmpPalmNormal.set(0, 0, 1);
-        } else {
-          this.tmpPalmNormal.normalize();
-        }
-      } else if (pose.wrist) {
-        this.landmarkToScene(pose.wrist, rect, cssH, mirrorX, poseRefZ, this.tmpWrist);
-        this.tmpVecA.copy(this.tmpMcp).sub(this.tmpWrist);
-        this.tmpVecB.copy(this.tmpPip).sub(this.tmpMcp);
-        this.tmpPalmNormal.crossVectors(this.tmpVecA, this.tmpVecB);
-        if (this.tmpPalmNormal.lengthSq() < 1e-4) {
-          this.tmpPalmNormal.set(0, 0, 1);
-        } else {
-          this.tmpPalmNormal.normalize();
-        }
-      } else {
-        this.tmpPalmNormal.set(0, 0, 1);
+      // Cached per-finger volumetric geometry & conformal cuticle skirt
+      const nailGeo = this.getOrCreateNailGeometry(activeShape, tipRoundness);
+      if (rig.nailMesh.geometry !== nailGeo) {
+        rig.nailMesh.geometry = nailGeo;
       }
 
-      // Guard against isolated 1-frame spurious dorsalNormal inversion (dot < -0.5)
-      // while keeping gradual real hand rotation 100% fluid
-      if (!rig.initialized) {
-        rig.filteredDorsalNormal.copy(this.tmpPalmNormal);
-        rig.normalFlipConfirmCount = 0;
-      } else {
-        const dotN = Math.max(-1, Math.min(1, rig.filteredDorsalNormal.dot(this.tmpPalmNormal)));
-        if (dotN < -0.5) {
-          rig.normalFlipConfirmCount++;
-          if (rig.normalFlipConfirmCount < 3) {
-            this.tmpPalmNormal.copy(rig.filteredDorsalNormal);
-          } else {
-            rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, 0.35).normalize();
-            rig.normalFlipConfirmCount = 0;
-          }
-        } else {
-          rig.normalFlipConfirmCount = 0;
-          const angleN = Math.acos(dotN);
-          const normalAlpha = isStationary
-            ? 0.04
-            : angleN < 0.035
-              ? 0.08
-              : Math.min(0.78, 0.22 + ((angleN - 0.035) / 0.28) * 0.56);
-          rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, normalAlpha).normalize();
-        }
+      const skirtGeo = this.getOrCreateSkirtGeometry(activeShape);
+      if (rig.cuticleSkirtMesh.geometry !== skirtGeo) {
+        rig.cuticleSkirtMesh.geometry = skirtGeo;
       }
-      this.tmpPalmNormal.copy(rig.filteredDorsalNormal);
 
-      // Gram-Schmidt right-handed orthonormal basis (det = +1):
-      // Z = dorsalNormal orthogonalized against Y, X = normalize(Y × Z), Z = normalize(X × Y)
-      this.tmpAxisZ
-        .copy(this.tmpPalmNormal)
-        .addScaledVector(this.tmpAxisY, -this.tmpPalmNormal.dot(this.tmpAxisY));
-      if (this.tmpAxisZ.lengthSq() < 1e-4) {
-        if (Math.abs(this.tmpAxisY.z) < 0.9) {
-          this.tmpAxisZ.set(0, 0, 1);
-        } else {
-          this.tmpAxisZ.set(1, 0, 0);
-        }
-        this.tmpAxisZ
-          .addScaledVector(this.tmpAxisY, -this.tmpAxisZ.dot(this.tmpAxisY))
-          .normalize();
-      } else {
-        this.tmpAxisZ.normalize();
+      applyDorsalMaterialOpacity(rig.dorsalMaterial, adjustment.opacity);
+      rig.undersideBundle.material.opacity = clamp(adjustment.opacity, 0.7, 1.0);
+
+      // Metric dimensions directly from filtered 3D worldLandmarks (in meters)
+      const metrics = computeFingerMetricDimensions(fingerId, filtered.worldLandmarks);
+      if (fingerId === 'middle') {
+        refPalmThicknessMeters = metrics.palmThicknessMeters;
       }
-      this.tmpAxisX.crossVectors(this.tmpAxisY, this.tmpAxisZ).normalize();
-      // Re-orthogonalize Z = X × Y for exact right-handed orthonormal basis (det(M) = +1)
-      this.tmpAxisZ.crossVectors(this.tmpAxisX, this.tmpAxisY).normalize();
 
-      this.tmpMatrix.makeBasis(this.tmpAxisX, this.tmpAxisY, this.tmpAxisZ);
-      this.tmpTargetQuat.setFromRotationMatrix(this.tmpMatrix);
+      // Guaranteed right-handed SO(3) anatomical basis (det === +1)
+      const basis = computeFingerAnatomicalBasis(
+        fingerId,
+        points3D,
+        filtered.handedness,
+        mirrorX,
+        this.tmpBasisMatrix
+      );
+      basis.extractBasis(this.tmpAxisX, this.tmpAxisY, this.tmpAxisZ);
 
+      this.tmpNailQuat.setFromRotationMatrix(basis);
       if (Math.abs(adjustment.rotationDeg) > 0.01) {
-        this.tmpRotOffsetQuat.setFromAxisAngle(
-          this.tmpAxisZ,
-          (-adjustment.rotationDeg * Math.PI) / 180
-        );
-        this.tmpTargetQuat.premultiply(this.tmpRotOffsetQuat);
+        this.tmpRotOffsetQuat.setFromAxisAngle(this.tmpAxisZ, rotRad);
+        this.tmpNailQuat.premultiply(this.tmpRotOffsetQuat);
       }
 
-      // Cuticle anchor strictly at lerp(DIP, TIP, 0.40)
-      this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, 0.40);
-
-      // True anatomical 3D nail sizing driven strictly by pxPerMeter & 3D distal length (zero 2D foreshortening distortion!)
-      const fingerSpec = this.cachedFingerSpecs?.[pose.id];
-      const specLengthMult = Math.max(
-        0.85,
-        Math.min(1.65, fingerSpec?.lengthMultiplier ?? fingerSpec?.relativeLength ?? 1.0)
-      );
-
-      const anatomicalW = pxPerMeter * (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138);
-      const minSensibleW = Math.max(4.5, rect.drawW * 0.014);
-      const maxSensibleW = rect.drawW * 0.22;
-      const nailW = Math.max(
-        minSensibleW,
-        Math.min(maxSensibleW, anatomicalW * adjustment.scale)
-      );
-
-      const anatomicalDistal3D = pxPerMeter * (ANATOMICAL_DISTAL_METERS[pose.id] ?? 0.021);
-      const stabilizedDistal3D = anatomicalDistal3D * 0.72 + segLen3D * 0.28;
-      // Natural nail plate (1.0x) = 0.58 * dist3D(DIP, TIP), absolute ceiling 1.65x
-      const naturalBaseH = 0.58 * stabilizedDistal3D;
-      const finalLengthMult = Math.min(
-        1.65,
-        Math.max(0.85, specLengthMult * shapeMult * adjustment.extensionLength)
-      );
-      const nailH = naturalBaseH * finalLengthMult * adjustment.scale;
-      const nailDepth = nailW;
-
-      // Physical Z-Buffer Clearance:
-      // Ventral-shifted distal occluder (-0.22 * fingerThickness) + guaranteed >= 2.5px positive Z clearance
-      const fingerThickness = nailW * 0.96;
-      const distalOccluderRadius = Math.max(nailW * 0.52, fingerThickness * 0.50);
-      const ventralShift = 0.22 * fingerThickness;
-      const dorsalOffset = Math.max(
-        0.52 * fingerThickness,
-        distalOccluderRadius - ventralShift + 2.5
-      );
-
-      this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, dorsalOffset);
-      this.tmpTargetScale.set(nailW, nailH, nailDepth);
-
-      // High-stability One-Euro Filter + Zero-Jitter Lock when stationary (< 1.2px raw movement)
-      const wasInitialized = rig.initialized;
-      let slerpAlpha = 0.22;
-
-      if (!wasInitialized) {
-        rig.currentPos.set(
-          rig.posFilters[0].filter(this.tmpTargetPos.x, dt),
-          rig.posFilters[1].filter(this.tmpTargetPos.y, dt),
-          rig.posFilters[2].filter(this.tmpTargetPos.z, dt)
-        );
-        rig.currentScale.set(
-          rig.scaleFilters[0].filter(this.tmpTargetScale.x, dt),
-          rig.scaleFilters[1].filter(this.tmpTargetScale.y, dt),
-          rig.scaleFilters[2].filter(this.tmpTargetScale.z, dt)
-        );
-        rig.currentQuat.copy(this.tmpTargetQuat);
-        rig.initialized = true;
+      // Real nail length in meters without double multiplication:
+      // bedLengthMeters covers v ∈ [0, 0.58] (cuticle lerp(DIP, TIP, 0.22) -> TIP)
+      let totalLenMeters: number;
+      if (spec?.extensionMm !== undefined && Number.isFinite(spec.extensionMm)) {
+        const extMeters = clamp(spec.extensionMm, 0.5, 13.0) / 1000;
+        totalLenMeters = (metrics.bedLengthMeters + extMeters) * fineExtMult;
       } else {
-        const fedTargetX = isStationary
-          ? rig.currentPos.x * 0.92 + this.tmpTargetPos.x * 0.08
-          : this.tmpTargetPos.x;
-        const fedTargetY = isStationary
-          ? rig.currentPos.y * 0.92 + this.tmpTargetPos.y * 0.08
-          : this.tmpTargetPos.y;
-        const fedTargetZ = isStationary
-          ? rig.currentPos.z * 0.92 + this.tmpTargetPos.z * 0.08
-          : this.tmpTargetPos.z;
-
-        const fx = rig.posFilters[0].filter(fedTargetX, dt, isStationary ? 0.5 : 0.35);
-        const fy = rig.posFilters[1].filter(fedTargetY, dt, isStationary ? 0.5 : 0.35);
-        const fz = rig.posFilters[2].filter(fedTargetZ, dt, isStationary ? 0.6 : 0.45);
-        const moveDist = Math.hypot(
-          fx - rig.currentPos.x,
-          fy - rig.currentPos.y,
-          fz - rig.currentPos.z
+        const lenMult = clamp(
+          spec?.lengthMultiplier ?? spec?.relativeLength ?? 1.15,
+          0.92,
+          1.65
         );
-        rig.currentPos.set(fx, fy, fz);
-
-        const fedScaleX = isStationary
-          ? rig.currentScale.x * 0.92 + this.tmpTargetScale.x * 0.08
-          : this.tmpTargetScale.x;
-        const fedScaleY = isStationary
-          ? rig.currentScale.y * 0.92 + this.tmpTargetScale.y * 0.08
-          : this.tmpTargetScale.y;
-        const fedScaleZ = isStationary
-          ? rig.currentScale.z * 0.92 + this.tmpTargetScale.z * 0.08
-          : this.tmpTargetScale.z;
-
-        const scaleDeadband = Math.max(0.18, nailW * 0.006);
-        rig.currentScale.set(
-          rig.scaleFilters[0].filter(fedScaleX, dt, scaleDeadband),
-          rig.scaleFilters[1].filter(fedScaleY, dt, scaleDeadband),
-          rig.scaleFilters[2].filter(fedScaleZ, dt, scaleDeadband)
-        );
-
-        const angleDelta = rig.currentQuat.angleTo(this.tmpTargetQuat);
-        const posSpeed = moveDist / Math.max(1, nailW) / dt;
-        const rotSpeed = angleDelta / dt;
-        if (angleDelta < 0.035 && posSpeed < 0.65) {
-          // Strong rotational damping when hand is still (< 0.035 rad) to eliminate jitter
-          slerpAlpha = 0.09 + (angleDelta / 0.035) * 0.07;
-        } else {
-          // Low-latency adaptive slerp when hand turns deliberately
-          const velocityNorm = Math.min(1, posSpeed * 0.16 + rotSpeed * 0.28);
-          slerpAlpha = 0.24 + velocityNorm * (0.78 - 0.24);
-        }
-        if (isStationary) {
-          slerpAlpha *= 0.12;
-        }
-        rig.currentQuat.slerp(this.tmpTargetQuat, slerpAlpha);
+        totalLenMeters = metrics.bedLengthMeters * lenMult * fineExtMult;
       }
+      totalLenMeters = Math.min(totalLenMeters, metrics.bedLengthMeters * 1.85);
 
-      rig.nailMesh.position.copy(rig.currentPos);
-      rig.nailMesh.quaternion.copy(rig.currentQuat);
-      rig.nailMesh.scale.copy(rig.currentScale);
+      const nailWMeters =
+        metrics.nailWidthMeters *
+        clamp(spec?.relativeWidth ?? 1.0, 0.88, 1.18) *
+        fineWidthMult;
+      const nailDepthMeters = nailWMeters;
+
+      // Dorsal cuticle anchor strictly attached to distal cylinder surface (zero profile gap)
+      this.tmpCuticlePos.copy(dipPt).lerp(tipPt, 0.22);
+      const dorsalOffset = metrics.phalanxRadiusMeters * 0.88;
+      this.tmpNailPos
+        .copy(this.tmpCuticlePos)
+        .addScaledVector(this.tmpAxisZ, dorsalOffset);
+
+      rig.nailMesh.position.copy(this.tmpNailPos);
+      rig.nailMesh.quaternion.copy(this.tmpNailQuat);
+      rig.nailMesh.scale.set(nailWMeters, totalLenMeters, nailDepthMeters);
       rig.nailMesh.visible = true;
 
-      // Dorsal normal dotted with camera view vector (0, 0, 1) is simply this.tmpAxisZ.z
-      const dorsalDotView = this.tmpAxisZ.z;
-
-      // Subtle dorsal AO contact shadow skirt: fade out naturally when palm faces camera
-      const aoOpacity = Math.max(0, Math.min(1, (dorsalDotView + 0.05) / 0.25));
-      if (aoOpacity > 0.02) {
-        this.tmpAoPos
-          .copy(rig.currentPos)
-          .addScaledVector(this.tmpAxisY, rig.currentScale.y * 0.46)
-          .addScaledVector(this.tmpAxisZ, -nailW * 0.025);
-        rig.aoShadowMesh.position.copy(this.tmpAoPos);
-        rig.aoShadowMesh.quaternion.copy(rig.currentQuat);
-        rig.aoShadowMesh.scale.set(rig.currentScale.x * 1.18, rig.currentScale.y * 0.94, 1);
-        rig.aoShadowMaterial.opacity = aoOpacity;
-        rig.aoShadowMesh.visible = true;
+      // Conformal Cuticle & Lateral Sulcus AO Contact Skirt aligned 1:1 with nail plate
+      const dorsalDotView = -this.tmpAxisZ.z; // camera looks toward -Z, toward camera is +Z => +this.tmpAxisZ.z
+      const skirtOpacity = clamp((this.tmpAxisZ.z + 0.05) / 0.25, 0, 1);
+      if (skirtOpacity > 0.02 && adjustment.opacity > 0.2) {
+        rig.cuticleSkirtMesh.position.copy(this.tmpNailPos);
+        rig.cuticleSkirtMesh.quaternion.copy(this.tmpNailQuat);
+        rig.cuticleSkirtMesh.scale.set(nailWMeters, totalLenMeters, nailDepthMeters);
+        rig.cuticleSkirtMesh.visible = true;
       } else {
-        rig.aoShadowMesh.visible = false;
+        rig.cuticleSkirtMesh.visible = false;
       }
+      void dorsalDotView;
 
-      // 3 physical invisible CapsuleGeometry phalanx occluders per finger (`renderOrder: 1`)
-      const fingerWidthRatio =
-        (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138) / ANATOMICAL_WIDTH_METERS.index;
-      const proximalRadius = distalOccluderRadius * 1.14 * Math.max(0.88, Math.min(1.12, fingerWidthRatio));
-      const middleRadius = distalOccluderRadius * 1.06 * Math.max(0.9, Math.min(1.1, fingerWidthRatio));
-      const occSlerpAlpha = isStationary ? slerpAlpha : Math.max(0.35, slerpAlpha);
+      // Volumetric Phalanx Cylinder + Joint Sphere Occluders (renderOrder = 1)
+      const distalRadius = metrics.phalanxRadiusMeters;
+      const middleRadius = distalRadius * 1.08;
+      const proximalRadius = distalRadius * 1.16;
 
-      // 1. Proximal phalanx (MCP -> PIP)
-      this.updatePhalanxOccluder(
-        rig.proximalOccluder,
-        this.tmpMcp,
-        this.tmpPip,
-        proximalRadius,
-        occSlerpAlpha,
-        wasInitialized
-      );
+      this.positionCylinderSegment(rig.proximalRodMesh, mcpPt, pipPt, proximalRadius);
+      this.positionCylinderSegment(rig.middleRodMesh, pipPt, dipPt, middleRadius);
+      this.positionCylinderSegment(rig.distalRodMesh, dipPt, tipPt, distalRadius * 0.82);
 
-      // 2. Middle phalanx (PIP -> DIP)
-      this.updatePhalanxOccluder(
-        rig.middleOccluder,
-        this.tmpPip,
-        this.tmpDip,
-        middleRadius,
-        occSlerpAlpha,
-        wasInitialized
-      );
+      this.positionJointSphere(rig.mcpJointMesh, mcpPt, proximalRadius * 1.03);
+      this.positionJointSphere(rig.pipJointMesh, pipPt, middleRadius * 1.02);
+      this.positionJointSphere(rig.dipJointMesh, dipPt, distalRadius * 1.0);
 
-      // 3. Distal phalanx (DIP -> TIP + 4%): ends strictly at TIP + 0.04*(TIP-DIP) and shifted ventrally (-0.22 * fingerThickness)
-      this.tmpVecA
-        .copy(this.tmpDip)
-        .addScaledVector(this.tmpAxisZ, -ventralShift);
-      this.tmpVecB
-        .copy(this.tmpTip)
-        .sub(this.tmpDip)
-        .multiplyScalar(1.04)
-        .add(this.tmpDip)
-        .addScaledVector(this.tmpAxisZ, -ventralShift);
-      this.updatePhalanxOccluder(
-        rig.distalOccluder,
-        this.tmpVecA,
-        this.tmpVecB,
-        distalOccluderRadius,
-        occSlerpAlpha,
-        wasInitialized
-      );
+      // Ventral Distal Pulp Sphere: centered at lerp(DIP, TIP, 0.82) shifted -0.12*distalRadius along -axisZ
+      this.tmpPulpPos
+        .copy(dipPt)
+        .lerp(tipPt, 0.82)
+        .addScaledVector(this.tmpAxisZ, -0.12 * distalRadius);
+      this.positionJointSphere(rig.distalPulpMesh, this.tmpPulpPos, distalRadius * 0.96);
     }
 
-    for (const [id, rig] of this.fingerRigs.entries()) {
-      if (!seenIds.has(id)) {
-        this.hideRig(rig);
-      }
-    }
+    // 6. Closed Volumetric Extruded Palm / Metacarpal Occluder (renderOrder = 1)
+    this.updatePalmOccluder(points3D, refPalmThicknessMeters);
 
     renderer.render(this.scene, this.camera);
   }
 
   public dispose(): void {
-    for (const geo of this.geometries.values()) {
+    for (const geo of this.nailGeometries.values()) {
       geo.dispose();
     }
-    this.geometries.clear();
+    this.nailGeometries.clear();
+
+    for (const geo of this.skirtGeometries.values()) {
+      geo.dispose();
+    }
+    this.skirtGeometries.clear();
 
     for (const rig of this.fingerRigs.values()) {
       rig.dorsalMaterial.dispose();
-      rig.aoShadowMaterial.dispose();
+      rig.undersideBundle.dispose();
     }
+    this.fingerRigs.clear();
 
     this.cachedPBRBundles.clear();
-    this.aoShadowGeometry.dispose();
-    this.aoShadowTexture.dispose();
-    this.undersideTexture.dispose();
-    this.undersideMaterial.dispose();
-    this.occluderGeometry.dispose();
+    this.skirtMaterialBundle.material.dispose();
+    this.skirtMaterialBundle.texture.dispose();
+    this.palmOccluderGeo.dispose();
+    this.unitCylinderGeo.dispose();
+    this.unitSphereGeo.dispose();
     this.occluderMaterial.dispose();
     this.envMap?.dispose();
+    this.envMap = null;
     this.renderer?.dispose();
     this.renderer = null;
-  }
-}
-
-// Lightweight reusable 8x8 sampler for real-time skin ambient light between PIP & DIP
-let skinSamplerCanvas: HTMLCanvasElement | null = null;
-let skinSamplerCtx: CanvasRenderingContext2D | null = null;
-
-export function sampleFingerSkinAmbient(
-  source: HTMLVideoElement | HTMLImageElement,
-  poses: FingerPose[],
-  prevSample: AmbientLightSample
-): AmbientLightSample {
-  const srcW = source instanceof HTMLVideoElement ? source.videoWidth : source.naturalWidth;
-  const srcH = source instanceof HTMLVideoElement ? source.videoHeight : source.naturalHeight;
-  if (!srcW || !srcH || poses.length === 0) return prevSample;
-
-  if (!skinSamplerCanvas) {
-    skinSamplerCanvas = document.createElement('canvas');
-    skinSamplerCanvas.width = 8;
-    skinSamplerCanvas.height = 8;
-    skinSamplerCtx = skinSamplerCanvas.getContext('2d', { willReadFrequently: true });
-  }
-  if (!skinSamplerCtx) return prevSample;
-
-  const refPose =
-    poses.find((p) => p.id === 'middle') ?? poses.find((p) => p.id === 'index') ?? poses[0];
-
-  const skinNormX = refPose.pip ? (refPose.dip.x + refPose.pip.x) * 0.5 : refPose.dip.x;
-  const skinNormY = refPose.pip
-    ? (refPose.dip.y + refPose.pip.y) * 0.5
-    : Math.min(0.95, refPose.dip.y + 0.04);
-
-  const patch = Math.max(8, Math.round(Math.min(srcW, srcH) * 0.028));
-  const sx = Math.max(0, Math.min(srcW - patch, Math.round(skinNormX * srcW - patch / 2)));
-  const sy = Math.max(0, Math.min(srcH - patch, Math.round(skinNormY * srcH - patch / 2)));
-
-  try {
-    skinSamplerCtx.drawImage(source, sx, sy, patch, patch, 0, 0, 8, 8);
-    const { data } = skinSamplerCtx.getImageData(0, 0, 8, 8);
-    let r = 0;
-    let g = 0;
-    let b = 0;
-    const count = data.length / 4;
-    for (let i = 0; i < data.length; i += 4) {
-      r += data[i];
-      g += data[i + 1];
-      b += data[i + 2];
-    }
-    const nr = r / count / 255;
-    const ng = g / count / 255;
-    const nb = b / count / 255;
-    const nluma = 0.299 * nr + 0.587 * ng + 0.114 * nb;
-
-    const alpha = 0.14;
-    return {
-      r: prevSample.r + (nr - prevSample.r) * alpha,
-      g: prevSample.g + (ng - prevSample.g) * alpha,
-      b: prevSample.b + (nb - prevSample.b) * alpha,
-      luma: prevSample.luma + (nluma - prevSample.luma) * alpha,
-    };
-  } catch {
-    return prevSample;
+    this.ready = false;
   }
 }

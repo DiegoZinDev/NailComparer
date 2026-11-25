@@ -1,11 +1,17 @@
 import type {
+  FingerId,
   NailCategory,
   NailDesign,
+  NailFingerDesignSpec,
+  NailFingerSpecsMap,
+  NailFinish,
   NailPatternType,
+  NailShape,
   NailStyleType,
 } from '../entities/NailDesign.js';
 
 export const VALID_NAIL_CATEGORIES: readonly NailCategory[] = [
+  'estudio',
   'francesinha',
   'gel',
   'cromado',
@@ -30,19 +36,49 @@ export const VALID_NAIL_PATTERN_TYPES: readonly NailPatternType[] = [
   'custom-photo',
 ] as const;
 
+export const VALID_NAIL_FINISHES: readonly NailFinish[] = [
+  'glossy',
+  'chrome',
+  'velvet',
+  'glitter',
+] as const;
+
+export const VALID_NAIL_SHAPES: readonly NailShape[] = [
+  'natural',
+  'oval',
+  'almond',
+  'square',
+  'coffin',
+  'stiletto',
+] as const;
+
+export const VALID_FINGER_IDS: readonly FingerId[] = [
+  'thumb',
+  'index',
+  'middle',
+  'ring',
+  'pinky',
+] as const;
+
 export interface NailDesignDTO {
   id: string;
   name: string;
   category: NailCategory;
   styleType: NailStyleType;
   baseColor: string;
+  secondaryColor: string | null;
   accentColor: string;
+  finish: NailFinish;
   patternType: NailPatternType;
   imageDataUrl: string | null;
   defaultScale: number;
   defaultRotation: number;
   defaultOpacity: number;
   isCustomReference: boolean;
+  isStudioCatalog: boolean;
+  detectedShape: NailShape | null;
+  detectedLength: number | null;
+  fingerSpecs: NailFingerSpecsMap | null;
   createdAt: string;
 }
 
@@ -52,13 +88,19 @@ export interface CreateNailDesignDTO {
   category: NailCategory;
   styleType?: NailStyleType;
   baseColor?: string;
+  secondaryColor?: string | null;
   accentColor?: string;
+  finish?: NailFinish;
   patternType?: NailPatternType;
   imageDataUrl?: string | null;
   defaultScale?: number;
   defaultRotation?: number;
   defaultOpacity?: number;
   isCustomReference?: boolean;
+  isStudioCatalog?: boolean;
+  detectedShape?: NailShape | null;
+  detectedLength?: number | null;
+  fingerSpecs?: NailFingerSpecsMap | null;
 }
 
 export interface UpdateNailDesignDTO {
@@ -66,13 +108,19 @@ export interface UpdateNailDesignDTO {
   category?: NailCategory;
   styleType?: NailStyleType;
   baseColor?: string;
+  secondaryColor?: string | null;
   accentColor?: string;
+  finish?: NailFinish;
   patternType?: NailPatternType;
   imageDataUrl?: string | null;
   defaultScale?: number;
   defaultRotation?: number;
   defaultOpacity?: number;
   isCustomReference?: boolean;
+  isStudioCatalog?: boolean;
+  detectedShape?: NailShape | null;
+  detectedLength?: number | null;
+  fingerSpecs?: NailFingerSpecsMap | null;
 }
 
 export type NailDesignValidationResult<T> =
@@ -103,12 +151,118 @@ export function isValidNailPatternType(value: unknown): value is NailPatternType
   );
 }
 
+export function isValidNailFinish(value: unknown): value is NailFinish {
+  return (
+    typeof value === 'string' &&
+    (VALID_NAIL_FINISHES as readonly string[]).includes(value)
+  );
+}
+
+export function isValidNailShape(value: unknown): value is NailShape {
+  return (
+    typeof value === 'string' &&
+    (VALID_NAIL_SHAPES as readonly string[]).includes(value)
+  );
+}
+
 function isValidHexColor(value: unknown): value is string {
   return typeof value === 'string' && HEX_COLOR_REGEX.test(value.trim());
 }
 
 function isFiniteNumberInRange(value: unknown, min: number, max: number): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+}
+
+function parseAndValidateFingerSpecsInput(
+  rawFingerSpecs: unknown,
+  rawFingerSpecsJson: unknown,
+  errors: string[]
+): { provided: boolean; value: NailFingerSpecsMap | null } {
+  if (rawFingerSpecs === undefined && rawFingerSpecsJson === undefined) {
+    return { provided: false, value: null };
+  }
+
+  let candidate: unknown = rawFingerSpecs;
+
+  if (candidate === undefined && rawFingerSpecsJson !== undefined) {
+    if (rawFingerSpecsJson === null) {
+      return { provided: true, value: null };
+    }
+    if (typeof rawFingerSpecsJson !== 'string') {
+      errors.push('fingerSpecsJson deve ser uma string JSON válida ou null.');
+      return { provided: true, value: null };
+    }
+    const trimmed = rawFingerSpecsJson.trim();
+    if (!trimmed) {
+      return { provided: true, value: null };
+    }
+    try {
+      candidate = JSON.parse(trimmed);
+    } catch {
+      errors.push('fingerSpecsJson contém JSON inválido.');
+      return { provided: true, value: null };
+    }
+  } else if (typeof candidate === 'string') {
+    const trimmed = candidate.trim();
+    if (!trimmed) {
+      return { provided: true, value: null };
+    }
+    try {
+      candidate = JSON.parse(trimmed);
+    } catch {
+      errors.push('fingerSpecs contém JSON inválido.');
+      return { provided: true, value: null };
+    }
+  }
+
+  if (candidate === null) {
+    return { provided: true, value: null };
+  }
+
+  if (typeof candidate !== 'object' || Array.isArray(candidate)) {
+    errors.push(
+      'fingerSpecs deve ser um objeto indexado pelos dedos (thumb, index, middle, ring, pinky).'
+    );
+    return { provided: true, value: null };
+  }
+
+  const record = candidate as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 0) {
+    errors.push('fingerSpecs não pode ser um objeto vazio.');
+    return { provided: true, value: null };
+  }
+
+  const sanitizedMap: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
+  for (const key of keys) {
+    if (!(VALID_FINGER_IDS as readonly string[]).includes(key)) {
+      errors.push(
+        `Chave inválida "${key}" em fingerSpecs. Dedos aceitos: ${VALID_FINGER_IDS.join(', ')}.`
+      );
+      continue;
+    }
+    const spec = record[key];
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      errors.push(`fingerSpecs.${key} deve ser um objeto válido.`);
+      continue;
+    }
+    const specObj = spec as Record<string, unknown>;
+    if (specObj.shape !== undefined && !isValidNailShape(specObj.shape)) {
+      errors.push(
+        `fingerSpecs.${key}.shape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+      );
+      continue;
+    }
+    sanitizedMap[key as FingerId] = {
+      ...(specObj as unknown as NailFingerDesignSpec),
+      fingerId: key as FingerId,
+    };
+  }
+
+  return {
+    provided: true,
+    value: sanitizedMap as NailFingerSpecsMap,
+  };
 }
 
 export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
@@ -118,13 +272,19 @@ export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
     category: entity.category,
     styleType: entity.styleType,
     baseColor: entity.baseColor,
+    secondaryColor: entity.secondaryColor,
     accentColor: entity.accentColor,
+    finish: entity.finish,
     patternType: entity.patternType,
     imageDataUrl: entity.imageDataUrl,
     defaultScale: entity.defaultScale,
     defaultRotation: entity.defaultRotation,
     defaultOpacity: entity.defaultOpacity,
     isCustomReference: entity.isCustomReference,
+    isStudioCatalog: entity.isStudioCatalog,
+    detectedShape: entity.detectedShape,
+    detectedLength: entity.detectedLength,
+    fingerSpecs: entity.fingerSpecs,
     createdAt: entity.createdAt,
   };
 }
@@ -199,6 +359,28 @@ export function validateCreateNailDesignDTO(
     errors.push('accentColor deve ser uma cor hexadecimal válida (ex: #FFFFFF).');
   }
 
+  let secondaryColor: string | null = null;
+  if (input.secondaryColor !== undefined && input.secondaryColor !== null) {
+    if (typeof input.secondaryColor === 'string' && input.secondaryColor.trim() === '') {
+      secondaryColor = null;
+    } else if (!isValidHexColor(input.secondaryColor)) {
+      errors.push('secondaryColor deve ser uma cor hexadecimal válida ou null.');
+    } else {
+      secondaryColor = input.secondaryColor.trim().toUpperCase();
+    }
+  }
+
+  let finish: NailFinish = 'glossy';
+  if (input.finish !== undefined) {
+    if (!isValidNailFinish(input.finish)) {
+      errors.push(
+        `finish inválido. Valores aceitos: ${VALID_NAIL_FINISHES.join(', ')}.`
+      );
+    } else {
+      finish = input.finish;
+    }
+  }
+
   let imageDataUrl: string | null = null;
   if (input.imageDataUrl !== undefined && input.imageDataUrl !== null) {
     if (typeof input.imageDataUrl !== 'string') {
@@ -248,9 +430,54 @@ export function validateCreateNailDesignDTO(
     }
   }
 
+  let isStudioCatalog = false;
+  if (input.isStudioCatalog !== undefined) {
+    if (typeof input.isStudioCatalog !== 'boolean') {
+      errors.push('isStudioCatalog deve ser boolean.');
+    } else {
+      isStudioCatalog = input.isStudioCatalog;
+    }
+  }
+
+  let detectedShape: NailShape | null = null;
+  if (input.detectedShape !== undefined && input.detectedShape !== null) {
+    if (!isValidNailShape(input.detectedShape)) {
+      errors.push(
+        `detectedShape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+      );
+    } else {
+      detectedShape = input.detectedShape;
+    }
+  }
+
+  let detectedLength: number | null = null;
+  if (input.detectedLength !== undefined && input.detectedLength !== null) {
+    if (!isFiniteNumberInRange(input.detectedLength, 0.4, 3.0)) {
+      errors.push('detectedLength deve ser um número finito entre 0.4 e 3.0.');
+    } else {
+      detectedLength = input.detectedLength;
+    }
+  }
+
+  const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
+    input.fingerSpecs,
+    input.fingerSpecsJson,
+    errors
+  );
+
   if (errors.length > 0) {
     return { valid: false, errors };
   }
+
+  const resolvedIsCustom =
+    input.isCustomReference !== undefined
+      ? isCustomReference
+      : input.category === 'cliente' || styleType === 'image';
+
+  const resolvedIsStudioCatalog =
+    input.isStudioCatalog !== undefined
+      ? isStudioCatalog
+      : input.category === 'estudio';
 
   const result: CreateNailDesignDTO = {
     ...(input.id !== undefined ? { id: (input.id as string).trim() } : {}),
@@ -258,16 +485,19 @@ export function validateCreateNailDesignDTO(
     category: input.category as NailCategory,
     styleType,
     baseColor: (baseColor as string).trim().toUpperCase(),
+    secondaryColor,
     accentColor: (accentColor as string).trim().toUpperCase(),
+    finish,
     patternType,
     imageDataUrl,
     defaultScale: defaultScale as number,
     defaultRotation: defaultRotation as number,
     defaultOpacity: defaultOpacity as number,
-    isCustomReference:
-      input.isCustomReference !== undefined
-        ? isCustomReference
-        : input.category === 'cliente' || styleType === 'image',
+    isCustomReference: resolvedIsCustom,
+    isStudioCatalog: resolvedIsStudioCatalog,
+    detectedShape,
+    detectedLength,
+    fingerSpecs: parsedFingerSpecs.provided ? parsedFingerSpecs.value : null,
   };
 
   return { valid: true, data: result };
@@ -322,11 +552,33 @@ export function validateUpdateNailDesignDTO(
     }
   }
 
+  if (input.secondaryColor !== undefined) {
+    if (input.secondaryColor === null) {
+      sanitized.secondaryColor = null;
+    } else if (typeof input.secondaryColor === 'string' && input.secondaryColor.trim() === '') {
+      sanitized.secondaryColor = null;
+    } else if (!isValidHexColor(input.secondaryColor)) {
+      errors.push('secondaryColor deve ser uma cor hexadecimal válida ou null.');
+    } else {
+      sanitized.secondaryColor = input.secondaryColor.trim().toUpperCase();
+    }
+  }
+
   if (input.accentColor !== undefined) {
     if (!isValidHexColor(input.accentColor)) {
       errors.push('accentColor deve ser uma cor hexadecimal válida.');
     } else {
       sanitized.accentColor = input.accentColor.trim().toUpperCase();
+    }
+  }
+
+  if (input.finish !== undefined) {
+    if (!isValidNailFinish(input.finish)) {
+      errors.push(
+        `finish inválido. Valores aceitos: ${VALID_NAIL_FINISHES.join(', ')}.`
+      );
+    } else {
+      sanitized.finish = input.finish;
     }
   }
 
@@ -392,6 +644,45 @@ export function validateUpdateNailDesignDTO(
     } else {
       sanitized.isCustomReference = input.isCustomReference;
     }
+  }
+
+  if (input.isStudioCatalog !== undefined) {
+    if (typeof input.isStudioCatalog !== 'boolean') {
+      errors.push('isStudioCatalog deve ser boolean.');
+    } else {
+      sanitized.isStudioCatalog = input.isStudioCatalog;
+    }
+  }
+
+  if (input.detectedShape !== undefined) {
+    if (input.detectedShape === null) {
+      sanitized.detectedShape = null;
+    } else if (!isValidNailShape(input.detectedShape)) {
+      errors.push(
+        `detectedShape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+      );
+    } else {
+      sanitized.detectedShape = input.detectedShape;
+    }
+  }
+
+  if (input.detectedLength !== undefined) {
+    if (input.detectedLength === null) {
+      sanitized.detectedLength = null;
+    } else if (!isFiniteNumberInRange(input.detectedLength, 0.4, 3.0)) {
+      errors.push('detectedLength deve ser um número finito entre 0.4 e 3.0.');
+    } else {
+      sanitized.detectedLength = input.detectedLength;
+    }
+  }
+
+  const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
+    input.fingerSpecs,
+    input.fingerSpecsJson,
+    errors
+  );
+  if (parsedFingerSpecs.provided) {
+    sanitized.fingerSpecs = parsedFingerSpecs.value;
   }
 
   if (errors.length > 0) {

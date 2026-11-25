@@ -17,11 +17,11 @@ import { ImportReferenceModal } from './components/ImportReferenceModal';
 import { MagneticDesignDock } from './components/MagneticDesignDock';
 import { NailAdjustControls } from './components/NailAdjustControls';
 import { WhiteLabelModal } from './components/WhiteLabelModal';
-import { DEFAULT_STUDIO_CONFIG, SEED_NAIL_DESIGNS } from './data/presets';
+import { DEFAULT_STUDIO_CONFIG } from './data/presets';
 import {
   type SyncStatus,
   createNailDesign,
-  deleteCustomDesign,
+  deleteDesign,
   loadNailDesigns,
   loadStudioConfig,
   saveStudioConfig,
@@ -41,11 +41,11 @@ interface BeforeInstallPromptEvent extends Event {
 }
 
 const DEFAULT_ADJUSTMENT: NailAdjustment = {
-  shape: 'almond',
-  extensionLength: 1.08,
-  scale: 1,
+  shape: 'natural',
+  extensionLength: 1.0,
+  scale: 1.0,
   rotationDeg: 0,
-  opacity: 0.94,
+  opacity: 0.98,
 };
 
 function applyCssVariables(config: StudioConfig): void {
@@ -64,10 +64,7 @@ function applyCssVariables(config: StudioConfig): void {
     '--glass-border',
     isLightSurface ? 'rgba(35, 31, 32, 0.14)' : 'rgba(255, 255, 255, 0.12)'
   );
-  root.style.setProperty(
-    '--glass-text',
-    isLightSurface ? '#1C191A' : '#FAF5F2'
-  );
+  root.style.setProperty('--glass-text', isLightSurface ? '#1C191A' : '#FAF5F2');
   root.style.setProperty(
     '--glass-muted',
     isLightSurface ? 'rgba(28, 25, 26, 0.62)' : 'rgba(250, 245, 242, 0.64)'
@@ -84,9 +81,9 @@ export function App(): React.ReactElement {
   const arRef = useRef<ARCameraCanvasHandle | null>(null);
 
   const [config, setConfig] = useState<StudioConfig>(DEFAULT_STUDIO_CONFIG);
-  const [designs, setDesigns] = useState<NailDesign[]>(SEED_NAIL_DESIGNS);
-  const [activeTab, setActiveTab] = useState<DockTab>('studio');
-  const [activeDesignId, setActiveDesignId] = useState<string>(SEED_NAIL_DESIGNS[0].id);
+  const [designs, setDesigns] = useState<NailDesign[]>([]);
+  const [activeTab, setActiveTab] = useState<DockTab>('client');
+  const [activeDesignId, setActiveDesignId] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
 
   const [mode, setMode] = useState<ARViewMode>('studio-demo');
@@ -98,6 +95,7 @@ export function App(): React.ReactElement {
   const [adjustOpen, setAdjustOpen] = useState<boolean>(false);
   const [whiteLabelOpen, setWhiteLabelOpen] = useState<boolean>(false);
   const [importOpen, setImportOpen] = useState<boolean>(false);
+  const [importModalMode, setImportModalMode] = useState<'client' | 'studio'>('client');
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [cameraNotice, setCameraNotice] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -127,7 +125,7 @@ export function App(): React.ReactElement {
     return () => window.clearTimeout(timer);
   }, [cameraNotice]);
 
-  // Hydrate studio config and catalog with backend -> IndexedDB offline fallback
+  // Hydrate studio config and real catalog/references with backend -> IndexedDB offline fallback
   useEffect(() => {
     let mounted = true;
     applyCssVariables(DEFAULT_STUDIO_CONFIG);
@@ -138,7 +136,16 @@ export function App(): React.ReactElement {
       applyCssVariables(cfgRes.config);
       setDesigns(desRes.designs);
       if (desRes.designs.length > 0) {
-        setActiveDesignId(desRes.designs[0].id);
+        const first = desRes.designs[0];
+        setActiveDesignId(first.id);
+        setActiveTab(first.isStudioCatalog || first.category === 'Estudio' ? 'studio' : 'client');
+        setAdjustment((prev) => ({
+          ...prev,
+          shape: first.detectedShape ?? 'natural',
+          extensionLength: 1.0,
+        }));
+      } else {
+        setActiveDesignId(null);
       }
       setSyncStatus(
         cfgRes.status === 'offline' || desRes.status === 'offline' ? 'offline' : 'synced'
@@ -150,10 +157,23 @@ export function App(): React.ReactElement {
     };
   }, []);
 
-  const activeDesign = useMemo(
-    () => designs.find((d) => d.id === activeDesignId) ?? designs[0] ?? SEED_NAIL_DESIGNS[0],
-    [designs, activeDesignId]
-  );
+  const activeDesign = useMemo<NailDesign | null>(() => {
+    if (designs.length === 0 || !activeDesignId) return null;
+    return designs.find((d) => d.id === activeDesignId) ?? null;
+  }, [designs, activeDesignId]);
+
+  const syncAdjustmentForDesign = useCallback((design: NailDesign) => {
+    setAdjustment((prev) => ({
+      ...prev,
+      shape: design.detectedShape ?? 'natural',
+      extensionLength: 1.0,
+    }));
+  }, []);
+
+  const openImportModal = useCallback((targetMode: 'client' | 'studio') => {
+    setImportModalMode(targetMode);
+    setImportOpen(true);
+  }, []);
 
   const handleSaveConfig = async (nextConfig: StudioConfig) => {
     setConfig(nextConfig);
@@ -166,38 +186,45 @@ export function App(): React.ReactElement {
 
   const handleCreateDesign = async (draft: Omit<NailDesign, 'id' | 'createdAt'>) => {
     const res = await createNailDesign(draft);
+    const isStudio = Boolean(
+      draft.isStudioCatalog ?? (draft.category === 'Estudio' || importModalMode === 'studio')
+    );
     const created: NailDesign = {
       ...res.design,
       fingerSpecs: draft.fingerSpecs ?? res.design.fingerSpecs,
       secondaryColor: draft.secondaryColor ?? res.design.secondaryColor,
       detectedShape: draft.detectedShape ?? res.design.detectedShape,
       detectedLength: draft.detectedLength ?? res.design.detectedLength,
+      isStudioCatalog: isStudio,
+      isCustom: !isStudio,
+      category: isStudio ? 'Estudio' : 'Cliente',
     };
     setDesigns((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
     setActiveDesignId(created.id);
-    if (created.detectedShape || created.detectedLength) {
-      setAdjustment((prev) => ({
-        ...prev,
-        shape: created.detectedShape ?? prev.shape,
-        extensionLength: created.detectedLength ?? prev.extensionLength,
-      }));
-    }
-    setActiveTab('client');
+    syncAdjustmentForDesign(created);
+    setActiveTab(isStudio ? 'studio' : 'client');
     setCompareClean(false);
     setSyncStatus(res.status);
   };
 
-  const handleDeleteCustom = async (id: string) => {
+  const handleDeleteDesign = async (id: string) => {
     const nextList = designs.filter((d) => d.id !== id);
     setDesigns(nextList);
-    if (activeDesignId === id && nextList[0]) {
-      setActiveDesignId(nextList[0].id);
+    if (activeDesignId === id) {
+      const nextDesign = nextList[0] ?? null;
+      setActiveDesignId(nextDesign ? nextDesign.id : null);
+      if (nextDesign) {
+        syncAdjustmentForDesign(nextDesign);
+      } else {
+        setAdjustment(DEFAULT_ADJUSTMENT);
+      }
     }
-    const status = await deleteCustomDesign(id);
+    const status = await deleteDesign(id);
     setSyncStatus(status);
   };
 
   const handleCapture = useCallback(() => {
+    if (!activeDesign) return;
     const dataUrl = arRef.current?.captureCompositeDataUrl(
       config.studioName,
       config.logoDataUrl
@@ -205,7 +232,7 @@ export function App(): React.ReactElement {
     if (dataUrl) {
       setCapturedImage(dataUrl);
     }
-  }, [config.studioName, config.logoDataUrl]);
+  }, [activeDesign, config.studioName, config.logoDataUrl]);
 
   const toggleMode = useCallback(() => {
     setCameraNotice(null);
@@ -221,6 +248,11 @@ export function App(): React.ReactElement {
     }
   }, [installPrompt]);
 
+  const arCanvasExtraProps = {
+    onRequestImportClient: () => openImportModal('client'),
+    onRequestImportStudio: () => openImportModal('studio'),
+  };
+
   return (
     <main className="studio-shell">
       {/* 100dvh Full-Bleed Live AR Viewport */}
@@ -229,11 +261,12 @@ export function App(): React.ReactElement {
         mode={mode}
         onModeChange={setMode}
         facingMode={facingMode}
-        activeDesign={activeDesign}
+        activeDesign={activeDesign as NailDesign}
         adjustment={adjustment}
         compareClean={compareClean}
         onTrackingChange={setHandDetected}
         onCameraNotice={setCameraNotice}
+        {...arCanvasExtraProps}
       />
 
       {/* Top Floating White-Label Brand Header */}
@@ -253,7 +286,10 @@ export function App(): React.ReactElement {
                 className={`sync-dot ${syncStatus === 'offline' ? 'is-offline' : ''}`}
                 title={syncStatus === 'offline' ? 'Modo Offline Local' : 'Sincronizado'}
               />
-              <EditorialTitle text={activeDesign.name} className="active-design-caption" />
+              <EditorialTitle
+                text={activeDesign ? activeDesign.name : 'Sem modelo ativo • Importe uma foto'}
+                className="active-design-caption"
+              />
             </div>
           </div>
         </div>
@@ -341,6 +377,8 @@ export function App(): React.ReactElement {
           className={`glass-icon-btn glass-panel ${compareClean ? 'is-highlighted' : ''}`}
           aria-label="Comparar antes e depois"
           title="Antes / Depois"
+          disabled={!activeDesign}
+          style={!activeDesign ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
         >
           {compareClean ? <EyeOff size={17} /> : <Eye size={17} />}
         </motion.button>
@@ -350,8 +388,8 @@ export function App(): React.ReactElement {
           whileTap={{ scale: 0.9 }}
           onClick={() => setAdjustOpen((v) => !v)}
           className={`glass-icon-btn glass-panel ${adjustOpen ? 'is-highlighted' : ''}`}
-          aria-label="Ajustar escala, rotação e formato"
-          title="Ajustes da Unha"
+          aria-label="Ajustar encaixe anatômico"
+          title="Encaixe Anatômico"
         >
           <SlidersHorizontal size={17} />
         </motion.button>
@@ -362,7 +400,9 @@ export function App(): React.ReactElement {
           onClick={handleCapture}
           className="capture-fab"
           aria-label="Capturar foto e enviar no WhatsApp"
-          title="Capturar Foto"
+          title={activeDesign ? 'Capturar Foto' : 'Selecione ou importe um modelo primeiro'}
+          disabled={!activeDesign}
+          style={!activeDesign ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}
         >
           <Camera size={20} />
         </motion.button>
@@ -375,29 +415,26 @@ export function App(): React.ReactElement {
           onToggle={() => setAdjustOpen(false)}
           adjustment={adjustment}
           onChange={setAdjustment}
-          onReset={() => setAdjustment(DEFAULT_ADJUSTMENT)}
+          onReset={() =>
+            setAdjustment({
+              ...DEFAULT_ADJUSTMENT,
+              shape: activeDesign?.detectedShape ?? 'natural',
+            })
+          }
         />
 
         <MagneticDesignDock
           designs={designs}
           activeTab={activeTab}
           onTabChange={setActiveTab}
-          activeShape={adjustment.shape}
-          onShapeChange={(shape) => setAdjustment((prev) => ({ ...prev, shape }))}
-          activeDesignId={activeDesign.id}
+          activeDesignId={activeDesign?.id ?? null}
           onSelectDesign={(d) => {
             setCompareClean(false);
             setActiveDesignId(d.id);
-            if (d.detectedShape || d.detectedLength) {
-              setAdjustment((prev) => ({
-                ...prev,
-                shape: d.detectedShape ?? prev.shape,
-                extensionLength: d.detectedLength ?? prev.extensionLength,
-              }));
-            }
+            syncAdjustmentForDesign(d);
           }}
-          onOpenImport={() => setImportOpen(true)}
-          onDeleteCustom={handleDeleteCustom}
+          onOpenImport={openImportModal}
+          onDeleteDesign={handleDeleteDesign}
         />
       </div>
 
@@ -408,20 +445,24 @@ export function App(): React.ReactElement {
         onClose={() => setWhiteLabelOpen(false)}
         onPreviewChange={applyCssVariables}
         onSave={handleSaveConfig}
+        onOpenStudioCatalogImport={() => openImportModal('studio')}
       />
 
       <ImportReferenceModal
         open={importOpen}
+        targetMode={importModalMode}
         onClose={() => setImportOpen(false)}
         onCreateDesign={handleCreateDesign}
       />
 
-      <CapturePreviewModal
-        imageDataUrl={capturedImage}
-        design={activeDesign}
-        config={config}
-        onClose={() => setCapturedImage(null)}
-      />
+      {activeDesign && (
+        <CapturePreviewModal
+          imageDataUrl={capturedImage}
+          design={activeDesign}
+          config={config}
+          onClose={() => setCapturedImage(null)}
+        />
+      )}
     </main>
   );
 }

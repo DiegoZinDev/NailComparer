@@ -30,6 +30,7 @@ export interface ThemePresetDefinition {
 
 export type NailCategory =
   | 'Todas'
+  | 'Estudio'
   | 'Francesinha'
   | 'Gel'
   | 'Cromado'
@@ -48,7 +49,20 @@ export type NailPatternType =
   | 'cat-eye'
   | 'aurora';
 
-export type NailShape = 'natural' | 'almond' | 'square' | 'coffin' | 'stiletto';
+export type NailShape = 'natural' | 'oval' | 'almond' | 'square' | 'coffin' | 'stiletto';
+
+export type NailExtensionLevel =
+  | 'Curta/Natural'
+  | 'Pouco Alongada'
+  | 'Alongada'
+  | 'Muito Alongada (Extrema)';
+
+export type NailFinishV9 =
+  | 'glossy_gel'
+  | 'jelly_translucent'
+  | 'chrome_mirror'
+  | 'velvet_matte'
+  | 'cat_eye';
 
 export type FingerId = 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
 
@@ -70,16 +84,34 @@ export interface StrokeAnchor {
 export interface NailFingerDesignSpec {
   fingerId: FingerId;
   detectedFromPhoto: boolean;
-  shape: NailShape; // 'natural' | 'square' | 'coffin' | 'almond' | 'stiletto'
-  relativeLength: number; // 0.85 .. 1.65
+  shape: NailShape; // 'natural' | 'oval' | 'square' | 'coffin' | 'almond' | 'stiletto'
+  relativeLength: number; // 0.85 .. 1.65 (salon scale)
   relativeWidth: number; // 0.90 .. 1.25
   baseColor: string; // dominant gel/polish base hex
-  secondaryColor: string; // gradient / aura / french tip hex
+  secondaryColor: string; // gradient / aura / french tip / floral petal hex
   accentColor: string; // metallic gold / pearl / chrome 3D relief hex
   pattern: ArtisticPattern;
   strokeAnchors: StrokeAnchor[]; // normalized positions of detected strokes/reliefs on the nail
   metallicIntensity: number; // 0 .. 1
   glossIntensity: number; // 0.5 .. 1
+  // V9 High-Fidelity Reference & Anatomical Spec fields
+  extensionLevel?: NailExtensionLevel;
+  extensionMm?: number; // real free-edge extension in mm (1.5 .. 12.0)
+  tipRoundness?: number; // 0 .. 1
+  aspectRatio?: number;
+  lengthMultiplier?: number; // 0.85 .. 1.65
+  hasMetallicOutline?: boolean;
+  outlineColor?: string;
+  has3DRelief?: boolean;
+  reliefDescription?: string;
+  artDescription?: string;
+  finishStyle?: NailFinishV9;
+  uvPatchDataUrl?: string; // canonical delighted UV texture (512x512 or 1024x1024)
+  normalMapDataUrl?: string;
+  displacementMapDataUrl?: string;
+  metalnessMapDataUrl?: string;
+  roughnessMapDataUrl?: string;
+  isImportedReference?: boolean;
 }
 
 export interface NailDesign {
@@ -93,6 +125,7 @@ export interface NailDesign {
   finish: 'glossy' | 'chrome' | 'velvet' | 'glitter';
   imageDataUrl?: string | null;
   isCustom?: boolean;
+  isStudioCatalog?: boolean;
   detectedShape?: NailShape;
   detectedLength?: number;
   fingerSpecs?: Record<FingerId, NailFingerDesignSpec>;
@@ -101,10 +134,10 @@ export interface NailDesign {
 
 export interface NailAdjustment {
   shape: NailShape;
-  extensionLength: number; // 0.75 (curto/natural) to 1.75 (longo)
-  scale: number; // width/fit multiplier 0.75 to 1.35
-  rotationDeg: number; // -30 to +30
-  opacity: number; // 0.65 to 1.0
+  extensionLength: number; // Fine-tune multiplier 0.85 .. 1.15 (±15%) around reference length
+  scale: number; // Width/fit multiplier 0.85 .. 1.20
+  rotationDeg: number; // 0 default
+  opacity: number; // 0.70 .. 1.0 realism/opacity
 }
 
 export type ARViewMode = 'camera' | 'studio-demo';
@@ -132,4 +165,15 @@ export interface FingerPose {
   handedness?: 'Left' | 'Right';
   widthScale: number;
   lengthScale: number;
+}
+
+/**
+ * Unified 21-point MediaPipe hand frame carrying BOTH screen-normalized landmarks
+ * and metric worldLandmarks (in meters) for single-phase pre-kinematic filtering.
+ */
+export interface HandSkeletonFrame {
+  landmarks: NormalizedPoint[]; // 21 normalized screen landmarks (x, y, z)
+  worldLandmarks: Vec3[]; // 21 metric 3D world landmarks (meters)
+  handedness: 'Left' | 'Right';
+  timestampMs: number;
 }

@@ -3,24 +3,32 @@ import type {
   ArtisticPattern,
   FingerId,
   NailDesign,
+  NailExtensionLevel,
+  NailFinishV9,
   NailFingerDesignSpec as BaseNailFingerDesignSpec,
   NailShape,
   StrokeAnchor,
 } from '../types/nail';
 
-export type NailExtensionLevel =
-  | 'Curta/Natural'
-  | 'Pouco Alongada'
-  | 'Alongada'
-  | 'Muito Alongada (Extrema)';
+export type { NailExtensionLevel, NailFinishV9 };
 
 export type NailFingerDesignSpec = BaseNailFingerDesignSpec & {
   extensionLevel?: NailExtensionLevel;
+  extensionMm?: number;
+  tipRoundness?: number;
   aspectRatio?: number;
   lengthMultiplier?: number;
   hasMetallicOutline?: boolean;
   outlineColor?: string;
+  has3DRelief?: boolean;
+  reliefDescription?: string;
+  artDescription?: string;
+  finishStyle?: NailFinishV9;
   uvPatchDataUrl?: string;
+  normalMapDataUrl?: string;
+  displacementMapDataUrl?: string;
+  metalnessMapDataUrl?: string;
+  roughnessMapDataUrl?: string;
   isImportedReference?: boolean;
 };
 
@@ -70,6 +78,16 @@ const FINGER_LANDMARKS: Record<
   pinky: { tipIdx: 20, dipIdx: 19, pipIdx: 18, defaultWidth: 0.91, defaultLength: 0.91 },
 };
 
+const VALID_SHAPES: NailShape[] = ['natural', 'oval', 'almond', 'square', 'coffin', 'stiletto'];
+const VALID_PATTERNS: ArtisticPattern[] = [
+  'solid_gloss',
+  'chrome_mirror',
+  'gold_3d_waves',
+  'aura_gradient',
+  'french_tip',
+  'floral_accent',
+];
+
 let cachedLandmarker: HandLandmarker | null = null;
 let landmarkerPromise: Promise<HandLandmarker | null> | null = null;
 
@@ -89,8 +107,8 @@ async function getImageHandLandmarker(): Promise<HandLandmarker | null> {
           },
           runningMode: 'IMAGE',
           numHands: 2,
-          minHandDetectionConfidence: 0.28,
-          minHandPresenceConfidence: 0.28,
+          minHandDetectionConfidence: 0.26,
+          minHandPresenceConfidence: 0.26,
         });
         cachedLandmarker = landmarker;
         return landmarker;
@@ -119,36 +137,41 @@ function createScratchCanvas(w: number, h: number): { canvas: ScratchCanvas; ctx
   return { canvas: el, ctx };
 }
 
-function loadImageFromFile(file: File, maxDim = 1600): Promise<HTMLImageElement> {
+function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Falha ao ler arquivo de imagem.'));
-    reader.onload = () => {
-      const rawImg = new Image();
-      rawImg.onerror = () => reject(new Error('Imagem inválida.'));
-      rawImg.onload = () => {
-        const scale = Math.min(1, maxDim / Math.max(rawImg.naturalWidth, rawImg.naturalHeight));
-        if (scale >= 0.99) {
-          resolve(rawImg);
-          return;
-        }
-        const c = document.createElement('canvas');
-        c.width = Math.max(1, Math.round(rawImg.naturalWidth * scale));
-        c.height = Math.max(1, Math.round(rawImg.naturalHeight * scale));
-        const ctx = c.getContext('2d');
-        if (!ctx) {
-          resolve(rawImg);
-          return;
-        }
-        ctx.drawImage(rawImg, 0, 0, c.width, c.height);
-        const norm = new Image();
-        norm.onload = () => resolve(norm);
-        norm.onerror = () => resolve(rawImg);
-        norm.src = c.toDataURL('image/jpeg', 0.94);
-      };
-      rawImg.src = String(reader.result);
-    };
+    reader.onload = () => resolve(String(reader.result));
     reader.readAsDataURL(file);
+  });
+}
+
+function loadImageFromDataUrl(dataUrl: string, maxDim = 2200): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const rawImg = new Image();
+    rawImg.onerror = () => reject(new Error('Imagem inválida.'));
+    rawImg.onload = () => {
+      const maxNatural = Math.max(rawImg.naturalWidth, rawImg.naturalHeight);
+      const scale = Math.min(1, maxDim / Math.max(1, maxNatural));
+      if (scale >= 0.99) {
+        resolve(rawImg);
+        return;
+      }
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(rawImg.naturalWidth * scale));
+      c.height = Math.max(1, Math.round(rawImg.naturalHeight * scale));
+      const ctx = c.getContext('2d');
+      if (!ctx) {
+        resolve(rawImg);
+        return;
+      }
+      ctx.drawImage(rawImg, 0, 0, c.width, c.height);
+      const norm = new Image();
+      norm.onload = () => resolve(norm);
+      norm.onerror = () => resolve(rawImg);
+      norm.src = c.toDataURL('image/jpeg', 0.95);
+    };
+    rawImg.src = dataUrl;
   });
 }
 
@@ -163,21 +186,53 @@ function rgbToHex(r: number, g: number, b: number): string {
   );
 }
 
+/**
+ * True CIE L*a*b* conversion (sRGB -> D65 XYZ -> CIELab) so deep burgundy/wine (#5A0A1E),
+ * crimson flowers, skin tones, and warm gold rims remain accurately separated without muddying.
+ */
 function rgbToLabLike(r: number, g: number, b: number): [number, number, number] {
-  const rn = r / 255;
-  const gn = g / 255;
-  const bn = b / 255;
-  const l = 0.299 * rn + 0.587 * gn + 0.114 * bn;
-  const a = 0.5 * (rn - gn) + 0.25 * (rn - bn);
-  const bCh = 0.25 * (rn + gn) - 0.5 * bn;
-  return [l * 100, a * 120, bCh * 120];
+  const lin = (c: number) => {
+    const v = c / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const rl = lin(r);
+  const gl = lin(g);
+  const bl = lin(b);
+
+  const x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.95047;
+  const y = 0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl;
+  const z = (0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl) / 1.08883;
+
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(x);
+  const fy = f(y);
+  const fz = f(z);
+
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
 function deltaLab(c1: [number, number, number], c2: [number, number, number]): number {
-  const dl = (c1[0] - c2[0]) * 0.7;
-  const da = (c1[1] - c2[1]) * 1.35;
-  const db = (c1[2] - c2[2]) * 1.25;
+  const dl = (c1[0] - c2[0]) * 0.78;
+  const da = (c1[1] - c2[1]) * 1.15;
+  const db = (c1[2] - c2[2]) * 1.1;
   return Math.hypot(dl, da, db);
+}
+
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d > 1e-5) {
+    if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+    else if (max === gn) h = ((bn - rn) / d + 2) / 6;
+    else h = ((rn - gn) / d + 4) / 6;
+  }
+  const s = max > 0 ? d / max : 0;
+  return [h * 360, s, max];
 }
 
 function medianRgbColor(samples: Array<[number, number, number]>, fallback: string): string {
@@ -195,7 +250,7 @@ function isGoldOrMetallicPixel(r: number, g: number, b: number, gradMag: number)
   const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
   const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
   // Warm gold / champagne metallic
-  const isWarmGold = r > g * 1.05 && g > b * 1.15 && luma > 0.42 && sat > 0.22;
+  const isWarmGold = r > g * 1.05 && g > b * 1.16 && luma > 0.40 && sat > 0.22;
   // Bright pearl / specular chrome ridge
   const isPearlRidge = luma > 0.78 && gradMag > 0.14;
   return isWarmGold || isPearlRidge;
@@ -203,6 +258,7 @@ function isGoldOrMetallicPixel(r: number, g: number, b: number, gradMag: number)
 
 function classifyExtensionFromAspectRatio(aspectRatio: number): {
   extensionLevel: NailExtensionLevel;
+  extensionMm: number;
   lengthMultiplier: number;
 } {
   const ar = Math.max(0.75, Math.min(3.4, aspectRatio));
@@ -211,6 +267,7 @@ function classifyExtensionFromAspectRatio(aspectRatio: number): {
     const t = Math.max(0, Math.min(1, (ar - 0.85) / (1.30 - 0.85)));
     return {
       extensionLevel: 'Curta/Natural',
+      extensionMm: Number((1.5 + t * 1.5).toFixed(1)),
       lengthMultiplier: Number(Math.min(1.65, 0.85 + t * (1.02 - 0.85)).toFixed(2)),
     };
   }
@@ -218,6 +275,7 @@ function classifyExtensionFromAspectRatio(aspectRatio: number): {
     const t = Math.max(0, Math.min(1, (ar - 1.30) / (1.72 - 1.30)));
     return {
       extensionLevel: 'Pouco Alongada',
+      extensionMm: Number((3.0 + t * 2.2).toFixed(1)),
       lengthMultiplier: Number(Math.min(1.65, 1.04 + t * (1.22 - 1.04)).toFixed(2)),
     };
   }
@@ -225,12 +283,14 @@ function classifyExtensionFromAspectRatio(aspectRatio: number): {
     const t = Math.max(0, Math.min(1, (ar - 1.72) / (2.25 - 1.72)));
     return {
       extensionLevel: 'Alongada',
+      extensionMm: Number((5.2 + t * 3.3).toFixed(1)),
       lengthMultiplier: Number(Math.min(1.65, 1.24 + t * (1.44 - 1.24)).toFixed(2)),
     };
   }
   const t = Math.max(0, Math.min(1, (ar - 2.25) / (3.10 - 2.25)));
   return {
     extensionLevel: 'Muito Alongada (Extrema)',
+    extensionMm: Number((8.5 + t * 3.5).toFixed(1)),
     lengthMultiplier: Number(Math.min(1.65, 1.46 + t * (1.65 - 1.46)).toFixed(2)),
   };
 }
@@ -242,11 +302,47 @@ function classifyExtensionFromMultiplier(lengthMultiplier: number): NailExtensio
   return 'Muito Alongada (Extrema)';
 }
 
+function computeExtensionMmFromMultiplier(lengthMultiplier: number): number {
+  const t = Math.max(0, Math.min(1, (lengthMultiplier - 0.85) / (1.65 - 0.85)));
+  return Number((1.5 + t * 10.5).toFixed(1));
+}
+
+function sanitizeHexColor(hex: unknown, fallback: string): string {
+  if (typeof hex !== 'string') return fallback;
+  const trimmed = hex.trim();
+  if (/^#[0-9A-Fa-f]{6}$/.test(trimmed)) return trimmed.toUpperCase();
+  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    const r = trimmed[1];
+    const g = trimmed[2];
+    const b = trimmed[3];
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return fallback;
+}
+
+function normalizeShape(shape: unknown, fallback: NailShape = 'almond'): NailShape {
+  if (typeof shape === 'string' && VALID_SHAPES.includes(shape as NailShape)) {
+    return shape as NailShape;
+  }
+  return fallback;
+}
+
+function normalizePattern(pattern: unknown, fallback: ArtisticPattern = 'solid_gloss'): ArtisticPattern {
+  if (typeof pattern === 'string' && VALID_PATTERNS.includes(pattern as ArtisticPattern)) {
+    return pattern as ArtisticPattern;
+  }
+  return fallback;
+}
+
 /**
- * Generates a rectified 256×256 UV patch strictly from the central 70% of the segmented nail plate
- * using bilinear sampling directly from the source image, followed by chromaticity-preserving
- * Retinex / high-pass lighting equalization to suppress harsh shadows and blown highlights.
- * Orientation: u = 0..1 (left->right), v = 0..1 (cuticle at canvas bottom -> tip at canvas top).
+ * Full 512×512 UV Rectification covering 94% of the segmented nail plate
+ * (`u ∈ [0.03, 0.97], v ∈ [0.04, 0.96]`) via direct bilinear sampling from the full-res source photo.
+ *
+ * CRITICAL FIDELITY GUARANTEE:
+ * - NO global Retinex normalization (preserves deep burgundy/wine `#5A0A1E`, obsidian, crimson florals, gold rims).
+ * - Surgical specular-glare inpainting ONLY on blown-out specular highlight pixels (`luma > 0.92 && sat < 0.12`),
+ *   replacing each glare pixel with the Gaussian/distance-weighted mean of non-specular neighbors within radius 6px.
+ * - Orientation: u = 0..1 (left->right), v = 0..1 (cuticle at canvas bottom -> tip at canvas top).
  */
 function buildRectifiedNailUVPatch(
   img: HTMLImageElement,
@@ -262,7 +358,7 @@ function buildRectifiedNailUVPatch(
   angleRad: number
 ): string | undefined {
   const nailLen = maxY - minY;
-  if (nailLen < 8) return undefined;
+  if (nailLen < 16) return undefined;
 
   const imgW = img.naturalWidth;
   const imgH = img.naturalHeight;
@@ -275,7 +371,7 @@ function buildRectifiedNailUVPatch(
     let accL = 0;
     let accR = 0;
     let cnt = 0;
-    for (let dy = -2; dy <= 2; dy++) {
+    for (let dy = -4; dy <= 4; dy++) {
       const yy = Math.max(minY, Math.min(maxY, y + dy));
       if (rowLeft[yy] >= 0 && rowRight[yy] > rowLeft[yy]) {
         accL += rowLeft[yy];
@@ -295,19 +391,20 @@ function buildRectifiedNailUVPatch(
     return [anchorX + cosA * ux - sinA * uy, anchorY + sinA * ux + cosA * uy];
   };
 
-  // Compute tight source bounding box covering the central 70% plate region
+  // Compute tight source bounding box covering 94% of the segmented plate (u,v in [0.03..0.97], [0.04..0.96])
   let minSrcX = imgW;
   let maxSrcX = 0;
   let minSrcY = imgH;
   let maxSrcY = 0;
-  const yStart = minY + nailLen * 0.15;
-  const yEnd = maxY - nailLen * 0.15;
-  for (const ry of [yStart, (yStart + yEnd) * 0.5, yEnd]) {
+  const yStart = minY + nailLen * 0.04;
+  const yEnd = maxY - nailLen * 0.04;
+  for (let k = 0; k <= 6; k++) {
+    const ry = yStart + ((yEnd - yStart) * k) / 6;
     const yi = Math.max(minY, Math.min(maxY, Math.round(ry)));
     const l = smoothL[yi];
     const r = smoothR[yi];
     const span = r - l;
-    for (const rx of [l + span * 0.15, r - span * 0.15]) {
+    for (const rx of [l + span * 0.03, (l + r) * 0.5, r - span * 0.03]) {
       const [sx, sy] = roiToImg(rx, ry);
       if (sx < minSrcX) minSrcX = sx;
       if (sx > maxSrcX) maxSrcX = sx;
@@ -316,19 +413,19 @@ function buildRectifiedNailUVPatch(
     }
   }
 
-  const pad = 6;
+  const pad = 12;
   const bx = Math.max(0, Math.floor(minSrcX - pad));
   const by = Math.max(0, Math.floor(minSrcY - pad));
   const bx2 = Math.min(imgW, Math.ceil(maxSrcX + pad));
   const by2 = Math.min(imgH, Math.ceil(maxSrcY + pad));
-  const bw = Math.max(4, bx2 - bx);
-  const bh = Math.max(4, by2 - by);
+  const bw = Math.max(8, bx2 - bx);
+  const bh = Math.max(8, by2 - by);
 
   const { ctx: cropCtx } = createScratchCanvas(bw, bh);
   cropCtx.drawImage(img, bx, by, bw, bh, 0, 0, bw, bh);
   const srcData = cropCtx.getImageData(0, 0, bw, bh).data;
 
-  const size = 256;
+  const size = 512;
   const outCanvas = document.createElement('canvas');
   outCanvas.width = size;
   outCanvas.height = size;
@@ -337,13 +434,13 @@ function buildRectifiedNailUVPatch(
 
   const outImg = outCtx.createImageData(size, size);
   const patchRGB = new Float32Array(size * size * 3);
-  const patchLuma = new Float32Array(size * size);
+  const isSpecGlare = new Uint8Array(size * size);
 
-  // 1. Bilinear sampling strictly over central 70% of nail plate (uPlate, vPlate ∈ [0.15, 0.85])
+  // 1. Bilinear sampling over 94% of segmented plate: uPlate ∈ [0.03, 0.97], vPlate ∈ [0.04, 0.96]
   for (let py = 0; py < size; py++) {
-    // py = 0 is top of canvas (v = 1 tip), py = size-1 is bottom of canvas (v = 0 cuticle)
+    // py = 0 is canvas top (v = 1 tip), py = size-1 is canvas bottom (v = 0 cuticle)
     const v = 1 - py / (size - 1);
-    const vPlate = 0.15 + v * 0.70;
+    const vPlate = 0.04 + v * 0.92;
     const ry = maxY - vPlate * nailLen;
     const y0 = Math.max(minY, Math.min(maxY, Math.floor(ry)));
     const y1 = Math.max(minY, Math.min(maxY, y0 + 1));
@@ -355,11 +452,11 @@ function buildRectifiedNailUVPatch(
     const r1 = smoothR[y1];
     const lx = l0 + (l1 - l0) * fy;
     const rx = r0 + (r1 - r0) * fy;
-    const span = Math.max(2, rx - lx);
+    const span = Math.max(4, rx - lx);
 
     for (let px = 0; px < size; px++) {
       const u = px / (size - 1);
-      const uPlate = 0.15 + u * 0.70;
+      const uPlate = 0.03 + u * 0.94;
       const rxf = lx + uPlate * span;
       const [sxAbs, syAbs] = roiToImg(rxf, ry);
 
@@ -400,94 +497,77 @@ function buildRectifiedNailUVPatch(
       patchRGB[pIdx * 3] = r;
       patchRGB[pIdx * 3 + 1] = g;
       patchRGB[pIdx * 3 + 2] = b;
-      patchLuma[pIdx] = 0.299 * r + 0.587 * g + 0.114 * b;
+
+      const maxC = Math.max(r, g, b);
+      const minC = Math.min(r, g, b);
+      const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+      const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+      // Mark ONLY blown-out specular glare highlights (luma > 0.92 && saturation < 0.12)
+      if (luma > 0.92 && sat < 0.12) {
+        isSpecGlare[pIdx] = 1;
+      }
     }
   }
 
-  // 2. Separable low-frequency illumination field estimation (2-pass box blur radius = 28)
-  const boxBlur = (src: Float32Array, radius: number): Float32Array => {
-    const tmp = new Float32Array(size * size);
-    const dst = new Float32Array(size * size);
-    const win = radius * 2 + 1;
-
-    // Horizontal pass
-    for (let y = 0; y < size; y++) {
-      let sum = 0;
-      for (let k = -radius; k <= radius; k++) {
-        sum += src[y * size + Math.max(0, Math.min(size - 1, k))];
-      }
-      for (let x = 0; x < size; x++) {
-        tmp[y * size + x] = sum / win;
-        const addX = Math.min(size - 1, x + radius + 1);
-        const remX = Math.max(0, x - radius);
-        sum += src[y * size + addX] - src[y * size + remX];
-      }
-    }
-
-    // Vertical pass
-    for (let x = 0; x < size; x++) {
-      let sum = 0;
-      for (let k = -radius; k <= radius; k++) {
-        sum += tmp[Math.max(0, Math.min(size - 1, k)) * size + x];
-      }
-      for (let y = 0; y < size; y++) {
-        dst[y * size + x] = sum / win;
-        const addY = Math.min(size - 1, y + radius + 1);
-        const remY = Math.max(0, y - radius);
-        sum += tmp[addY * size + x] - tmp[remY * size + x];
-      }
-    }
-    return dst;
-  };
-
-  const blurPass1 = boxBlur(patchLuma, 28);
-  const lowFreqLuma = boxBlur(blurPass1, 20);
-
-  let lumaMean = 0;
-  for (let i = 0; i < patchLuma.length; i++) lumaMean += patchLuma[i];
-  lumaMean /= patchLuma.length;
-  const targetMean = Math.max(55, Math.min(205, lumaMean));
-
-  // 3. Chromaticity-preserving Retinex lighting normalization + gentle specular glare roll-off
+  // 2. Surgical specular-glare inpainting: replace blown highlight pixels with weighted average
+  //    of non-specular neighbor pixels within local radius 6..8px (100% preserving real deep colors!)
   const outBytes = outImg.data;
-  for (let i = 0; i < size * size; i++) {
-    const r = patchRGB[i * 3];
-    const g = patchRGB[i * 3 + 1];
-    const b = patchRGB[i * 3 + 2];
-    const lum = patchLuma[i];
-    const low = Math.max(18, lowFreqLuma[i]);
+  const searchRadius = 7;
 
-    // Gentle inverse illumination gain (exponent 0.56 keeps dark/light polish identity intact)
-    const ratio = targetMean / low;
-    const gain = Math.max(0.72, Math.min(1.38, Math.pow(ratio, 0.56)));
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const pIdx = py * size + px;
+      const p4 = pIdx * 4;
 
-    let rr = r * gain;
-    let gg = g * gain;
-    let bb = b * gain;
+      let rr = patchRGB[pIdx * 3];
+      let gg = patchRGB[pIdx * 3 + 1];
+      let bb = patchRGB[pIdx * 3 + 2];
 
-    // Gentle glare compression for blown-out low-saturation specular streaks
-    const maxC = Math.max(r, g, b);
-    const minC = Math.min(r, g, b);
-    const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
-    if (lum > 230 && sat < 0.14) {
-      const glareMix = Math.min(0.45, ((lum - 230) / 25) * 0.45);
-      const localTarget = Math.min(218, low * gain);
-      const scaleGlare = localTarget / Math.max(1, lum * gain);
-      rr = rr * (1 - glareMix) + rr * scaleGlare * glareMix;
-      gg = gg * (1 - glareMix) + gg * scaleGlare * glareMix;
-      bb = bb * (1 - glareMix) + bb * scaleGlare * glareMix;
+      if (isSpecGlare[pIdx]) {
+        let sumW = 0;
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+
+        for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+          const ny = py + dy;
+          if (ny < 0 || ny >= size) continue;
+          for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+            const nx = px + dx;
+            if (nx < 0 || nx >= size) continue;
+            const d2 = dx * dx + dy * dy;
+            if (d2 === 0 || d2 > searchRadius * searchRadius) continue;
+
+            const nIdx = ny * size + nx;
+            if (isSpecGlare[nIdx]) continue;
+
+            const w = 1 / (1 + d2 * 0.35);
+            sumW += w;
+            sumR += patchRGB[nIdx * 3] * w;
+            sumG += patchRGB[nIdx * 3 + 1] * w;
+            sumB += patchRGB[nIdx * 3 + 2] * w;
+          }
+        }
+
+        if (sumW > 0) {
+          const blend = 0.88;
+          rr = rr * (1 - blend) + (sumR / sumW) * blend;
+          gg = gg * (1 - blend) + (sumG / sumW) * blend;
+          bb = bb * (1 - blend) + (sumB / sumW) * blend;
+        }
+      }
+
+      outBytes[p4] = Math.max(0, Math.min(255, Math.round(rr)));
+      outBytes[p4 + 1] = Math.max(0, Math.min(255, Math.round(gg)));
+      outBytes[p4 + 2] = Math.max(0, Math.min(255, Math.round(bb)));
+      outBytes[p4 + 3] = 255;
     }
-
-    const p4 = i * 4;
-    outBytes[p4] = Math.max(0, Math.min(255, Math.round(rr)));
-    outBytes[p4 + 1] = Math.max(0, Math.min(255, Math.round(gg)));
-    outBytes[p4 + 2] = Math.max(0, Math.min(255, Math.round(bb)));
-    outBytes[p4 + 3] = 255;
   }
 
   outCtx.putImageData(outImg, 0, 0);
   try {
-    const webp = outCanvas.toDataURL('image/webp', 0.90);
+    const webp = outCanvas.toDataURL('image/webp', 0.92);
     if (webp.startsWith('data:image/webp')) return webp;
   } catch {
     // Fallback to PNG below
@@ -495,10 +575,18 @@ function buildRectifiedNailUVPatch(
   return outCanvas.toDataURL('image/png');
 }
 
+interface FingerRoiAnalysisOutput {
+  spec: NailFingerDesignSpec;
+  qualityScore: number;
+}
+
 /**
- * Segments strictly the nail plate pixels inside an upright ROI, measures 3D shape & proportions,
- * extracts 3 chromatic layers (base, secondary, accent), classifies the artistic pattern, and
- * detects exact normalized strokeAnchors `(u, v)` for 3D reliefs.
+ * High-Resolution (320×480) ROI Segmentation & Analysis for a single finger:
+ * - Extracts upright 320×480 ROI directly from the full-res original photo (DIP -> past TIP)
+ * - Combines CIELab distance vs PIP->DIP phalanx skin + HSV saturation/luma + Sobel edge magnitude
+ *   + anatomical elliptical prior + rejection of wide gold rings outside the distal DIP->TIP plate
+ * - Rectifies 512×512 UV texture covering 94% of the plate with surgical glare-only inpainting
+ * - Computes qualityScore (sharpness + nail-vs-skin contrast + absence of ring occlusion) for 2-hand selection
  */
 function analyzeSingleNailROI(
   img: HTMLImageElement,
@@ -507,7 +595,7 @@ function analyzeSingleNailROI(
   dipNorm: { x: number; y: number },
   tipNorm: { x: number; y: number },
   detectedFromPhoto: boolean
-): NailFingerDesignSpec {
+): FingerRoiAnalysisOutput {
   const imgW = img.naturalWidth;
   const imgH = img.naturalHeight;
   const cfg = FINGER_LANDMARKS[fingerId];
@@ -520,6 +608,8 @@ function analyzeSingleNailROI(
     relativeLength: defaultMult,
     lengthMultiplier: defaultMult,
     extensionLevel: classifyExtensionFromMultiplier(defaultMult),
+    extensionMm: computeExtensionMmFromMultiplier(defaultMult),
+    tipRoundness: 0.55,
     aspectRatio: Number((1.15 * defaultMult).toFixed(2)),
     relativeWidth: cfg.defaultWidth,
     baseColor: '#E5BEB3',
@@ -527,6 +617,7 @@ function analyzeSingleNailROI(
     accentColor: '#D4AF37',
     hasMetallicOutline: false,
     outlineColor: undefined,
+    has3DRelief: false,
     pattern: 'solid_gloss',
     strokeAnchors: [],
     metallicIntensity: 0.12,
@@ -535,14 +626,14 @@ function analyzeSingleNailROI(
   };
 
   try {
-    // 1. Sample phalanx skin color between PIP -> DIP
-    const { ctx: skinCtx } = createScratchCanvas(24, 24);
-    const sx = ((pipNorm.x + dipNorm.x) * 0.5) * imgW;
-    const sy = ((pipNorm.y + dipNorm.y) * 0.5) * imgH;
+    // 1. Sample phalanx skin color strictly along PIP -> DIP (away from any distal plate/ring edge)
+    const { ctx: skinCtx } = createScratchCanvas(28, 28);
+    const sx = (pipNorm.x * 0.55 + dipNorm.x * 0.45) * imgW;
+    const sy = (pipNorm.y * 0.55 + dipNorm.y * 0.45) * imgH;
     const dx = (tipNorm.x - dipNorm.x) * imgW;
     const dy = (tipNorm.y - dipNorm.y) * imgH;
-    const segPx = Math.max(18, Math.hypot(dx, dy));
-    const patch = Math.max(8, Math.round(segPx * 0.26));
+    const segPx = Math.max(24, Math.hypot(dx, dy));
+    const patch = Math.max(10, Math.round(segPx * 0.24));
 
     skinCtx.drawImage(
       img,
@@ -552,33 +643,38 @@ function analyzeSingleNailROI(
       patch,
       0,
       0,
-      24,
-      24
+      28,
+      28
     );
-    const skinPixels = skinCtx.getImageData(0, 0, 24, 24).data;
-    let sr = 0;
-    let sg = 0;
-    let sb = 0;
-    let sc = 0;
+    const skinPixels = skinCtx.getImageData(0, 0, 28, 28).data;
+    const skinRgbSamples: Array<[number, number, number]> = [];
     for (let i = 0; i < skinPixels.length; i += 4) {
-      sr += skinPixels[i];
-      sg += skinPixels[i + 1];
-      sb += skinPixels[i + 2];
-      sc++;
+      const r = skinPixels[i];
+      const g = skinPixels[i + 1];
+      const b = skinPixels[i + 2];
+      const [, sat] = rgbToHsv(r, g, b);
+      const luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      // Exclude bright metallic jewelry reflections when estimating phalanx skin reference
+      if (!(r > g * 1.06 && g > b * 1.18 && luma > 0.52 && sat > 0.28)) {
+        skinRgbSamples.push([r, g, b]);
+      }
     }
-    const skinLab = rgbToLabLike(sr / Math.max(1, sc), sg / Math.max(1, sc), sb / Math.max(1, sc));
+    const skinHex = medianRgbColor(skinRgbSamples, '#D8B29D');
+    const skinLab = hexToLab(skinHex);
 
-    // 2. Render upright ROI centered around nail plate (DIP -> past TIP)
-    const roiW = 80;
-    const roiH = 120;
+    // 2. Render high-resolution upright 320×480 ROI centered around nail plate (DIP -> past TIP)
+    const roiW = 320;
+    const roiH = 480;
     const { ctx: roiCtx } = createScratchCanvas(roiW, roiH);
     const angleRad = Math.atan2(dy, dx) + Math.PI / 2;
-    const anchorX = (dipNorm.x + 0.7 * (tipNorm.x - dipNorm.x)) * imgW;
-    const anchorY = (dipNorm.y + 0.7 * (tipNorm.y - dipNorm.y)) * imgH;
-    const roiSpanH = segPx * 1.92;
+    const anchorX = (dipNorm.x + 0.72 * (tipNorm.x - dipNorm.x)) * imgW;
+    const anchorY = (dipNorm.y + 0.72 * (tipNorm.y - dipNorm.y)) * imgH;
+    const roiSpanH = segPx * 1.98;
     const scale = roiH / roiSpanH;
 
     roiCtx.save();
+    roiCtx.imageSmoothingEnabled = true;
+    roiCtx.imageSmoothingQuality = 'high';
     roiCtx.translate(roiW / 2, roiH / 2);
     roiCtx.scale(scale, scale);
     roiCtx.rotate(-angleRad);
@@ -587,8 +683,13 @@ function analyzeSingleNailROI(
 
     const { data } = roiCtx.getImageData(0, 0, roiW, roiH);
 
-    // Background lab from upper distal ROI corners
-    const cornerOffsets = [0, (roiW - 1) * 4, (roiW * 2 + 2) * 4, (roiW * 3 - 3) * 4];
+    // Background CIELab from distal upper corners
+    const cornerOffsets = [
+      (roiW * 4 + 4) * 4,
+      (roiW * 4 + roiW - 5) * 4,
+      (roiW * 8 + 8) * 4,
+      (roiW * 8 + roiW - 9) * 4,
+    ];
     let br = 0;
     let bg = 0;
     let bb = 0;
@@ -599,7 +700,32 @@ function analyzeSingleNailROI(
     }
     const bgLab = rgbToLabLike(br / 4, bg / 4, bb / 4);
 
-    // 3. Segment strictly the nail plate pixels (excluding skin/rings/background)
+    // Precompute luma + Sobel edge magnitude across 320×480 ROI
+    const lumaMap = new Float32Array(roiW * roiH);
+    const sobelMap = new Float32Array(roiW * roiH);
+    for (let i = 0; i < roiW * roiH; i++) {
+      const p4 = i * 4;
+      lumaMap[i] = (0.299 * data[p4] + 0.587 * data[p4 + 1] + 0.114 * data[p4 + 2]) / 255;
+    }
+    for (let y = 1; y < roiH - 1; y++) {
+      for (let x = 1; x < roiW - 1; x++) {
+        const tl = lumaMap[(y - 1) * roiW + (x - 1)];
+        const tc = lumaMap[(y - 1) * roiW + x];
+        const tr = lumaMap[(y - 1) * roiW + (x + 1)];
+        const ml = lumaMap[y * roiW + (x - 1)];
+        const mr = lumaMap[y * roiW + (x + 1)];
+        const bl = lumaMap[(y + 1) * roiW + (x - 1)];
+        const bc = lumaMap[(y + 1) * roiW + x];
+        const brp = lumaMap[(y + 1) * roiW + (x + 1)];
+        const gx = tr + 2 * mr + brp - (tl + 2 * ml + bl);
+        const gy = bl + 2 * bc + brp - (tl + 2 * tc + tr);
+        sobelMap[y * roiW + x] = Math.hypot(gx, gy) * 0.25;
+      }
+    }
+
+    // 3. Combined high-precision segmentation:
+    //    CIELab distance vs phalanx skin + HSV saturation/luma + Sobel edges
+    //    + anatomical elliptical prior + rejection of wide gold rings outside distal plate
     const rowLeft = new Int16Array(roiH).fill(-1);
     const rowRight = new Int16Array(roiH).fill(-1);
     const rowWidths = new Float32Array(roiH);
@@ -607,33 +733,69 @@ function analyzeSingleNailROI(
     let maxY = 0;
     let maxWidth = 0;
     let activeRows = 0;
+    let ringBandRows = 0;
+
+    // Anatomical plate prior ellipse center (slightly distal from ROI center)
+    const priorCx = roiW * 0.5;
+    const priorCy = roiH * 0.47;
+    const priorRx = roiW * 0.27;
+    const priorRy = roiH * 0.39;
+
+    const isWideGoldBand = (x: number, y: number): boolean => {
+      // Gold rings on proximal/middle phalanx appear near bottom of ROI or outside lateral plate width
+      const inDistalCore = y >= roiH * 0.14 && y <= roiH * 0.78 && Math.abs(x - priorCx) <= roiW * 0.23;
+      if (inDistalCore) return false;
+      const idx = (y * roiW + x) * 4;
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+      const [, sat, val] = rgbToHsv(r, g, b);
+      return r > g * 1.07 && g > b * 1.18 && val > 0.45 && sat > 0.26;
+    };
 
     const isNailPixel = (x: number, y: number): boolean => {
       const idx = (y * roiW + x) * 4;
-      const pLab = rgbToLabLike(data[idx], data[idx + 1], data[idx + 2]);
+      const r = data[idx];
+      const g = data[idx + 1];
+      const b = data[idx + 2];
+
+      if (isWideGoldBand(x, y)) return false;
+
+      const pLab = rgbToLabLike(r, g, b);
       const dSkin = deltaLab(pLab, skinLab);
       const dBg = deltaLab(pLab, bgLab);
-      const nIdx = (y * roiW + Math.max(0, x - 1)) * 4;
-      const grad =
-        Math.abs(data[idx] - data[nIdx]) +
-        Math.abs(data[idx + 1] - data[nIdx + 1]) +
-        Math.abs(data[idx + 2] - data[nIdx + 2]);
-      return (dSkin > 10.2 || grad > 36) && dBg > 7.2;
+      const [, sat, val] = rgbToHsv(r, g, b);
+      const edge = sobelMap[y * roiW + x];
+
+      // Anatomical elliptical prior boosts confidence inside expected nail bed and penalizes far flanks
+      const ellipDist = Math.hypot((x - priorCx) / priorRx, (y - priorCy) / priorRy);
+      const priorBonus = ellipDist <= 1.05 ? 1.8 : Math.max(-4.5, (1.05 - ellipDist) * 7.5);
+
+      const isDeepDarkPolish = val < 0.26 && dBg > 5.0 && ellipDist < 1.15;
+      const isVividOrLightPolish = (sat > 0.20 || val > 0.84) && dSkin > 7.5;
+      const chromaPass = dSkin + priorBonus > 10.5 || isDeepDarkPolish || isVividOrLightPolish;
+      const edgePass = edge > 0.14 && ellipDist < 1.08 && dSkin > 5.5;
+
+      return (chromaPass || edgePass) && (dBg > 6.5 || isDeepDarkPolish);
     };
 
-    for (let y = Math.round(roiH * 0.06); y < Math.round(roiH * 0.88); y++) {
+    const yScanStart = Math.round(roiH * 0.05);
+    const yScanEnd = Math.round(roiH * 0.89);
+
+    for (let y = yScanStart; y < yScanEnd; y++) {
       const cx = Math.floor(roiW / 2);
       let left = cx;
       let right = cx;
       let found = false;
-      for (let off = 0; off <= 12; off++) {
-        if (cx + off < roiW - 4 && isNailPixel(cx + off, y)) {
+
+      for (let off = 0; off <= Math.round(roiW * 0.14); off++) {
+        if (cx + off < roiW - 8 && isNailPixel(cx + off, y)) {
           left = cx + off;
           right = left;
           found = true;
           break;
         }
-        if (cx - off >= 4 && isNailPixel(cx - off, y)) {
+        if (cx - off >= 8 && isNailPixel(cx - off, y)) {
           left = cx - off;
           right = left;
           found = true;
@@ -643,7 +805,7 @@ function analyzeSingleNailROI(
       if (!found) continue;
 
       let missL = 0;
-      while (left > 3 && missL < 2) {
+      while (left > 6 && missL < 4) {
         if (isNailPixel(left - 1, y)) {
           left--;
           missL = 0;
@@ -652,8 +814,10 @@ function analyzeSingleNailROI(
           left--;
         }
       }
+      left += missL;
+
       let missR = 0;
-      while (right < roiW - 4 && missR < 2) {
+      while (right < roiW - 7 && missR < 4) {
         if (isNailPixel(right + 1, y)) {
           right++;
           missR = 0;
@@ -662,9 +826,16 @@ function analyzeSingleNailROI(
           right++;
         }
       }
+      right -= missR;
 
       const w = right - left + 1;
-      if (w >= 6 && w <= roiW * 0.72) {
+      // Reject excessively wide proximal rows caused by wide rings or overlapping fingers
+      if (y > roiH * 0.72 && w > roiW * 0.56) {
+        ringBandRows++;
+        continue;
+      }
+
+      if (w >= 18 && w <= roiW * 0.68) {
         rowLeft[y] = left;
         rowRight[y] = right;
         rowWidths[y] = w;
@@ -675,10 +846,9 @@ function analyzeSingleNailROI(
       }
     }
 
-    if (activeRows < 8 || maxWidth < 7) {
-      // Fallback rectangular plate inside center of ROI
-      minY = Math.round(roiH * 0.22);
-      maxY = Math.round(roiH * 0.78);
+    if (activeRows < 24 || maxWidth < 24) {
+      minY = Math.round(roiH * 0.18);
+      maxY = Math.round(roiH * 0.80);
       maxWidth = Math.round(roiW * 0.36);
       for (let y = minY; y <= maxY; y++) {
         rowLeft[y] = Math.round(roiW * 0.32);
@@ -687,13 +857,13 @@ function analyzeSingleNailROI(
       }
     }
 
-    const nailLength = Math.max(12, maxY - minY);
+    const nailLength = Math.max(32, maxY - minY);
 
     const sampleBandWidth = (fracFromCuticle: number): number => {
       const targetY = Math.round(maxY - nailLength * fracFromCuticle);
       let acc = 0;
       let cnt = 0;
-      for (let dyb = -2; dyb <= 2; dyb++) {
+      for (let dyb = -6; dyb <= 6; dyb++) {
         const yy = Math.max(0, Math.min(roiH - 1, targetY + dyb));
         if (rowWidths[yy] > 0) {
           acc += rowWidths[yy];
@@ -703,48 +873,51 @@ function analyzeSingleNailROI(
       return cnt > 0 ? acc / cnt : maxWidth;
     };
 
-    const baseWidth = Math.max(6, sampleBandWidth(0.34), maxWidth * 0.88);
+    const baseWidth = Math.max(20, sampleBandWidth(0.34), maxWidth * 0.88);
     const aspectRatio = Number((nailLength / baseWidth).toFixed(2));
 
     const widthAt76 = sampleBandWidth(0.76);
     const widthAt86 = sampleBandWidth(0.86);
     const widthAt95 = sampleBandWidth(0.95);
 
-    // Relative width near tip (topWidth / baseWidth) & tip apex curvature
     const tipTapering = Math.max(0.06, Math.min(1.15, widthAt86 / baseWidth));
-    const tipFlatness = Math.max(0, Math.min(1, widthAt95 / Math.max(3, widthAt86)));
+    const tipFlatness = Math.max(0, Math.min(1, widthAt95 / Math.max(8, widthAt86)));
     const midToTipSlope = Math.max(0, Math.min(1, (widthAt76 - widthAt95) / baseWidth));
     const apexCurvature = Math.max(
       0,
       Math.min(1, (1 - tipFlatness) * 0.65 + midToTipSlope * 0.35)
     );
+    const tipRoundness = Number(
+      Math.max(0, Math.min(1, (1 - tipFlatness) * 0.72 + (1 - tipTapering) * 0.28)).toFixed(2)
+    );
 
-    // Shape classification combining aspectRatio, tipTapering (topWidth/baseWidth), and apexCurvature
-    // Note: NailShape 'coffin' represents Bailarina in the 3D geometry/material catalog.
     let shape: NailShape = 'almond';
-    if (aspectRatio < 1.30) {
-      shape = tipTapering >= 0.82 && apexCurvature < 0.32 ? 'square' : 'natural';
+    if (aspectRatio < 1.28) {
+      shape = tipTapering >= 0.84 && apexCurvature < 0.30 ? 'square' : 'natural';
     } else if (
       tipTapering < 0.34 ||
-      (aspectRatio >= 1.68 && tipTapering < 0.44 && apexCurvature >= 0.46)
+      (aspectRatio >= 1.72 && tipTapering < 0.44 && apexCurvature >= 0.46)
     ) {
       shape = 'stiletto';
-    } else if (tipTapering >= 0.78 && apexCurvature < 0.36) {
+    } else if (tipTapering >= 0.80 && apexCurvature < 0.34) {
       shape = 'square';
-    } else if (tipTapering >= 0.46 && tipTapering < 0.78 && apexCurvature < 0.44) {
+    } else if (tipTapering >= 0.46 && tipTapering < 0.80 && apexCurvature < 0.42) {
       shape = 'coffin';
+    } else if (tipTapering >= 0.66 && apexCurvature >= 0.36 && aspectRatio < 1.65) {
+      shape = 'oval';
     } else {
       shape = 'almond';
     }
 
-    const { extensionLevel, lengthMultiplier } = classifyExtensionFromAspectRatio(aspectRatio);
+    const { extensionLevel, extensionMm, lengthMultiplier } =
+      classifyExtensionFromAspectRatio(aspectRatio);
     const relativeLength = lengthMultiplier;
     const relativeWidth = Number(
       Math.max(0.78, Math.min(1.30, cfg.defaultWidth * (baseWidth / (roiW * 0.36)))).toFixed(2)
     );
 
-    // 4. Hyper-Detailed 3-Zone Analysis inside segmented nail plate:
-    //    Zone 1: Central Core (u ∈ [0.16, 0.84], v ∈ [0.14, 0.82]) — dominant polish base excluding pure specular glare
+    // 4. 3-Zone Analysis inside segmented 320×480 plate:
+    //    Zone 1: Central Core (u ∈ [0.16, 0.84], v ∈ [0.14, 0.82]) — dominant polish base (deep colors preserved!)
     //    Zone 2: Outer 5% Perimeter Ring — metallic/contrasting outline & french tip detection
     //    Zone 3: Central Elements (Blobs & Strokes) — connected-component PCA eccentricity for floral vs 3D waves
     const centralZoneSamples: Array<[number, number, number]> = [];
@@ -761,42 +934,33 @@ function analyzeSingleNailROI(
     let perimeterTotalPixels = 0;
     let lumaSum = 0;
     let lumaSqSum = 0;
+    let sharpnessAcc = 0;
+    let contrastAcc = 0;
     let ridgeCount = 0;
+    let ringOcclusionPixels = 0;
 
-    const getLuma = (x: number, y: number): number => {
-      const cx = Math.max(0, Math.min(roiW - 1, x));
-      const cy = Math.max(0, Math.min(roiH - 1, y));
-      const p = (cy * roiW + cx) * 4;
-      return (0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]) / 255;
-    };
-
-    for (let y = minY; y <= maxY; y++) {
+    // Sample on a 2px stride for fast, crisp 160×240 statistical analysis (~10x sharper than old 80×120)
+    const stride = 2;
+    for (let y = minY; y <= maxY; y += stride) {
       const lx = rowLeft[y];
       const rx = rowRight[y];
       if (lx < 0 || rx <= lx) continue;
 
-      // v = 0 at cuticle (maxY), v = 1 at tip (minY)
       const v = (maxY - y) / nailLength;
       const span = rx - lx;
-      if (span < 4) continue;
+      if (span < 10) continue;
 
-      for (let x = lx; x <= rx; x++) {
+      for (let x = lx; x <= rx; x += stride) {
         const p = (y * roiW + x) * 4;
         const r = data[p];
         const g = data[p + 1];
         const b = data[p + 2];
         const u = (x - lx) / Math.max(1, span);
 
-        const maxC = Math.max(r, g, b);
-        const minC = Math.min(r, g, b);
-        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
-        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        const [, sat, val] = rgbToHsv(r, g, b);
+        const lum = lumaMap[y * roiW + x];
+        const grad = sobelMap[y * roiW + x];
 
-        const gx = getLuma(x + 1, y) - getLuma(x - 1, y);
-        const gy = getLuma(x, y + 1) - getLuma(x, y - 1);
-        const grad = Math.hypot(gx, gy);
-
-        // Skip extreme outer 1px background/skin bleed on perimeter checks
         const isPerimeterRing =
           (u <= 0.08 || u >= 0.92 || v <= 0.06 || v >= 0.94) &&
           u >= 0.015 &&
@@ -817,28 +981,37 @@ function analyzeSingleNailROI(
           continue;
         }
 
-        // Strict inner plate bounds (avoiding sidewall skin bleed)
-        if (u < 0.10 || u > 0.90) continue;
+        if (u < 0.09 || u > 0.91) continue;
 
         totalPlatePixels++;
         lumaSum += lum;
         lumaSqSum += lum * lum;
+        sharpnessAcc += grad;
+
+        const pLab = rgbToLabLike(r, g, b);
+        contrastAcc += deltaLab(pLab, skinLab);
+
         if (grad > 0.13) ridgeCount++;
 
-        // Zone 1: Central Core u ∈ [0.16, 0.84], v ∈ [0.14, 0.82] excluding pure specular highlights
-        const isPureSpecularGlare = lum > 0.93 && sat < 0.09 && grad < 0.18;
+        // Track if a thick bright gold band sits across the nail bed (indicating ring occlusion)
+        if (v < 0.35 && r > g * 1.07 && g > b * 1.18 && val > 0.5 && sat > 0.28) {
+          ringOcclusionPixels++;
+        }
+
+        // Zone 1: Central Core u ∈ [0.16, 0.84], v ∈ [0.14, 0.82] excluding blown specular glare
+        const isPureSpecularGlare = lum > 0.92 && sat < 0.12 && grad < 0.20;
         if (u >= 0.16 && u <= 0.84 && v >= 0.14 && v <= 0.82 && !isPureSpecularGlare) {
           centralZoneSamples.push([r, g, b]);
         }
 
-        if (v >= 0.72 && v <= 0.94 && u >= 0.2 && u <= 0.8) {
+        if (v >= 0.72 && v <= 0.94 && u >= 0.2 && u <= 0.8 && !isPureSpecularGlare) {
           tipSamples.push([r, g, b]);
         }
 
         const radialDist = Math.hypot((u - 0.5) * 1.4, (v - 0.5) * 1.2);
-        if (radialDist < 0.28) {
+        if (radialDist < 0.28 && !isPureSpecularGlare) {
           centerAuraSamples.push([r, g, b]);
-        } else if (radialDist > 0.44) {
+        } else if (radialDist > 0.44 && !isPureSpecularGlare) {
           outerAuraSamples.push([r, g, b]);
         }
 
@@ -849,7 +1022,6 @@ function analyzeSingleNailROI(
       }
     }
 
-    // Dominant cluster median for Zone 1 (immune to floral/art blobs occupying < 45% of nail)
     const baseColor = extractDominantColorCluster(centralZoneSamples, defaultSpec.baseColor);
     const baseLab = hexToLab(baseColor);
 
@@ -858,7 +1030,7 @@ function analyzeSingleNailROI(
     const centerAuraColor = medianRgbColor(centerAuraSamples, baseColor);
     const outerAuraColor = medianRgbColor(outerAuraSamples, baseColor);
 
-    // Zone 2: Evaluate 5% perimeter border contrast / metallic rim
+    // Zone 2: Evaluate perimeter border contrast / metallic rim
     const perimeterContrastSamples = perimeterSamples.filter(
       (rgb) => deltaLab(rgbToLabLike(rgb[0], rgb[1], rgb[2]), baseLab) > 13.5
     );
@@ -871,13 +1043,13 @@ function analyzeSingleNailROI(
     const perimMetallicRatio =
       perimeterTotalPixels > 0 ? perimeterMetallicSamples.length / perimeterTotalPixels : 0;
     const hasLateralRim =
-      lateralPerimeterSamples.length >= 4 &&
+      lateralPerimeterSamples.length >= 10 &&
       lateralContrastSamples.length / Math.max(1, lateralPerimeterSamples.length) > 0.22;
 
     const perimeterCandidateColor =
-      perimeterMetallicSamples.length >= 4
+      perimeterMetallicSamples.length >= 8
         ? medianRgbColor(perimeterMetallicSamples, baseColor)
-        : perimeterContrastSamples.length >= 4
+        : perimeterContrastSamples.length >= 8
           ? medianRgbColor(perimeterContrastSamples, baseColor)
           : medianRgbColor(perimeterSamples, baseColor);
     const perimeterLab = hexToLab(perimeterCandidateColor);
@@ -894,55 +1066,48 @@ function analyzeSingleNailROI(
 
     const outlineColor = hasMetallicOutline ? perimeterCandidateColor : undefined;
 
-    // Zone 3: Connected-component blob & stroke detection inside core/body (u ∈ [0.12, 0.88], v ∈ [0.10, 0.88])
-    const contrastMask = new Uint8Array(roiW * roiH);
-    const maskPixels: Array<{ x: number; y: number; u: number; v: number; r: number; g: number; b: number; isMetal: boolean }> = [];
+    // Zone 3: Connected-component analysis at half-res grid (160×240) for crisp floral / 3D wave detection
+    const gridW = Math.floor(roiW / stride);
+    const gridH = Math.floor(roiH / stride);
+    const contrastMask = new Uint8Array(gridW * gridH);
+    const maskPixels: Array<{ gx: number; gy: number; x: number; y: number }> = [];
 
-    for (let y = minY; y <= maxY; y++) {
+    for (let gy = 0; gy < gridH; gy++) {
+      const y = gy * stride;
+      if (y < minY || y > maxY) continue;
       const lx = rowLeft[y];
       const rx = rowRight[y];
       if (lx < 0 || rx <= lx) continue;
       const v = (maxY - y) / nailLength;
-      if (v < 0.10 || v > 0.88) continue;
+      if (v < 0.08 || v > 0.90) continue;
       const span = rx - lx;
-      for (let x = Math.round(lx + span * 0.12); x <= Math.round(rx - span * 0.12); x++) {
+      const minX = Math.round(lx + span * 0.10);
+      const maxX = Math.round(rx - span * 0.10);
+
+      for (let gx = 0; gx < gridW; gx++) {
+        const x = gx * stride;
+        if (x < minX || x > maxX) continue;
         const p = (y * roiW + x) * 4;
         const r = data[p];
         const g = data[p + 1];
         const b = data[p + 2];
-        const maxC = Math.max(r, g, b);
-        const minC = Math.min(r, g, b);
-        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
-        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        const [, sat] = rgbToHsv(r, g, b);
+        const lum = lumaMap[y * roiW + x];
+        const grad = sobelMap[y * roiW + x];
 
-        const gx = getLuma(x + 1, y) - getLuma(x - 1, y);
-        const gy = getLuma(x, y + 1) - getLuma(x, y - 1);
-        const grad = Math.hypot(gx, gy);
-
-        // Exclude smooth specular reflection highlights from artwork blobs
-        if (lum > 0.92 && sat < 0.09 && grad < 0.16) continue;
+        if (lum > 0.92 && sat < 0.11 && grad < 0.18) continue;
 
         const pLab = rgbToLabLike(r, g, b);
         const dBase = deltaLab(pLab, baseLab);
         const isMetal = isGoldOrMetallicPixel(r, g, b, grad);
-        if (dBase > 15.5 || (isMetal && dBase > 10.5)) {
-          contrastMask[y * roiW + x] = 1;
-          maskPixels.push({
-            x,
-            y,
-            u: (x - lx) / Math.max(1, span),
-            v,
-            r,
-            g,
-            b,
-            isMetal,
-          });
+        if (dBase > 15.0 || (isMetal && dBase > 10.0)) {
+          contrastMask[gy * gridW + gx] = 1;
+          maskPixels.push({ gx, gy, x, y });
         }
       }
     }
 
-    // Connected components on contrastMask
-    const visited = new Uint8Array(roiW * roiH);
+    const visited = new Uint8Array(gridW * gridH);
     interface DetectedComponent {
       count: number;
       cu: number;
@@ -957,7 +1122,7 @@ function analyzeSingleNailROI(
     const components: DetectedComponent[] = [];
 
     for (const seed of maskPixels) {
-      const startIdx = seed.y * roiW + seed.x;
+      const startIdx = seed.gy * gridW + seed.gx;
       if (visited[startIdx] || !contrastMask[startIdx]) continue;
 
       const queue: number[] = [startIdx];
@@ -967,33 +1132,34 @@ function analyzeSingleNailROI(
       let head = 0;
       while (head < queue.length) {
         const cur = queue[head++];
-        const cy = Math.floor(cur / roiW);
-        const cx = cur - cy * roiW;
+        const gy = Math.floor(cur / gridW);
+        const gx = cur - gy * gridW;
+        const cy = gy * stride;
+        const cx = gx * stride;
         const lx = rowLeft[cy];
         const rx = rowRight[cy];
         const span = Math.max(1, rx - lx);
-        const p = cur * 4;
+        const p = (cy * roiW + cx) * 4;
         const r = data[p];
         const g = data[p + 1];
         const b = data[p + 2];
-        const gx = getLuma(cx + 1, cy) - getLuma(cx - 1, cy);
-        const gy = getLuma(cx, cy + 1) - getLuma(cx, cy - 1);
+        const grad = sobelMap[cy * roiW + cx];
         pts.push({
           u: (cx - lx) / span,
           v: (maxY - cy) / nailLength,
           r,
           g,
           b,
-          isMetal: isGoldOrMetallicPixel(r, g, b, Math.hypot(gx, gy)),
+          isMetal: isGoldOrMetallicPixel(r, g, b, grad),
         });
 
         for (let oy = -1; oy <= 1; oy++) {
           for (let ox = -1; ox <= 1; ox++) {
             if (ox === 0 && oy === 0) continue;
-            const nx = cx + ox;
-            const ny = cy + oy;
-            if (nx < 0 || nx >= roiW || ny < minY || ny > maxY) continue;
-            const nIdx = ny * roiW + nx;
+            const ngx = gx + ox;
+            const ngy = gy + oy;
+            if (ngx < 0 || ngx >= gridW || ngy < 0 || ngy >= gridH) continue;
+            const nIdx = ngy * gridW + ngx;
             if (!visited[nIdx] && contrastMask[nIdx]) {
               visited[nIdx] = 1;
               queue.push(nIdx);
@@ -1002,7 +1168,7 @@ function analyzeSingleNailROI(
         }
       }
 
-      if (pts.length < 4) continue;
+      if (pts.length < 10) continue;
 
       let sumU = 0;
       let sumV = 0;
@@ -1017,7 +1183,6 @@ function analyzeSingleNailROI(
       const cu = sumU / pts.length;
       const cv = sumV / pts.length;
 
-      // 2x2 covariance PCA for eccentricity & stroke orientation
       let cxx = 0;
       let cyy = 0;
       let cxy = 0;
@@ -1042,7 +1207,6 @@ function analyzeSingleNailROI(
 
       const domHex = extractDominantColorCluster(rgbs, '#FFFFFF');
       const domLab = hexToLab(domHex);
-      // Detect contrasting inner pistil / center dot inside compact clusters (e.g. gold/light dot inside red flower)
       const innerDotRgbs: Array<[number, number, number]> = [];
       for (const pt of pts) {
         if (Math.hypot(pt.u - cu, pt.v - cv) < radius * 0.45) {
@@ -1060,10 +1224,10 @@ function analyzeSingleNailROI(
         eccentricity,
         angle,
         radius,
-        isMetallic: metalHits / pts.length > 0.38,
+        isMetallic: metalHits / pts.length > 0.36,
         dominantColor: domHex,
         centerDotColor:
-          innerDotRgbs.length >= 2 ? medianRgbColor(innerDotRgbs, '#D4AF37') : null,
+          innerDotRgbs.length >= 4 ? medianRgbColor(innerDotRgbs, '#D4AF37') : null,
       });
     }
 
@@ -1077,29 +1241,28 @@ function analyzeSingleNailROI(
     const ridgeDensity = ridgeCount / Math.max(1, totalPlatePixels);
     const metallicRatio = metallicPoints.length / Math.max(1, totalPlatePixels);
 
-    const meaningfulComponents = components.filter((c) => c.count >= 5);
+    const meaningfulComponents = components.filter((c) => c.count >= 12);
     const elongatedStrokeCount = meaningfulComponents.filter(
-      (c) => c.eccentricity >= 0.82 && (c.isMetallic || metallicRatio > 0.03)
+      (c) => c.eccentricity >= 0.82 && (c.isMetallic || metallicRatio > 0.025)
     ).length;
     const compactBlobCount = meaningfulComponents.filter(
       (c) => c.eccentricity < 0.84
     ).length;
 
     const detectedAnchors: StrokeAnchor[] = meaningfulComponents.slice(0, 4).map((c) => ({
-      u: Number(Math.max(0.16, Math.min(0.84, c.cu)).toFixed(2)),
-      v: Number(Math.max(0.16, Math.min(0.86, c.cv)).toFixed(2)),
+      u: Number(Math.max(0.14, Math.min(0.86, c.cu)).toFixed(2)),
+      v: Number(Math.max(0.14, Math.min(0.88, c.cv)).toFixed(2)),
       radius: Number(c.radius.toFixed(2)),
       angle: Number(c.angle.toFixed(2)),
     }));
     const strokeAnchors =
       detectedAnchors.length > 0 ? detectedAnchors : clusterStrokeAnchors(metallicPoints);
 
-    // Classify artistic pattern from 3-zone spatial + PCA eccentricity signals
     let pattern: ArtisticPattern = 'solid_gloss';
     let secondaryColor = tipColor;
     let accentColor =
       outlineColor ??
-      (accentSamples.length > 4
+      (accentSamples.length > 8
         ? medianRgbColor(accentSamples, '#D4AF37')
         : '#D4AF37');
 
@@ -1107,14 +1270,14 @@ function analyzeSingleNailROI(
     const hasInnerFloralDot = meaningfulComponents.some((c) => c.centerDotColor !== null);
 
     if (
-      (elongatedStrokeCount >= 1 && metallicRatio > 0.028) ||
-      (metallicRatio > 0.048 && ridgeDensity > 0.075 && strokeAnchors.length >= 2 && compactBlobCount === 0)
+      (elongatedStrokeCount >= 1 && metallicRatio > 0.025) ||
+      (metallicRatio > 0.045 && ridgeDensity > 0.070 && strokeAnchors.length >= 2 && compactBlobCount === 0)
     ) {
       pattern = 'gold_3d_waves';
       const metalComp = meaningfulComponents.find((c) => c.isMetallic);
       accentColor =
         metalComp?.dominantColor ??
-        (accentSamples.length > 3 ? medianRgbColor(accentSamples, '#D4AF37') : accentColor);
+        (accentSamples.length > 6 ? medianRgbColor(accentSamples, '#D4AF37') : accentColor);
       secondaryColor =
         hasMetallicOutline && outlineColor
           ? outlineColor
@@ -1122,18 +1285,17 @@ function analyzeSingleNailROI(
             ? tipColor
             : shadeHex(baseColor, 14);
     } else if (
-      (compactBlobCount >= 1 && topBlob && topBlob.count >= 8 && (hasInnerFloralDot || compactBlobCount >= 2)) ||
-      (meaningfulComponents.length >= 2 && compactBlobCount >= 2 && ridgeDensity > 0.04)
+      (compactBlobCount >= 1 && topBlob && topBlob.count >= 18 && (hasInnerFloralDot || compactBlobCount >= 2)) ||
+      (meaningfulComponents.length >= 2 && compactBlobCount >= 2 && ridgeDensity > 0.038)
     ) {
       pattern = 'floral_accent';
-      const petalBlob =
-        meaningfulComponents.find((c) => !c.isMetallic) ?? topBlob;
+      const petalBlob = meaningfulComponents.find((c) => !c.isMetallic) ?? topBlob;
       secondaryColor = petalBlob ? petalBlob.dominantColor : '#FFFDF9';
       const dotBlob = meaningfulComponents.find((c) => c.centerDotColor !== null);
       accentColor =
         dotBlob?.centerDotColor ??
         outlineColor ??
-        (accentSamples.length > 3 ? medianRgbColor(accentSamples, '#D4AF37') : '#D4AF37');
+        (accentSamples.length > 6 ? medianRgbColor(accentSamples, '#D4AF37') : '#D4AF37');
     } else if (baseTipDelta > 16 && radialDelta < 18 && meaningfulComponents.length <= 1) {
       pattern = 'french_tip';
       secondaryColor = tipColor;
@@ -1143,7 +1305,7 @@ function analyzeSingleNailROI(
     } else if (lumaVariance > 0.032 && meanLuma > 0.58 && meaningfulComponents.length === 0) {
       pattern = 'chrome_mirror';
       secondaryColor = '#FFFFFF';
-      accentColor = accentSamples.length > 3 ? accentColor : '#F5E7DF';
+      accentColor = accentSamples.length > 6 ? accentColor : '#F5E7DF';
     } else {
       pattern = 'solid_gloss';
       secondaryColor =
@@ -1160,8 +1322,14 @@ function analyzeSingleNailROI(
         : pattern === 'gold_3d_waves' || hasMetallicOutline
           ? 0.88
           : pattern === 'floral_accent'
-            ? 0.45
+            ? 0.48
             : 0.08;
+
+    const has3DRelief =
+      pattern === 'gold_3d_waves' ||
+      pattern === 'floral_accent' ||
+      hasMetallicOutline ||
+      ridgeDensity > 0.065;
 
     const uvPatchDataUrl = buildRectifiedNailUVPatch(
       img,
@@ -1177,32 +1345,48 @@ function analyzeSingleNailROI(
       angleRad
     );
 
+    // Quality score for selecting best specimen across 2 overlapping hands:
+    // rewards sharpness + nail-vs-skin Lab contrast + resolution, penalizes ring occlusion.
+    const avgSharpness = sharpnessAcc / Math.max(1, totalPlatePixels);
+    const avgContrast = contrastAcc / Math.max(1, totalPlatePixels);
+    const ringPenalty = (ringOcclusionPixels / Math.max(1, totalPlatePixels)) * 60 + ringBandRows * 0.4;
+    const qualityScore =
+      avgSharpness * 140 +
+      Math.min(45, avgContrast) * 1.4 +
+      Math.min(120, segPx) * 0.25 -
+      ringPenalty;
+
     return {
-      fingerId,
-      detectedFromPhoto,
-      shape,
-      relativeLength,
-      lengthMultiplier,
-      extensionLevel,
-      aspectRatio,
-      relativeWidth,
-      baseColor,
-      secondaryColor,
-      accentColor,
-      hasMetallicOutline,
-      outlineColor,
-      pattern,
-      strokeAnchors:
-        strokeAnchors.length > 0
-          ? strokeAnchors
-          : defaultAnchorsForPattern(pattern),
-      metallicIntensity,
-      glossIntensity: pattern === 'chrome_mirror' ? 1.0 : 0.94,
-      uvPatchDataUrl,
-      isImportedReference: true,
+      qualityScore,
+      spec: {
+        fingerId,
+        detectedFromPhoto,
+        shape,
+        relativeLength,
+        lengthMultiplier,
+        extensionLevel,
+        extensionMm,
+        tipRoundness,
+        aspectRatio,
+        relativeWidth,
+        baseColor,
+        secondaryColor,
+        accentColor,
+        hasMetallicOutline,
+        outlineColor,
+        has3DRelief,
+        finishStyle: pattern === 'chrome_mirror' ? 'chrome_mirror' : 'glossy_gel',
+        pattern,
+        strokeAnchors:
+          strokeAnchors.length > 0 ? strokeAnchors : defaultAnchorsForPattern(pattern),
+        metallicIntensity,
+        glossIntensity: pattern === 'chrome_mirror' ? 1.0 : 0.94,
+        uvPatchDataUrl,
+        isImportedReference: true,
+      },
     };
   } catch {
-    return defaultSpec;
+    return { spec: defaultSpec, qualityScore: 0 };
   }
 }
 
@@ -1211,12 +1395,12 @@ function extractDominantColorCluster(
   fallback: string
 ): string {
   if (samples.length === 0) return fallback;
-  if (samples.length < 6) return medianRgbColor(samples, fallback);
+  if (samples.length < 8) return medianRgbColor(samples, fallback);
 
-  // Coarse 3D RGB quantization (step 24) to isolate dominant base polish even with central nail art
+  // Coarse 3D RGB quantization (step 20) to isolate dominant base polish even with central nail art
   const bins = new Map<string, { sumR: number; sumG: number; sumB: number; count: number }>();
   for (const [r, g, b] of samples) {
-    const key = `${Math.floor(r / 24)}_${Math.floor(g / 24)}_${Math.floor(b / 24)}`;
+    const key = `${Math.floor(r / 20)}_${Math.floor(g / 20)}_${Math.floor(b / 20)}`;
     const cur = bins.get(key);
     if (cur) {
       cur.sumR += r;
@@ -1242,7 +1426,7 @@ function extractDominantColorCluster(
     bestBin.sumB / bestBin.count
   );
   const clusterSamples = samples.filter(
-    ([r, g, b]) => deltaLab(rgbToLabLike(r, g, b), seedLab) < 18
+    ([r, g, b]) => deltaLab(rgbToLabLike(r, g, b), seedLab) < 16
   );
   return medianRgbColor(clusterSamples.length > 0 ? clusterSamples : samples, fallback);
 }
@@ -1288,9 +1472,8 @@ function clusterStrokeAnchors(
 
 /**
  * Harmonic Inheritance for Missing Fingers:
- * If any of the 5 fingers wasn't visible in the photo (or on 1–3 nail macro shots),
- * propagates cohesive luxury salon harmony across all 5 fingers—preserving ornate accent nail
- * placement on `ring` / `middle` while harmonizing adjacent missing fingers!
+ * Propagates uvPatchDataUrl, colors, reliefs, and proportions harmoniously to unseen fingers
+ * (e.g., when only 3–4 fingers are visible in a reference photo).
  */
 function applyHarmonicInheritance(
   partial: Partial<Record<FingerId, NailFingerDesignSpec>>
@@ -1299,7 +1482,6 @@ function applyHarmonicInheritance(
     (s): s is NailFingerDesignSpec => Boolean(s)
   );
 
-  // Pick richest artistic spec as accent donor & cleanest gel/french spec as companion donor
   const ornateDonor =
     detected.find((s) => s.pattern === 'gold_3d_waves' || s.pattern === 'floral_accent') ??
     detected.find((s) => s.pattern !== 'solid_gloss') ??
@@ -1320,7 +1502,6 @@ function applyHarmonicInheritance(
     }
 
     const cfg = FINGER_LANDMARKS[id];
-    // Ring finger inherits ornate accent style if detected anywhere; others harmonize cleanly
     const donor =
       id === 'ring' || (id === 'middle' && ornateDonor.pattern !== 'solid_gloss')
         ? ornateDonor
@@ -1351,10 +1532,12 @@ function applyHarmonicInheritance(
       lengthMultiplier: inheritedLengthMult,
       extensionLevel:
         donor.extensionLevel ?? classifyExtensionFromMultiplier(inheritedLengthMult),
+      extensionMm: donor.extensionMm ?? computeExtensionMmFromMultiplier(inheritedLengthMult),
       aspectRatio: donor.aspectRatio,
       relativeWidth: cfg.defaultWidth,
       hasMetallicOutline: donor.hasMetallicOutline ?? false,
       outlineColor: donor.outlineColor,
+      has3DRelief: donor.has3DRelief ?? false,
       pattern: inheritedPattern,
       uvPatchDataUrl: donor.uvPatchDataUrl,
       isImportedReference: donor.isImportedReference ?? true,
@@ -1372,7 +1555,7 @@ function applyHarmonicInheritance(
 
 /**
  * Fallback macro analyzer when MediaPipe doesn't detect full hand landmarks
- * (e.g., extreme macro close-up of 1–3 nails). Analyzes 3 sharpest zones and harmonizes all 5 fingers.
+ * (e.g., extreme macro close-up of 1–3 nails). Analyzes 3 high-res zones and harmonizes all 5 fingers.
  */
 function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResult {
   const macroTargets: Array<{ fingerId: FingerId; cx: number; cy: number }> = [
@@ -1386,7 +1569,7 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
     const pip = { x: t.cx, y: Math.min(0.95, t.cy + 0.26) };
     const dip = { x: t.cx, y: Math.min(0.92, t.cy + 0.14) };
     const tip = { x: t.cx, y: Math.max(0.08, t.cy - 0.14) };
-    partial[t.fingerId] = analyzeSingleNailROI(img, t.fingerId, pip, dip, tip, true);
+    partial[t.fingerId] = analyzeSingleNailROI(img, t.fingerId, pip, dip, tip, true).spec;
   }
 
   const fingerSpecs = applyHarmonicInheritance(partial);
@@ -1408,13 +1591,185 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
 }
 
 /**
- * Pillar 1 — Per-Finger Independent Vision Analyzer:
- * Runs MediaPipe HandLandmarker (IMAGE mode, numHands: 2) to locate ALL visible fingers
- * (thumb, index, middle, ring, pinky), segments each nail plate independently, extracts
- * 3 chromatic layers + shape + pattern + strokeAnchors, and harmonizes any unseen fingers.
+ * Normalizes a partial/full `fingerSpecs` payload returned by `POST /api/vision/reconstruct-reference`
+ * into a strict, length-clamped 5-finger `PerFingerAnalysisResult`.
  */
-export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAnalysisResult> {
-  const img = await loadImageFromFile(file, 1600);
+function normalizeBackendReconstructionResult(
+  payload: Record<string, unknown>
+): PerFingerAnalysisResult | null {
+  const rawSpecs = payload.fingerSpecs as Partial<Record<FingerId, Partial<NailFingerDesignSpec>>> | undefined;
+  if (!rawSpecs || typeof rawSpecs !== 'object') return null;
+
+  const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
+  const detectedFingerIds: FingerId[] = [];
+
+  for (const id of ORDERED_FINGERS) {
+    const raw = rawSpecs[id];
+    if (!raw || typeof raw !== 'object') continue;
+    const cfg = FINGER_LANDMARKS[id];
+    const lengthMultiplier = Number(
+      Math.max(
+        0.85,
+        Math.min(1.65, Number(raw.lengthMultiplier ?? raw.relativeLength ?? cfg.defaultLength))
+      ).toFixed(2)
+    );
+    const shape = normalizeShape(raw.shape, 'almond');
+    const pattern = normalizePattern(raw.pattern, 'solid_gloss');
+    const baseColor = sanitizeHexColor(raw.baseColor, '#5A0A1E');
+    const secondaryColor = sanitizeHexColor(raw.secondaryColor, '#FFFDF9');
+    const accentColor = sanitizeHexColor(raw.accentColor, '#D4AF37');
+    const hasMetallicOutline = Boolean(raw.hasMetallicOutline);
+    const outlineColor = raw.outlineColor ? sanitizeHexColor(raw.outlineColor, accentColor) : undefined;
+    const detectedFromPhoto = raw.detectedFromPhoto !== false;
+
+    if (detectedFromPhoto) {
+      detectedFingerIds.push(id);
+    }
+
+    partial[id] = {
+      fingerId: id,
+      detectedFromPhoto,
+      shape,
+      relativeLength: lengthMultiplier,
+      lengthMultiplier,
+      extensionLevel:
+        (raw.extensionLevel as NailExtensionLevel | undefined) ??
+        classifyExtensionFromMultiplier(lengthMultiplier),
+      extensionMm:
+        typeof raw.extensionMm === 'number'
+          ? Math.max(1.5, Math.min(12.0, Number(raw.extensionMm.toFixed(1))))
+          : computeExtensionMmFromMultiplier(lengthMultiplier),
+      tipRoundness:
+        typeof raw.tipRoundness === 'number'
+          ? Math.max(0, Math.min(1, Number(raw.tipRoundness.toFixed(2))))
+          : undefined,
+      aspectRatio: typeof raw.aspectRatio === 'number' ? raw.aspectRatio : undefined,
+      relativeWidth:
+        typeof raw.relativeWidth === 'number'
+          ? Math.max(0.78, Math.min(1.30, Number(raw.relativeWidth.toFixed(2))))
+          : cfg.defaultWidth,
+      baseColor,
+      secondaryColor,
+      accentColor,
+      hasMetallicOutline,
+      outlineColor,
+      has3DRelief:
+        typeof raw.has3DRelief === 'boolean'
+          ? raw.has3DRelief
+          : pattern === 'gold_3d_waves' || pattern === 'floral_accent' || hasMetallicOutline,
+      reliefDescription: typeof raw.reliefDescription === 'string' ? raw.reliefDescription : undefined,
+      artDescription: typeof raw.artDescription === 'string' ? raw.artDescription : undefined,
+      finishStyle: raw.finishStyle,
+      pattern,
+      strokeAnchors: Array.isArray(raw.strokeAnchors)
+        ? raw.strokeAnchors
+        : defaultAnchorsForPattern(pattern),
+      metallicIntensity:
+        typeof raw.metallicIntensity === 'number'
+          ? Math.max(0, Math.min(1, raw.metallicIntensity))
+          : hasMetallicOutline || pattern === 'gold_3d_waves'
+            ? 0.88
+            : 0.14,
+      glossIntensity:
+        typeof raw.glossIntensity === 'number'
+          ? Math.max(0.4, Math.min(1, raw.glossIntensity))
+          : 0.96,
+      uvPatchDataUrl: typeof raw.uvPatchDataUrl === 'string' ? raw.uvPatchDataUrl : undefined,
+      normalMapDataUrl:
+        typeof raw.normalMapDataUrl === 'string' ? raw.normalMapDataUrl : undefined,
+      displacementMapDataUrl:
+        typeof raw.displacementMapDataUrl === 'string' ? raw.displacementMapDataUrl : undefined,
+      metalnessMapDataUrl:
+        typeof raw.metalnessMapDataUrl === 'string' ? raw.metalnessMapDataUrl : undefined,
+      roughnessMapDataUrl:
+        typeof raw.roughnessMapDataUrl === 'string' ? raw.roughnessMapDataUrl : undefined,
+      isImportedReference: true,
+    };
+  }
+
+  if (Object.keys(partial).length === 0) return null;
+
+  const fingerSpecs = applyHarmonicInheritance(partial);
+  const finalDetected =
+    detectedFingerIds.length > 0
+      ? detectedFingerIds
+      : (Object.keys(partial) as FingerId[]);
+  const primary =
+    fingerSpecs[finalDetected.includes('middle') ? 'middle' : finalDetected[0]] ??
+    fingerSpecs.middle;
+
+  return {
+    fingerSpecs,
+    detectedFingerIds: finalDetected,
+    method: 'mediapipe',
+    primaryShape: normalizeShape(payload.primaryShape, primary.shape),
+    primaryLength: Number(
+      Math.max(
+        0.85,
+        Math.min(1.65, Number(payload.primaryLength ?? primary.lengthMultiplier ?? primary.relativeLength))
+      ).toFixed(2)
+    ),
+    primaryExtensionLevel:
+      (payload.primaryExtensionLevel as NailExtensionLevel | undefined) ?? primary.extensionLevel,
+    primaryAspectRatio:
+      typeof payload.primaryAspectRatio === 'number'
+        ? payload.primaryAspectRatio
+        : primary.aspectRatio,
+    primaryBaseColor: sanitizeHexColor(payload.primaryBaseColor, primary.baseColor),
+    primarySecondaryColor: sanitizeHexColor(
+      payload.primarySecondaryColor,
+      primary.secondaryColor
+    ),
+    primaryAccentColor: sanitizeHexColor(payload.primaryAccentColor, primary.accentColor),
+    primaryPattern: normalizePattern(payload.primaryPattern, primary.pattern),
+  };
+}
+
+async function tryBackendReferenceReconstruction(
+  imageDataUrl: string
+): Promise<PerFingerAnalysisResult | null> {
+  const apiBase = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+  const endpoint = `${apiBase}/api/vision/reconstruct-reference`;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageDataUrl }),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<string, unknown>;
+    return normalizeBackendReconstructionResult(data);
+  } catch {
+    return null;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+/**
+ * Primary Hybrid Reconstruction Entry-Point (`imageDataUrl`):
+ * 1. Calls `POST /api/vision/reconstruct-reference` (respecting `VITE_API_URL`, 12s timeout).
+ *    If backend responds 200 OK with reconstructed `fingerSpecs`, returns high-fidelity AI/VLM result directly.
+ * 2. Offline / No-API-Key Local High-Res Fallback:
+ *    - Runs MediaPipe `HandLandmarker` (`IMAGE` mode, `numHands: 2`) for overlapping 2-hand photos,
+ *      scoring each candidate finger specimen by sharpness + nail-vs-skin CIELab contrast + absence of ring occlusion.
+ *    - Extracts 320×480 upright ROIs from the full-res image, segments with combined CIELab + HSV + Sobel + elliptical prior,
+ *      rectifies 512×512 UV textures (94% plate) preserving deep colors with surgical glare-only inpainting,
+ *      and propagates harmonically across all 5 fingers.
+ */
+export async function analyzeReferencePhotoPerFinger(
+  imageDataUrl: string
+): Promise<PerFingerAnalysisResult> {
+  const backendResult = await tryBackendReferenceReconstruction(imageDataUrl);
+  if (backendResult) {
+    return backendResult;
+  }
+
+  const img = await loadImageFromDataUrl(imageDataUrl, 2200);
   const w = img.naturalWidth;
   const h = img.naturalHeight;
 
@@ -1423,36 +1778,47 @@ export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAn
     try {
       const result = landmarker.detect(img);
       const hands = result.landmarks ?? [];
-      const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
-      const detectedFingerIds: FingerId[] = [];
+      const bestByFinger: Partial<Record<FingerId, FingerRoiAnalysisOutput>> = {};
 
       for (const hand of hands) {
         if (!hand || hand.length < 21) continue;
         for (const fingerId of ORDERED_FINGERS) {
-          if (partial[fingerId]) continue; // keep clearest first detection per anatomical finger
           const cfg = FINGER_LANDMARKS[fingerId];
           const tip = hand[cfg.tipIdx];
           const dip = hand[cfg.dipIdx];
           const pip = hand[cfg.pipIdx];
 
           if (
-            tip.x < 0.03 ||
-            tip.x > 0.97 ||
-            tip.y < 0.03 ||
-            tip.y > 0.97 ||
-            dip.x < 0.02 ||
-            dip.x > 0.98 ||
-            dip.y < 0.02 ||
-            dip.y > 0.98
+            tip.x < 0.02 ||
+            tip.x > 0.98 ||
+            tip.y < 0.02 ||
+            tip.y > 0.98 ||
+            dip.x < 0.015 ||
+            dip.x > 0.985 ||
+            dip.y < 0.015 ||
+            dip.y > 0.985
           ) {
             continue;
           }
 
           const segPx = Math.hypot((tip.x - dip.x) * w, (tip.y - dip.y) * h);
-          if (segPx < 16) continue;
+          if (segPx < 18) continue;
 
-          partial[fingerId] = analyzeSingleNailROI(img, fingerId, pip, dip, tip, true);
-          detectedFingerIds.push(fingerId);
+          const candidate = analyzeSingleNailROI(img, fingerId, pip, dip, tip, true);
+          const existing = bestByFinger[fingerId];
+          if (!existing || candidate.qualityScore > existing.qualityScore) {
+            bestByFinger[fingerId] = candidate;
+          }
+        }
+      }
+
+      const partial: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
+      const detectedFingerIds: FingerId[] = [];
+      for (const id of ORDERED_FINGERS) {
+        const chosen = bestByFinger[id];
+        if (chosen) {
+          partial[id] = chosen.spec;
+          detectedFingerIds.push(id);
         }
       }
 
@@ -1484,8 +1850,16 @@ export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAn
 }
 
 /**
+ * File-based wrapper preserving full backward compatibility with `ImportReferenceModal.tsx`.
+ */
+export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAnalysisResult> {
+  const imageDataUrl = await fileToDataUrl(file);
+  return analyzeReferencePhotoPerFinger(imageDataUrl);
+}
+
+/**
  * Converts any Studio Catalog `NailDesign` into a cohesive 5-finger `NailFingerDesignSpec` map
- * so every Studio preset ALSO renders through the exact same procedural 1024×1024 PBR pipeline!
+ * so every Studio preset ALSO renders through the exact same 1024×1024 PBR pipeline.
  */
 export function buildFingerSpecsFromStudioDesign(
   design: NailDesign
@@ -1529,12 +1903,14 @@ export function buildFingerSpecsFromStudioDesign(
       relativeLength: fingerLenMult,
       lengthMultiplier: fingerLenMult,
       extensionLevel: classifyExtensionFromMultiplier(fingerLenMult),
+      extensionMm: computeExtensionMmFromMultiplier(fingerLenMult),
       relativeWidth: cfg.defaultWidth,
       baseColor,
       secondaryColor,
       accentColor,
       hasMetallicOutline: false,
       outlineColor: undefined,
+      has3DRelief: pattern === 'gold_3d_waves',
       pattern,
       strokeAnchors: defaultAnchorsForPattern(pattern),
       metallicIntensity,
@@ -1543,6 +1919,11 @@ export function buildFingerSpecsFromStudioDesign(
   }
   return map;
 }
+
+/**
+ * Alias exported for callers referencing `buildFallbackStudioFingerSpecs`.
+ */
+export const buildFallbackStudioFingerSpecs = buildFingerSpecsFromStudioDesign;
 
 function hexToLab(hex: string): [number, number, number] {
   const clean = hex.replace('#', '');
