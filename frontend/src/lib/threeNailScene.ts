@@ -213,8 +213,9 @@ interface FingerRig {
  *   Group 0 = Dorsal sculpted gel shell + closed lateral/free-edge walls (per-finger 1024×1024 PBR MeshPhysicalMaterial)
  *   Group 1 = Concave hollowed translucent milky-gel underside (`#F0E2D8`, `DoubleSide`)
  * - Subtle warm AO contact shadow skirt (`renderOrder: 2`, `depthWrite: false`) beneath each nail
- * - 3 invisible physical phalanx depth occluder capsules per finger (`MCP->PIP`, `PIP->DIP`, `DIP->TIP`, `renderOrder: 1`,
- *   `colorWrite: false, depthWrite: true`) for accurate cross-finger occlusion and palm-facing underside reveal!
+ * - 3 invisible physical phalanx depth occluder cylinders per finger (`MCP->PIP`, `PIP->DIP`, `DIP->TIP`, `renderOrder: 1`,
+ *   `colorWrite: false, depthWrite: true`) centered on the 3D phalanx axes and ending exactly at `TIP`
+ *   for accurate cross-finger occlusion and palm-facing underside reveal!
  */
 export class ThreeNailScene {
   private renderer: THREE.WebGLRenderer | null = null;
@@ -231,7 +232,7 @@ export class ThreeNailScene {
   private aoShadowGeometry: THREE.PlaneGeometry;
   private aoShadowTexture: THREE.CanvasTexture;
   private occluderMaterial: THREE.MeshBasicMaterial;
-  private occluderGeometry: THREE.CapsuleGeometry;
+  private occluderGeometry: THREE.CylinderGeometry;
 
   private fingerRigs = new Map<FingerId, FingerRig>();
   private ready = false;
@@ -296,7 +297,7 @@ export class ThreeNailScene {
       opacity: 0.92,
       depthWrite: true,
       depthTest: true,
-      side: THREE.DoubleSide,
+      side: THREE.FrontSide,
     });
 
     this.aoShadowGeometry = new THREE.PlaneGeometry(1.06, 0.98);
@@ -307,8 +308,8 @@ export class ThreeNailScene {
       depthWrite: true,
       depthTest: true,
     });
-    // Radius = 0.5, cylinder height = 1.0 -> total unscaled height = 2.0
-    this.occluderGeometry = new THREE.CapsuleGeometry(0.5, 1.0, 6, 12);
+    // Unit cylinder: radius = 1.0, height = 1.0 (spans y ∈ [-0.5, +0.5]) so scale(r, len, r) stops exactly at start & end
+    this.occluderGeometry = new THREE.CylinderGeometry(1.0, 1.0, 1.0, 14, 1, false);
 
     try {
       const renderer = new THREE.WebGLRenderer({
@@ -376,7 +377,7 @@ export class ThreeNailScene {
           transparent: true,
           depthWrite: true,
           depthTest: true,
-          side: THREE.DoubleSide,
+          side: THREE.FrontSide,
         });
 
         const nailMesh = new THREE.Mesh(initialGeo, [dorsalMaterial, this.undersideMaterial]);
@@ -558,14 +559,11 @@ export class ThreeNailScene {
     start: THREE.Vector3,
     end: THREE.Vector3,
     radius: number,
-    ventralNormal: THREE.Vector3,
-    ventralOffsetRatio: number,
-    endFraction: number,
     slerpAlpha: number,
     initialized: boolean
   ): void {
     this.tmpOccStart.copy(start);
-    this.tmpOccEnd.copy(start).lerp(end, endFraction);
+    this.tmpOccEnd.copy(end);
     this.tmpOccDir.copy(this.tmpOccEnd).sub(this.tmpOccStart);
     const segLen = this.tmpOccDir.length();
 
@@ -577,15 +575,10 @@ export class ThreeNailScene {
     this.tmpOccDir.divideScalar(segLen);
     this.tmpOccQuat.setFromUnitVectors(this.tmpOccUp, this.tmpOccDir);
 
-    // CapsuleGeometry(0.5, 1.0) has radius 0.5 -> diameter 1.0, and total unscaled height 2.0
-    const scaleY = Math.max(radius * 0.85, segLen * 0.5);
-    const scaleXZ = radius * 2.0;
-
-    // Anchor end of distal/phalanx capsule precisely so foreshortened capsules never poke past fingertip
+    // Center unit cylinder (height = 1.0, radius = 1.0) strictly on phalanx axis so distal end stops exactly at `end` (TIP)
     this.tmpOccCenter
-      .copy(this.tmpOccEnd)
-      .addScaledVector(this.tmpOccDir, -scaleY)
-      .addScaledVector(ventralNormal, radius * ventralOffsetRatio);
+      .copy(this.tmpOccStart)
+      .addScaledVector(this.tmpOccDir, segLen * 0.5);
 
     if (!initialized) {
       occ.pos.copy(this.tmpOccCenter);
@@ -597,7 +590,7 @@ export class ThreeNailScene {
 
     occ.mesh.position.copy(occ.pos);
     occ.mesh.quaternion.copy(occ.quat);
-    occ.mesh.scale.set(scaleXZ, scaleY, scaleXZ);
+    occ.mesh.scale.set(radius, segLen, radius);
     occ.mesh.visible = true;
   }
 
@@ -703,8 +696,9 @@ export class ThreeNailScene {
           this.tmpPalmNormal.set(pose.palmNormal.x, -pose.palmNormal.y, -pose.palmNormal.z);
         }
 
-        // Account for handedness & mirrorX so dorsal normal consistently exits the back of the hand
-        if ((pose.handedness === 'Left') !== mirrorX) {
+        // Convert vIndex x vPinky into outward dorsal normal (+Z local = back of hand, -Z local = palm)
+        // for both Left/Right hands and mirrorX true/false
+        if (((pose.handedness ?? 'Right') === 'Right') !== mirrorX) {
           this.tmpPalmNormal.negate();
         }
 
@@ -727,22 +721,25 @@ export class ThreeNailScene {
         this.tmpPalmNormal.set(0, 0, 1);
       }
 
-      // Gram-Schmidt orthogonalization: Z = dorsalNormal orthogonalized against Y, X = normalize(Y × Z)
+      // Gram-Schmidt right-handed orthonormal basis (det = +1):
+      // Z = dorsalNormal orthogonalized against Y, X = normalize(Y × Z), Z = normalize(X × Y)
       this.tmpAxisZ
         .copy(this.tmpPalmNormal)
         .addScaledVector(this.tmpAxisY, -this.tmpPalmNormal.dot(this.tmpAxisY));
       if (this.tmpAxisZ.lengthSq() < 1e-4) {
-        this.tmpAxisZ.set(0, 0, 1);
+        if (Math.abs(this.tmpAxisY.z) < 0.9) {
+          this.tmpAxisZ.set(0, 0, 1);
+        } else {
+          this.tmpAxisZ.set(1, 0, 0);
+        }
+        this.tmpAxisZ
+          .addScaledVector(this.tmpAxisY, -this.tmpAxisZ.dot(this.tmpAxisY))
+          .normalize();
       } else {
         this.tmpAxisZ.normalize();
       }
-      this.tmpAxisX.crossVectors(this.tmpAxisY, this.tmpAxisZ);
-      if (this.tmpAxisX.lengthSq() < 1e-4) {
-        this.tmpAxisX.set(1, 0, 0);
-      } else {
-        this.tmpAxisX.normalize();
-      }
-      // Re-orthogonalize Z = X × Y for exact right-handed orthonormal basis
+      this.tmpAxisX.crossVectors(this.tmpAxisY, this.tmpAxisZ).normalize();
+      // Re-orthogonalize Z = X × Y for exact right-handed orthonormal basis (det(M) = +1)
       this.tmpAxisZ.crossVectors(this.tmpAxisX, this.tmpAxisY).normalize();
 
       this.tmpMatrix.makeBasis(this.tmpAxisX, this.tmpAxisY, this.tmpAxisZ);
@@ -756,9 +753,8 @@ export class ThreeNailScene {
         this.tmpTargetQuat.premultiply(this.tmpRotOffsetQuat);
       }
 
-      // Cuticle anchor strictly between DIP and TIP (0.44 thumb, 0.39 fingers)
-      const cuticleT = pose.id === 'thumb' ? 0.44 : 0.39;
-      this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, cuticleT);
+      // Cuticle anchor strictly at lerp(DIP, TIP, 0.42) to cover full nail bed seamlessly
+      this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, 0.42);
 
       // Clamp foreshortened scale cleanly when finger turns sideways in profile
       const rawNailW = pose.widthScale * rect.drawW * 1.12 * adjustment.scale;
@@ -771,7 +767,12 @@ export class ThreeNailScene {
       const nailH = clampedBaseH * adjustment.scale * adjustment.extensionLength * shapeMult;
       const nailDepth = nailW;
 
-      this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, nailW * 0.14);
+      // Seat nail plate cleanly on dorsal surface just above the DIP->TIP occluder cylinder (radius = 1.05 * halfWidth)
+      const fingerHalfW = nailW * 0.5;
+      const distalOccluderRadius = fingerHalfW * 1.05;
+      const dorsalOffset = distalOccluderRadius + nailW * 0.05;
+
+      this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, dorsalOffset);
       this.tmpTargetScale.set(nailW, nailH, nailDepth);
 
       // One-Euro Adaptive Filter for 3D position & scale + velocity-responsive Quaternion slerp
@@ -830,7 +831,7 @@ export class ThreeNailScene {
         this.tmpAoPos
           .copy(rig.currentPos)
           .addScaledVector(this.tmpAxisY, rig.currentScale.y * 0.46)
-          .addScaledVector(this.tmpAxisZ, -nailW * 0.06);
+          .addScaledVector(this.tmpAxisZ, -nailW * 0.025);
         rig.aoShadowMesh.position.copy(this.tmpAoPos);
         rig.aoShadowMesh.quaternion.copy(rig.currentQuat);
         rig.aoShadowMesh.scale.set(rig.currentScale.x * 1.18, rig.currentScale.y * 0.94, 1);
@@ -840,20 +841,18 @@ export class ThreeNailScene {
         rig.aoShadowMesh.visible = false;
       }
 
-      // 3 physical invisible phalanx occluder capsules per finger (`renderOrder: 1`)
-      // Ventral direction = -dorsalNormal (toward palm side)
-      const ventralNormal = this.tmpVecA.copy(this.tmpAxisZ).negate();
-      const baseRadius = nailW * (FINGER_OCCLUDER_RADIUS_FACTOR[pose.id] ?? 0.45);
+      // 3 physical invisible phalanx occluder cylinders per finger (`renderOrder: 1`)
+      // Centered strictly on the 3D phalanx axes (zero ventral offset) and ending exactly at TIP
+      const fingerScaleRatio = (FINGER_OCCLUDER_RADIUS_FACTOR[pose.id] ?? 0.45) / 0.45;
+      const proximalRadius = distalOccluderRadius * 1.12 * fingerScaleRatio;
+      const middleRadius = distalOccluderRadius * 1.05 * fingerScaleRatio;
 
       // 1. Proximal phalanx (MCP -> PIP)
       this.updatePhalanxOccluder(
         rig.proximalOccluder,
         this.tmpMcp,
         this.tmpPip,
-        baseRadius * 1.12,
-        ventralNormal,
-        0.45,
-        1.0,
+        proximalRadius,
         slerpAlpha,
         wasInitialized
       );
@@ -863,25 +862,19 @@ export class ThreeNailScene {
         rig.middleOccluder,
         this.tmpPip,
         this.tmpDip,
-        baseRadius * 1.04,
-        ventralNormal,
-        0.45,
-        1.0,
+        middleRadius,
         slerpAlpha,
         wasInitialized
       );
 
-      // 3. Distal phalanx (DIP -> TIP): offset -dorsalNormal * radius * 0.55 so back-of-hand
-      //    never z-fights its own nail, while palm-facing-camera cleanly occludes the nail bed
-      //    and leaves the free-edge extension past TIP visible from its milky-gel underside!
+      // 3. Distal phalanx (DIP -> TIP): radius = 1.05 * halfWidth, stops strictly at TIP
+      //    so back-of-hand shows full Group 0 nail above cylinder, while palm-facing-camera
+      //    occludes nail bed up to TIP and leaves only the Group 1 free-edge extension visible!
       this.updatePhalanxOccluder(
         rig.distalOccluder,
         this.tmpDip,
         this.tmpTip,
-        baseRadius * 0.96,
-        ventralNormal,
-        0.55,
-        0.95,
+        distalOccluderRadius,
         slerpAlpha,
         wasInitialized
       );
