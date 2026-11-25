@@ -18,7 +18,11 @@ export type NailFingerDesignSpec = BaseNailFingerDesignSpec & {
   extensionLevel?: NailExtensionLevel;
   aspectRatio?: number;
   lengthMultiplier?: number;
+  hasMetallicOutline?: boolean;
+  outlineColor?: string;
 };
+
+export type ExtendedNailFingerDesignSpec = NailFingerDesignSpec;
 
 export const ORDERED_FINGERS: FingerId[] = ['thumb', 'index', 'middle', 'ring', 'pinky'];
 
@@ -266,6 +270,8 @@ function analyzeSingleNailROI(
     baseColor: '#E5BEB3',
     secondaryColor: '#FFF7F3',
     accentColor: '#D4AF37',
+    hasMetallicOutline: false,
+    outlineColor: undefined,
     pattern: 'solid_gloss',
     strokeAnchors: [],
     metallicIntensity: 0.12,
@@ -481,15 +487,22 @@ function analyzeSingleNailROI(
       Math.max(0.78, Math.min(1.30, cfg.defaultWidth * (baseWidth / (roiW * 0.36)))).toFixed(2)
     );
 
-    // 4. Extract 3 chromatic layers & classify artistic pattern strictly inside segmented nail plate
-    const baseSamples: Array<[number, number, number]> = [];
+    // 4. Hyper-Detailed 3-Zone Analysis inside segmented nail plate:
+    //    Zone 1: Central Core (u ∈ [0.16, 0.84], v ∈ [0.14, 0.82]) — dominant polish base excluding pure specular glare
+    //    Zone 2: Outer 5% Perimeter Ring — metallic/contrasting outline & french tip detection
+    //    Zone 3: Central Elements (Blobs & Strokes) — connected-component PCA eccentricity for floral vs 3D waves
+    const centralZoneSamples: Array<[number, number, number]> = [];
     const tipSamples: Array<[number, number, number]> = [];
-    const centerSamples: Array<[number, number, number]> = [];
-    const borderSamples: Array<[number, number, number]> = [];
+    const centerAuraSamples: Array<[number, number, number]> = [];
+    const outerAuraSamples: Array<[number, number, number]> = [];
+    const perimeterSamples: Array<[number, number, number]> = [];
+    const lateralPerimeterSamples: Array<[number, number, number]> = [];
+    const perimeterMetallicSamples: Array<[number, number, number]> = [];
     const accentSamples: Array<[number, number, number]> = [];
     const metallicPoints: Array<{ u: number; v: number; r: number; g: number; b: number; grad: number }> = [];
 
     let totalPlatePixels = 0;
+    let perimeterTotalPixels = 0;
     let lumaSum = 0;
     let lumaSqSum = 0;
     let ridgeCount = 0;
@@ -509,40 +522,68 @@ function analyzeSingleNailROI(
       // v = 0 at cuticle (maxY), v = 1 at tip (minY)
       const v = (maxY - y) / nailLength;
       const span = rx - lx;
+      if (span < 4) continue;
 
-      // Shrink laterally by 12% to strictly avoid sidewall skin bleed
-      const xStart = Math.round(lx + span * 0.12);
-      const xEnd = Math.round(rx - span * 0.12);
-
-      for (let x = xStart; x <= xEnd; x++) {
+      for (let x = lx; x <= rx; x++) {
         const p = (y * roiW + x) * 4;
         const r = data[p];
         const g = data[p + 1];
         const b = data[p + 2];
         const u = (x - lx) / Math.max(1, span);
 
+        const maxC = Math.max(r, g, b);
+        const minC = Math.min(r, g, b);
+        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
         const gx = getLuma(x + 1, y) - getLuma(x - 1, y);
         const gy = getLuma(x, y + 1) - getLuma(x, y - 1);
         const grad = Math.hypot(gx, gy);
-        const lum = getLuma(x, y);
+
+        // Skip extreme outer 1px background/skin bleed on perimeter checks
+        const isPerimeterRing =
+          (u <= 0.08 || u >= 0.92 || v <= 0.06 || v >= 0.94) &&
+          u >= 0.015 &&
+          u <= 0.985;
+
+        if (isPerimeterRing) {
+          const pLab = rgbToLabLike(r, g, b);
+          if (deltaLab(pLab, bgLab) > 8.0 && deltaLab(pLab, skinLab) > 7.5) {
+            perimeterTotalPixels++;
+            perimeterSamples.push([r, g, b]);
+            if (u <= 0.09 || u >= 0.91) {
+              lateralPerimeterSamples.push([r, g, b]);
+            }
+            if (isGoldOrMetallicPixel(r, g, b, grad)) {
+              perimeterMetallicSamples.push([r, g, b]);
+            }
+          }
+          continue;
+        }
+
+        // Strict inner plate bounds (avoiding sidewall skin bleed)
+        if (u < 0.10 || u > 0.90) continue;
 
         totalPlatePixels++;
         lumaSum += lum;
         lumaSqSum += lum * lum;
         if (grad > 0.13) ridgeCount++;
 
-        if (v >= 0.15 && v <= 0.55) {
-          baseSamples.push([r, g, b]);
+        // Zone 1: Central Core u ∈ [0.16, 0.84], v ∈ [0.14, 0.82] excluding pure specular highlights
+        const isPureSpecularGlare = lum > 0.93 && sat < 0.09 && grad < 0.18;
+        if (u >= 0.16 && u <= 0.84 && v >= 0.14 && v <= 0.82 && !isPureSpecularGlare) {
+          centralZoneSamples.push([r, g, b]);
         }
-        if (v >= 0.62 && v <= 0.92) {
+
+        if (v >= 0.72 && v <= 0.94 && u >= 0.2 && u <= 0.8) {
           tipSamples.push([r, g, b]);
         }
 
         const radialDist = Math.hypot((u - 0.5) * 1.4, (v - 0.5) * 1.2);
         if (radialDist < 0.28) {
-          centerSamples.push([r, g, b]);
-        } else if (radialDist > 0.45) {
-          borderSamples.push([r, g, b]);
+          centerAuraSamples.push([r, g, b]);
+        } else if (radialDist > 0.44) {
+          outerAuraSamples.push([r, g, b]);
         }
 
         if (isGoldOrMetallicPixel(r, g, b, grad)) {
@@ -552,60 +593,315 @@ function analyzeSingleNailROI(
       }
     }
 
-    const baseColor = medianRgbColor(baseSamples, defaultSpec.baseColor);
-    const tipColor = medianRgbColor(tipSamples, baseColor);
-    const centerColor = medianRgbColor(centerSamples, baseColor);
-    const borderColor = medianRgbColor(borderSamples, baseColor);
-
+    // Dominant cluster median for Zone 1 (immune to floral/art blobs occupying < 45% of nail)
+    const baseColor = extractDominantColorCluster(centralZoneSamples, defaultSpec.baseColor);
     const baseLab = hexToLab(baseColor);
+
+    const tipColor = medianRgbColor(tipSamples, baseColor);
     const tipLab = hexToLab(tipColor);
-    const centerLab = hexToLab(centerColor);
-    const borderLab = hexToLab(borderColor);
+    const centerAuraColor = medianRgbColor(centerAuraSamples, baseColor);
+    const outerAuraColor = medianRgbColor(outerAuraSamples, baseColor);
+
+    // Zone 2: Evaluate 5% perimeter border contrast / metallic rim
+    const perimeterContrastSamples = perimeterSamples.filter(
+      (rgb) => deltaLab(rgbToLabLike(rgb[0], rgb[1], rgb[2]), baseLab) > 13.5
+    );
+    const lateralContrastSamples = lateralPerimeterSamples.filter(
+      (rgb) => deltaLab(rgbToLabLike(rgb[0], rgb[1], rgb[2]), baseLab) > 13.5
+    );
+
+    const perimContrastRatio =
+      perimeterTotalPixels > 0 ? perimeterContrastSamples.length / perimeterTotalPixels : 0;
+    const perimMetallicRatio =
+      perimeterTotalPixels > 0 ? perimeterMetallicSamples.length / perimeterTotalPixels : 0;
+    const hasLateralRim =
+      lateralPerimeterSamples.length >= 4 &&
+      lateralContrastSamples.length / Math.max(1, lateralPerimeterSamples.length) > 0.22;
+
+    const perimeterCandidateColor =
+      perimeterMetallicSamples.length >= 4
+        ? medianRgbColor(perimeterMetallicSamples, baseColor)
+        : perimeterContrastSamples.length >= 4
+          ? medianRgbColor(perimeterContrastSamples, baseColor)
+          : medianRgbColor(perimeterSamples, baseColor);
+    const perimeterLab = hexToLab(perimeterCandidateColor);
+    const perimeterDelta = deltaLab(perimeterLab, baseLab);
+    const perimeterLumaDiff = Math.abs(perimeterLab[0] - baseLab[0]) / 100;
 
     const baseTipDelta = deltaLab(baseLab, tipLab);
-    const radialDelta = deltaLab(centerLab, borderLab);
+    const radialDelta = deltaLab(hexToLab(centerAuraColor), hexToLab(outerAuraColor));
+
+    const hasMetallicOutline =
+      (perimMetallicRatio > 0.16 && (perimeterDelta > 11 || perimeterLumaDiff > 0.12)) ||
+      (hasLateralRim && perimContrastRatio > 0.24 && perimeterDelta > 14.5) ||
+      (baseTipDelta > 18 && perimMetallicRatio > 0.12);
+
+    const outlineColor = hasMetallicOutline ? perimeterCandidateColor : undefined;
+
+    // Zone 3: Connected-component blob & stroke detection inside core/body (u ∈ [0.12, 0.88], v ∈ [0.10, 0.88])
+    const contrastMask = new Uint8Array(roiW * roiH);
+    const maskPixels: Array<{ x: number; y: number; u: number; v: number; r: number; g: number; b: number; isMetal: boolean }> = [];
+
+    for (let y = minY; y <= maxY; y++) {
+      const lx = rowLeft[y];
+      const rx = rowRight[y];
+      if (lx < 0 || rx <= lx) continue;
+      const v = (maxY - y) / nailLength;
+      if (v < 0.10 || v > 0.88) continue;
+      const span = rx - lx;
+      for (let x = Math.round(lx + span * 0.12); x <= Math.round(rx - span * 0.12); x++) {
+        const p = (y * roiW + x) * 4;
+        const r = data[p];
+        const g = data[p + 1];
+        const b = data[p + 2];
+        const maxC = Math.max(r, g, b);
+        const minC = Math.min(r, g, b);
+        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+        const gx = getLuma(x + 1, y) - getLuma(x - 1, y);
+        const gy = getLuma(x, y + 1) - getLuma(x, y - 1);
+        const grad = Math.hypot(gx, gy);
+
+        // Exclude smooth specular reflection highlights from artwork blobs
+        if (lum > 0.92 && sat < 0.09 && grad < 0.16) continue;
+
+        const pLab = rgbToLabLike(r, g, b);
+        const dBase = deltaLab(pLab, baseLab);
+        const isMetal = isGoldOrMetallicPixel(r, g, b, grad);
+        if (dBase > 15.5 || (isMetal && dBase > 10.5)) {
+          contrastMask[y * roiW + x] = 1;
+          maskPixels.push({
+            x,
+            y,
+            u: (x - lx) / Math.max(1, span),
+            v,
+            r,
+            g,
+            b,
+            isMetal,
+          });
+        }
+      }
+    }
+
+    // Connected components on contrastMask
+    const visited = new Uint8Array(roiW * roiH);
+    interface DetectedComponent {
+      count: number;
+      cu: number;
+      cv: number;
+      eccentricity: number;
+      angle: number;
+      radius: number;
+      isMetallic: boolean;
+      dominantColor: string;
+      centerDotColor: string | null;
+    }
+    const components: DetectedComponent[] = [];
+
+    for (const seed of maskPixels) {
+      const startIdx = seed.y * roiW + seed.x;
+      if (visited[startIdx] || !contrastMask[startIdx]) continue;
+
+      const queue: number[] = [startIdx];
+      visited[startIdx] = 1;
+      const pts: Array<{ u: number; v: number; r: number; g: number; b: number; isMetal: boolean }> = [];
+
+      let head = 0;
+      while (head < queue.length) {
+        const cur = queue[head++];
+        const cy = Math.floor(cur / roiW);
+        const cx = cur - cy * roiW;
+        const lx = rowLeft[cy];
+        const rx = rowRight[cy];
+        const span = Math.max(1, rx - lx);
+        const p = cur * 4;
+        const r = data[p];
+        const g = data[p + 1];
+        const b = data[p + 2];
+        const gx = getLuma(cx + 1, cy) - getLuma(cx - 1, cy);
+        const gy = getLuma(cx, cy + 1) - getLuma(cx, cy - 1);
+        pts.push({
+          u: (cx - lx) / span,
+          v: (maxY - cy) / nailLength,
+          r,
+          g,
+          b,
+          isMetal: isGoldOrMetallicPixel(r, g, b, Math.hypot(gx, gy)),
+        });
+
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            if (ox === 0 && oy === 0) continue;
+            const nx = cx + ox;
+            const ny = cy + oy;
+            if (nx < 0 || nx >= roiW || ny < minY || ny > maxY) continue;
+            const nIdx = ny * roiW + nx;
+            if (!visited[nIdx] && contrastMask[nIdx]) {
+              visited[nIdx] = 1;
+              queue.push(nIdx);
+            }
+          }
+        }
+      }
+
+      if (pts.length < 4) continue;
+
+      let sumU = 0;
+      let sumV = 0;
+      let metalHits = 0;
+      const rgbs: Array<[number, number, number]> = [];
+      for (const pt of pts) {
+        sumU += pt.u;
+        sumV += pt.v;
+        if (pt.isMetal) metalHits++;
+        rgbs.push([pt.r, pt.g, pt.b]);
+      }
+      const cu = sumU / pts.length;
+      const cv = sumV / pts.length;
+
+      // 2x2 covariance PCA for eccentricity & stroke orientation
+      let cxx = 0;
+      let cyy = 0;
+      let cxy = 0;
+      for (const pt of pts) {
+        const du = pt.u - cu;
+        const dv = pt.v - cv;
+        cxx += du * du;
+        cyy += dv * dv;
+        cxy += du * dv;
+      }
+      cxx /= pts.length;
+      cyy /= pts.length;
+      cxy /= pts.length;
+
+      const trace = cxx + cyy;
+      const disc = Math.sqrt(Math.max(0, (cxx - cyy) * (cxx - cyy) + 4 * cxy * cxy));
+      const lambda1 = Math.max(1e-6, (trace + disc) * 0.5);
+      const lambda2 = Math.max(0, (trace - disc) * 0.5);
+      const eccentricity = Math.sqrt(Math.max(0, 1 - lambda2 / lambda1));
+      const angle = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+      const radius = Math.max(0.08, Math.min(0.26, Math.sqrt(lambda1) * 2.2));
+
+      const domHex = extractDominantColorCluster(rgbs, '#FFFFFF');
+      const domLab = hexToLab(domHex);
+      // Detect contrasting inner pistil / center dot inside compact clusters (e.g. gold/light dot inside red flower)
+      const innerDotRgbs: Array<[number, number, number]> = [];
+      for (const pt of pts) {
+        if (Math.hypot(pt.u - cu, pt.v - cv) < radius * 0.45) {
+          const dDom = deltaLab(rgbToLabLike(pt.r, pt.g, pt.b), domLab);
+          if (dDom > 14 || pt.isMetal) {
+            innerDotRgbs.push([pt.r, pt.g, pt.b]);
+          }
+        }
+      }
+
+      components.push({
+        count: pts.length,
+        cu,
+        cv,
+        eccentricity,
+        angle,
+        radius,
+        isMetallic: metalHits / pts.length > 0.38,
+        dominantColor: domHex,
+        centerDotColor:
+          innerDotRgbs.length >= 2 ? medianRgbColor(innerDotRgbs, '#D4AF37') : null,
+      });
+    }
+
+    components.sort((a, b) => b.count - a.count);
 
     const meanLuma = lumaSum / Math.max(1, totalPlatePixels);
-    const lumaVariance = Math.max(0, lumaSqSum / Math.max(1, totalPlatePixels) - meanLuma * meanLuma);
+    const lumaVariance = Math.max(
+      0,
+      lumaSqSum / Math.max(1, totalPlatePixels) - meanLuma * meanLuma
+    );
     const ridgeDensity = ridgeCount / Math.max(1, totalPlatePixels);
     const metallicRatio = metallicPoints.length / Math.max(1, totalPlatePixels);
 
-    // Cluster metallic/accent points into up to 4 clean strokeAnchors
-    const strokeAnchors = clusterStrokeAnchors(metallicPoints);
+    const meaningfulComponents = components.filter((c) => c.count >= 5);
+    const elongatedStrokeCount = meaningfulComponents.filter(
+      (c) => c.eccentricity >= 0.82 && (c.isMetallic || metallicRatio > 0.03)
+    ).length;
+    const compactBlobCount = meaningfulComponents.filter(
+      (c) => c.eccentricity < 0.84
+    ).length;
 
-    // Classify artistic pattern from real chromatic & gradient signals
+    const detectedAnchors: StrokeAnchor[] = meaningfulComponents.slice(0, 4).map((c) => ({
+      u: Number(Math.max(0.16, Math.min(0.84, c.cu)).toFixed(2)),
+      v: Number(Math.max(0.16, Math.min(0.86, c.cv)).toFixed(2)),
+      radius: Number(c.radius.toFixed(2)),
+      angle: Number(c.angle.toFixed(2)),
+    }));
+    const strokeAnchors =
+      detectedAnchors.length > 0 ? detectedAnchors : clusterStrokeAnchors(metallicPoints);
+
+    // Classify artistic pattern from 3-zone spatial + PCA eccentricity signals
     let pattern: ArtisticPattern = 'solid_gloss';
     let secondaryColor = tipColor;
     let accentColor =
-      accentSamples.length > 4
+      outlineColor ??
+      (accentSamples.length > 4
         ? medianRgbColor(accentSamples, '#D4AF37')
-        : '#D4AF37';
+        : '#D4AF37');
 
-    if (metallicRatio > 0.045 && ridgeDensity > 0.075 && strokeAnchors.length >= 2) {
+    const topBlob = meaningfulComponents[0];
+    const hasInnerFloralDot = meaningfulComponents.some((c) => c.centerDotColor !== null);
+
+    if (
+      (elongatedStrokeCount >= 1 && metallicRatio > 0.028) ||
+      (metallicRatio > 0.048 && ridgeDensity > 0.075 && strokeAnchors.length >= 2 && compactBlobCount === 0)
+    ) {
       pattern = 'gold_3d_waves';
-      secondaryColor = tipColor !== baseColor ? tipColor : shadeHex(baseColor, 14);
-    } else if (baseTipDelta > 16 && radialDelta < 18) {
+      const metalComp = meaningfulComponents.find((c) => c.isMetallic);
+      accentColor =
+        metalComp?.dominantColor ??
+        (accentSamples.length > 3 ? medianRgbColor(accentSamples, '#D4AF37') : accentColor);
+      secondaryColor =
+        hasMetallicOutline && outlineColor
+          ? outlineColor
+          : tipColor !== baseColor
+            ? tipColor
+            : shadeHex(baseColor, 14);
+    } else if (
+      (compactBlobCount >= 1 && topBlob && topBlob.count >= 8 && (hasInnerFloralDot || compactBlobCount >= 2)) ||
+      (meaningfulComponents.length >= 2 && compactBlobCount >= 2 && ridgeDensity > 0.04)
+    ) {
+      pattern = 'floral_accent';
+      const petalBlob =
+        meaningfulComponents.find((c) => !c.isMetallic) ?? topBlob;
+      secondaryColor = petalBlob ? petalBlob.dominantColor : '#FFFDF9';
+      const dotBlob = meaningfulComponents.find((c) => c.centerDotColor !== null);
+      accentColor =
+        dotBlob?.centerDotColor ??
+        outlineColor ??
+        (accentSamples.length > 3 ? medianRgbColor(accentSamples, '#D4AF37') : '#D4AF37');
+    } else if (baseTipDelta > 16 && radialDelta < 18 && meaningfulComponents.length <= 1) {
       pattern = 'french_tip';
       secondaryColor = tipColor;
-    } else if (radialDelta > 15) {
+    } else if (radialDelta > 15 && meaningfulComponents.length === 0) {
       pattern = 'aura_gradient';
-      baseSamples.length > 0 && (secondaryColor = centerColor);
-    } else if (lumaVariance > 0.032 && meanLuma > 0.58) {
+      secondaryColor = centerAuraColor;
+    } else if (lumaVariance > 0.032 && meanLuma > 0.58 && meaningfulComponents.length === 0) {
       pattern = 'chrome_mirror';
       secondaryColor = '#FFFFFF';
       accentColor = accentSamples.length > 3 ? accentColor : '#F5E7DF';
-    } else if (strokeAnchors.length >= 3 && ridgeDensity > 0.055) {
-      pattern = 'floral_accent';
-      secondaryColor = '#FFFDF9';
     } else {
       pattern = 'solid_gloss';
-      secondaryColor = shadeHex(baseColor, -14);
+      secondaryColor =
+        hasMetallicOutline && outlineColor ? outlineColor : shadeHex(baseColor, -14);
+    }
+
+    if (hasMetallicOutline && outlineColor && pattern !== 'floral_accent') {
+      accentColor = outlineColor;
     }
 
     const metallicIntensity =
       pattern === 'chrome_mirror'
         ? 0.92
-        : pattern === 'gold_3d_waves'
+        : pattern === 'gold_3d_waves' || hasMetallicOutline
           ? 0.88
           : pattern === 'floral_accent'
             ? 0.45
@@ -623,6 +919,8 @@ function analyzeSingleNailROI(
       baseColor,
       secondaryColor,
       accentColor,
+      hasMetallicOutline,
+      outlineColor,
       pattern,
       strokeAnchors:
         strokeAnchors.length > 0
@@ -634,6 +932,47 @@ function analyzeSingleNailROI(
   } catch {
     return defaultSpec;
   }
+}
+
+function extractDominantColorCluster(
+  samples: Array<[number, number, number]>,
+  fallback: string
+): string {
+  if (samples.length === 0) return fallback;
+  if (samples.length < 6) return medianRgbColor(samples, fallback);
+
+  // Coarse 3D RGB quantization (step 24) to isolate dominant base polish even with central nail art
+  const bins = new Map<string, { sumR: number; sumG: number; sumB: number; count: number }>();
+  for (const [r, g, b] of samples) {
+    const key = `${Math.floor(r / 24)}_${Math.floor(g / 24)}_${Math.floor(b / 24)}`;
+    const cur = bins.get(key);
+    if (cur) {
+      cur.sumR += r;
+      cur.sumG += g;
+      cur.sumB += b;
+      cur.count++;
+    } else {
+      bins.set(key, { sumR: r, sumG: g, sumB: b, count: 1 });
+    }
+  }
+
+  let bestBin: { sumR: number; sumG: number; sumB: number; count: number } | null = null;
+  for (const bin of bins.values()) {
+    if (!bestBin || bin.count > bestBin.count) {
+      bestBin = bin;
+    }
+  }
+  if (!bestBin) return medianRgbColor(samples, fallback);
+
+  const seedLab = rgbToLabLike(
+    bestBin.sumR / bestBin.count,
+    bestBin.sumG / bestBin.count,
+    bestBin.sumB / bestBin.count
+  );
+  const clusterSamples = samples.filter(
+    ([r, g, b]) => deltaLab(rgbToLabLike(r, g, b), seedLab) < 18
+  );
+  return medianRgbColor(clusterSamples.length > 0 ? clusterSamples : samples, fallback);
 }
 
 function defaultAnchorsForPattern(pattern: ArtisticPattern): StrokeAnchor[] {
@@ -742,6 +1081,8 @@ function applyHarmonicInheritance(
         donor.extensionLevel ?? classifyExtensionFromMultiplier(inheritedLengthMult),
       aspectRatio: donor.aspectRatio,
       relativeWidth: cfg.defaultWidth,
+      hasMetallicOutline: donor.hasMetallicOutline ?? false,
+      outlineColor: donor.outlineColor,
       pattern: inheritedPattern,
       strokeAnchors:
         inheritedPattern === 'gold_3d_waves' || inheritedPattern === 'floral_accent'
@@ -918,6 +1259,8 @@ export function buildFingerSpecsFromStudioDesign(
       baseColor,
       secondaryColor,
       accentColor,
+      hasMetallicOutline: false,
+      outlineColor: undefined,
       pattern,
       strokeAnchors: defaultAnchorsForPattern(pattern),
       metallicIntensity,
