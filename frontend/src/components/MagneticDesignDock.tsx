@@ -1,20 +1,18 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef } from 'react';
 import { motion, useMotionValue, useSpring, useTransform } from 'framer-motion';
-import { Plus, Trash2 } from 'lucide-react';
+import { Camera, Plus, Trash2 } from 'lucide-react';
 import { getSwatchBackground } from '../lib/swatchPreview';
-import type { NailCategory, NailDesign } from '../types/nail';
+import type { DockTab, NailDesign } from '../types/nail';
 
-const CATEGORIES: NailCategory[] = [
-  'Todas',
-  'Francesinha',
-  'Gel',
-  'Cromado',
-  'Nail Art',
-  'Cliente',
+const TABS: Array<{ id: DockTab; label: string }> = [
+  { id: 'client', label: 'Referência da Cliente' },
+  { id: 'studio', label: 'Catálogo do Estúdio' },
 ];
 
 interface MagneticDesignDockProps {
   designs: NailDesign[];
+  activeTab: DockTab;
+  onTabChange: (tab: DockTab) => void;
   activeDesignId: string;
   onSelectDesign: (design: NailDesign) => void;
   onOpenImport: () => void;
@@ -45,7 +43,7 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
     return Math.abs(val - center);
   });
 
-  const rawScale = useTransform(distance, [0, 75, 160], [1.22, 1.08, 1]);
+  const rawScale = useTransform(distance, [0, 75, 160], [1.18, 1.06, 1]);
   const scale = useSpring(rawScale, { stiffness: 360, damping: 26, mass: 0.5 });
 
   const swatchBg = useMemo(() => getSwatchBackground(design), [design]);
@@ -62,10 +60,7 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
         aria-label={design.name}
         aria-pressed={isActive}
       >
-        <span
-          className="dock-swatch-circle"
-          style={{ background: swatchBg }}
-        />
+        <span className="dock-swatch-circle" style={{ background: swatchBg }} />
         {isActive && (
           <motion.span
             layoutId="dockActiveRing"
@@ -97,48 +92,51 @@ const DockSwatchItem: React.FC<DockItemProps> = ({
 
 export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
   designs,
+  activeTab,
+  onTabChange,
   activeDesignId,
   onSelectDesign,
   onOpenImport,
   onDeleteCustom,
 }) => {
-  const [category, setCategory] = useState<NailCategory>('Todas');
   const mouseX = useMotionValue<number>(Infinity);
 
-  const filteredDesigns = useMemo(() => {
-    if (category === 'Todas') return designs;
-    return designs.filter((d) => d.category === category);
-  }, [designs, category]);
+  const visibleDesigns = useMemo(() => {
+    if (activeTab === 'client') {
+      return designs.filter((d) => d.isCustom || d.category === 'Cliente');
+    }
+    return designs.filter((d) => !d.isCustom && d.category !== 'Cliente');
+  }, [designs, activeTab]);
 
   return (
     <div className="dock-container">
-      {/* Category Filter Strip */}
-      <div className="category-strip" role="tablist" aria-label="Categorias de unhas">
-        {CATEGORIES.map((cat) => {
-          const active = cat === category;
+      {/* Clean 2-Tab Editorial Switcher (Zero game-like category filters) */}
+      <div className="dock-tabs-bar" role="tablist" aria-label="Origem das artes">
+        {TABS.map((tab) => {
+          const active = tab.id === activeTab;
           return (
             <button
-              key={cat}
+              key={tab.id}
               type="button"
               role="tab"
               aria-selected={active}
-              onClick={() => setCategory(cat)}
-              className={`category-pill ${active ? 'is-active' : ''}`}
+              onClick={() => onTabChange(tab.id)}
+              className={`dock-tab-btn ${active ? 'is-active' : ''}`}
             >
               {active && (
                 <motion.span
-                  layoutId="categoryActiveBg"
-                  className="category-pill-bg"
+                  layoutId="dockTabIndicator"
+                  className="dock-tab-bg"
                   transition={{ type: 'spring', stiffness: 460, damping: 34 }}
                 />
               )}
-              <span className="category-pill-text">{cat}</span>
+              <span className="dock-tab-text">{tab.label}</span>
             </button>
           );
         })}
       </div>
 
-      {/* Floating Magnetic Carousel Dock */}
+      {/* Floating Luxury Dock with Prominent + Importar Referência CTA */}
       <div
         className="magnetic-dock glass-panel"
         onMouseMove={(e) => mouseX.set(e.clientX)}
@@ -148,28 +146,36 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
         }}
         onTouchEnd={() => mouseX.set(Infinity)}
       >
-        <div className="dock-import-wrap">
-          <motion.button
-            type="button"
-            whileTap={{ scale: 0.92 }}
-            onClick={onOpenImport}
-            className="dock-import-btn"
-            aria-label="Importar foto da cliente"
-          >
-            <Plus size={20} strokeWidth={2.2} />
-          </motion.button>
-          <span className="dock-item-label">+ Foto</span>
-        </div>
+        <motion.button
+          type="button"
+          whileTap={{ scale: 0.95 }}
+          onClick={onOpenImport}
+          className="dock-import-hero-btn"
+          aria-label="Importar foto de referência da cliente"
+        >
+          <span className="dock-import-hero-icon">
+            <Plus size={16} strokeWidth={2.5} />
+          </span>
+          <span className="dock-import-hero-copy">
+            <strong>Importar</strong>
+            <small>Referência</small>
+          </span>
+        </motion.button>
 
         <div className="dock-divider" aria-hidden="true" />
 
         <div className="dock-scroll-track">
-          {filteredDesigns.length === 0 ? (
-            <div className="dock-empty-hint">
-              Nenhuma referência nesta categoria ainda.
-            </div>
+          {visibleDesigns.length === 0 ? (
+            <button
+              type="button"
+              onClick={onOpenImport}
+              className="dock-empty-cta"
+            >
+              <Camera size={15} />
+              <span>Toque para importar a foto que a cliente trouxe</span>
+            </button>
           ) : (
-            filteredDesigns.map((design) => (
+            visibleDesigns.map((design) => (
               <DockSwatchItem
                 key={design.id}
                 design={design}

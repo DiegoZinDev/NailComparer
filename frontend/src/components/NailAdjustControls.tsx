@@ -1,7 +1,7 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { RotateCcw, SlidersHorizontal, X } from 'lucide-react';
-import type { NailAdjustment } from '../types/nail';
+import type { NailAdjustment, NailShape } from '../types/nail';
 
 interface NailAdjustControlsProps {
   open: boolean;
@@ -11,11 +11,20 @@ interface NailAdjustControlsProps {
   onReset: () => void;
 }
 
-const SHAPES: Array<{ id: NailAdjustment['shape']; label: string }> = [
+const SHAPES: Array<{ id: NailShape; label: string }> = [
+  { id: 'natural', label: 'Natural' },
   { id: 'almond', label: 'Amendoada' },
-  { id: 'oval', label: 'Oval' },
+  { id: 'square', label: 'Quadrada' },
   { id: 'coffin', label: 'Bailarina' },
+  { id: 'stiletto', label: 'Stiletto' },
 ];
+
+function getLengthLabel(len: number): string {
+  if (len <= 0.9) return 'Curto';
+  if (len <= 1.12) return 'Médio';
+  if (len <= 1.42) return 'Longo';
+  return 'Extra Longo';
+}
 
 export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
   open,
@@ -34,12 +43,12 @@ export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
           exit={{ opacity: 0, y: 14, scale: 0.97 }}
           transition={{ type: 'spring', stiffness: 380, damping: 30 }}
           className="adjust-drawer glass-panel"
-          aria-label="Ajustes finos da unha"
+          aria-label="Alongamento e formato da unha"
         >
           <div className="adjust-header">
             <div className="adjust-title-group">
               <SlidersHorizontal size={15} />
-              <span>Ajuste Anatômico</span>
+              <span>Alongamento & Formato</span>
             </div>
             <div className="adjust-header-actions">
               <button
@@ -62,7 +71,7 @@ export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
             </div>
           </div>
 
-          <div className="shape-selector" role="group" aria-label="Formato da unha">
+          <div className="shape-selector is-five" role="group" aria-label="Formato do alongamento">
             {SHAPES.map((s) => (
               <button
                 key={s.id}
@@ -78,59 +87,61 @@ export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
           <div className="slider-grid">
             <label className="slider-row">
               <div className="slider-meta">
-                <span>Escala</span>
-                <span className="slider-val">{adjustment.scale.toFixed(2)}x</span>
-              </div>
-              <input
-                type="range"
-                min={0.6}
-                max={1.6}
-                step={0.02}
-                value={adjustment.scale}
-                onChange={(e) =>
-                  onChange({ ...adjustment, scale: parseFloat(e.target.value) })
-                }
-                className="luxury-range"
-              />
-            </label>
-
-            <label className="slider-row">
-              <div className="slider-meta">
-                <span>Rotação</span>
+                <span>Comprimento do Alongamento</span>
                 <span className="slider-val">
-                  {adjustment.rotationDeg > 0 ? `+${adjustment.rotationDeg}` : adjustment.rotationDeg}°
+                  {getLengthLabel(adjustment.extensionLength)} ({adjustment.extensionLength.toFixed(2)}x)
                 </span>
               </div>
               <input
                 type="range"
-                min={-45}
-                max={45}
-                step={1}
-                value={adjustment.rotationDeg}
+                min={0.75}
+                max={1.75}
+                step={0.02}
+                value={adjustment.extensionLength}
                 onChange={(e) =>
-                  onChange({ ...adjustment, rotationDeg: parseInt(e.target.value, 10) })
+                  onChange({ ...adjustment, extensionLength: parseFloat(e.target.value) })
                 }
                 className="luxury-range"
               />
             </label>
 
-            <label className="slider-row">
-              <div className="slider-meta">
-                <span>Opacidade</span>
-                <span className="slider-val">{Math.round(adjustment.opacity * 100)}%</span>
-              </div>
-              <input
-                type="range"
-                min={0.35}
-                max={1}
-                step={0.01}
-                value={adjustment.opacity}
-                onChange={(e) =>
-                  onChange({ ...adjustment, opacity: parseFloat(e.target.value) })
-                }
-                className="luxury-range"
-              />
-            </label>
+            <div className="slider-two-col">
+              <label className="slider-row">
+                <div className="slider-meta">
+                  <span>Largura</span>
+                  <span className="slider-val">{adjustment.scale.toFixed(2)}x</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.75}
+                  max={1.35}
+                  step={0.02}
+                  value={adjustment.scale}
+                  onChange={(e) =>
+                    onChange({ ...adjustment, scale: parseFloat(e.target.value) })
+                  }
+                  className="luxury-range"
+                />
+              </label>
+
+              <label className="slider-row">
+                <div className="slider-meta">
+                  <span>Intensidade</span>
+                  <span className="slider-val">{Math.round(adjustment.opacity * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.65}
+                  max={1}
+                  step={0.01}
+                  value={adjustment.opacity}
+                  onChange={(e) =>
+                    onChange({ ...adjustment, opacity: parseFloat(e.target.value) })
+                  }
+                  className="luxury-range"
+                />
+              </label>
+            </div>
           </div>
         </motion.section>
       )}

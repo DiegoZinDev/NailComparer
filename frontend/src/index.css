@@ -374,16 +374,25 @@ body,
   gap: 6px;
 }
 
+.shape-selector.is-five {
+  grid-template-columns: repeat(5, 1fr);
+  gap: 5px;
+}
+
 .shape-chip {
   height: 32px;
+  padding: 0 4px;
   border-radius: 10px;
   border: 1px solid var(--glass-border);
   background: rgba(255, 255, 255, 0.04);
   color: var(--glass-muted);
   font-family: var(--font-sans);
-  font-size: 0.75rem;
+  font-size: 0.7rem;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: all 0.18s ease;
 }
 
@@ -396,7 +405,13 @@ body,
 .slider-grid {
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: 10px;
+}
+
+.slider-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
 }
 
 .slider-row {
@@ -449,7 +464,7 @@ body,
   cursor: pointer;
 }
 
-/* Magnetic Dock + Category Strip */
+/* Clean 2-Tab Editorial Switcher + Luxury Magnetic Dock */
 .dock-container {
   width: 100%;
   max-width: 620px;
@@ -459,9 +474,9 @@ body,
   gap: 8px;
 }
 
-.category-strip {
-  display: flex;
-  align-items: center;
+.dock-tabs-bar {
+  display: inline-grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 4px;
   padding: 4px;
   border-radius: 999px;
@@ -469,35 +484,30 @@ body,
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--glass-border);
-  max-width: 100%;
-  overflow-x: auto;
-  scrollbar-width: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
 }
 
-.category-strip::-webkit-scrollbar {
-  display: none;
-}
-
-.category-pill {
+.dock-tab-btn {
   position: relative;
   border: none;
   background: transparent;
-  padding: 5px 11px;
+  padding: 6px 14px;
   border-radius: 999px;
   font-family: var(--font-sans);
-  font-size: 0.72rem;
+  font-size: 0.74rem;
   font-weight: 600;
+  letter-spacing: 0.015em;
   color: var(--glass-muted);
   white-space: nowrap;
   cursor: pointer;
   transition: color 0.18s ease;
 }
 
-.category-pill.is-active {
+.dock-tab-btn.is-active {
   color: #171214;
 }
 
-.category-pill-bg {
+.dock-tab-bg {
   position: absolute;
   inset: 0;
   border-radius: 999px;
@@ -505,7 +515,7 @@ body,
   z-index: 0;
 }
 
-.category-pill-text {
+.dock-tab-text {
   position: relative;
   z-index: 1;
 }
@@ -515,34 +525,56 @@ body,
   border-radius: 26px;
   padding: 10px 12px 9px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
 }
 
-.dock-import-wrap {
-  display: flex;
-  flex-direction: column;
+.dock-import-hero-btn {
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 9px;
+  height: 54px;
+  padding: 0 14px 0 10px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  background: linear-gradient(135deg, var(--primary), var(--accent));
+  color: #171214;
+  cursor: pointer;
   flex-shrink: 0;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.28);
 }
 
-.dock-import-btn {
-  width: 50px;
-  height: 50px;
+.dock-import-hero-icon {
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
-  border: 1px dashed var(--primary);
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--accent);
+  background: rgba(23, 18, 20, 0.14);
   display: grid;
   place-items: center;
-  cursor: pointer;
+}
+
+.dock-import-hero-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.08;
+}
+
+.dock-import-hero-copy strong {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.dock-import-hero-copy small {
+  font-size: 0.66rem;
+  font-weight: 600;
+  opacity: 0.78;
 }
 
 .dock-divider {
   width: 1px;
   height: 46px;
-  margin-top: 2px;
   background: var(--glass-border);
   flex-shrink: 0;
 }
@@ -563,10 +595,20 @@ body,
   display: none;
 }
 
-.dock-empty-hint {
-  font-size: 0.76rem;
+.dock-empty-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px dashed var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--glass-muted);
-  padding: 15px 6px;
+  font-family: var(--font-sans);
+  font-size: 0.74rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
 }
 
 .dock-item-wrap {
@@ -917,7 +959,7 @@ body,
   color: var(--glass-text);
 }
 
-/* Import Reference Modal */
+/* Import Reference Modal & Smart Nail Extractor */
 .import-preview-stage {
   display: flex;
   align-items: center;
@@ -926,20 +968,96 @@ body,
 
 .nail-crop-preview {
   position: relative;
-  width: 78px;
-  height: 112px;
-  border-radius: 42px 42px 34px 34px;
+  width: 96px;
+  height: 142px;
+  border-radius: 52px 52px 40px 40px;
   overflow: hidden;
   border: 1px solid var(--glass-border);
   background: rgba(255, 255, 255, 0.05);
   flex-shrink: 0;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+  touch-action: none;
+}
+
+.nail-crop-preview.is-interactive.has-texture {
+  cursor: grab;
+  border-color: var(--primary);
+}
+
+.nail-crop-preview.is-interactive.has-texture:active {
+  cursor: grabbing;
 }
 
 .nail-crop-preview img {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  pointer-events: none;
+}
+
+.nail-crop-drag-badge {
+  position: absolute;
+  bottom: 7px;
+  right: 7px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(16, 13, 15, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: var(--accent);
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.extractor-status-note {
+  font-size: 0.71rem;
+  line-height: 1.35;
+  color: var(--accent);
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-border);
+}
+
+.extractor-refine-box {
+  padding: 11px 13px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.extractor-refine-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.extractor-refine-sliders {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.spin-icon {
+  animation: nailSpin 1s linear infinite;
+}
+
+@keyframes nailSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .nail-crop-placeholder {

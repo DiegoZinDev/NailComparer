@@ -27,7 +27,13 @@ import {
   saveStudioConfig,
 } from './lib/offlineStore';
 import { getStudioMonogram } from './lib/swatchPreview';
-import type { ARViewMode, NailAdjustment, NailDesign, StudioConfig } from './types/nail';
+import type {
+  ARViewMode,
+  DockTab,
+  NailAdjustment,
+  NailDesign,
+  StudioConfig,
+} from './types/nail';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -35,10 +41,11 @@ interface BeforeInstallPromptEvent extends Event {
 }
 
 const DEFAULT_ADJUSTMENT: NailAdjustment = {
+  shape: 'almond',
+  extensionLength: 1.08,
   scale: 1,
   rotationDeg: 0,
   opacity: 0.94,
-  shape: 'almond',
 };
 
 function applyCssVariables(config: StudioConfig): void {
@@ -78,6 +85,7 @@ export function App(): React.ReactElement {
 
   const [config, setConfig] = useState<StudioConfig>(DEFAULT_STUDIO_CONFIG);
   const [designs, setDesigns] = useState<NailDesign[]>(SEED_NAIL_DESIGNS);
+  const [activeTab, setActiveTab] = useState<DockTab>('studio');
   const [activeDesignId, setActiveDesignId] = useState<string>(SEED_NAIL_DESIGNS[0].id);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('synced');
 
@@ -160,6 +168,8 @@ export function App(): React.ReactElement {
     const res = await createNailDesign(draft);
     setDesigns((prev) => [res.design, ...prev]);
     setActiveDesignId(res.design.id);
+    setActiveTab('client');
+    setCompareClean(false);
     setSyncStatus(res.status);
   };
 
@@ -356,6 +366,8 @@ export function App(): React.ReactElement {
 
         <MagneticDesignDock
           designs={designs}
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
           activeDesignId={activeDesign.id}
           onSelectDesign={(d) => {
             setCompareClean(false);

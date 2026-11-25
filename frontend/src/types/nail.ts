@@ -36,6 +36,8 @@ export type NailCategory =
   | 'Nail Art'
   | 'Cliente';
 
+export type DockTab = 'client' | 'studio';
+
 export type NailPatternType =
   | 'solid'
   | 'french'
@@ -45,6 +47,8 @@ export type NailPatternType =
   | 'gold-foil'
   | 'cat-eye'
   | 'aurora';
+
+export type NailShape = 'natural' | 'almond' | 'square' | 'coffin' | 'stiletto';
 
 export interface NailDesign {
   id: string;
@@ -61,10 +65,11 @@ export interface NailDesign {
 }
 
 export interface NailAdjustment {
-  scale: number; // 0.6 to 1.6
-  rotationDeg: number; // -45 to +45
-  opacity: number; // 0.35 to 1.0
-  shape: 'almond' | 'oval' | 'coffin';
+  shape: NailShape;
+  extensionLength: number; // 0.75 (curto/natural) to 1.75 (longo)
+  scale: number; // width/fit multiplier 0.75 to 1.35
+  rotationDeg: number; // -30 to +30
+  opacity: number; // 0.65 to 1.0
 }
 
 export type ARViewMode = 'camera' | 'studio-demo';
