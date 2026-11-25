@@ -55,17 +55,18 @@ export function evalNailHalfWidth(v: number, shape: NailShape): number {
 
 /**
  * Computes longitudinal Gel Apex (Ápice estrutural) elevation along v ∈ [0, 1].
- * Rises cleanly from cuticle (v = 0) to apex peak (v ≈ 0.38) and tapers smoothly to free edge (v = 1).
+ * Rises swiftly past the cuticle emergence (v >= 0.14) to apex peak (v ≈ 0.38)
+ * so the dorsal body clears the finger capsule cleanly, tapering smoothly to free edge (v = 1).
  */
 function evalGelApexZ(v: number, lengthRatio: number): number {
   const apexPeak = 0.38;
-  const apexHeight = 0.072 * Math.min(1.35, Math.max(0.85, lengthRatio));
+  const apexHeight = 0.098 * Math.min(1.35, Math.max(0.85, lengthRatio));
   if (v <= apexPeak) {
     const t = v / apexPeak;
-    return apexHeight * Math.sin(t * (Math.PI / 2));
+    return apexHeight * Math.pow(Math.sin(t * (Math.PI / 2)), 0.72);
   }
   const t = (v - apexPeak) / (1 - apexPeak);
-  return apexHeight * (1 - 0.52 * Math.pow(t, 1.35));
+  return apexHeight * (1 - 0.44 * Math.pow(t, 1.35));
 }
 
 /**
@@ -119,6 +120,13 @@ export function createVolumetricNailGeometry(
     const apexZ = evalGelApexZ(v, lengthRatio);
     const thickness = evalShellThickness(v);
 
+    // Smoothly plunge proximal cuticle margin (v < 0.14) into -Z so v = 0 sits ~2mm embedded inside
+    // the dorsal finger capsule, while v >= 0.14 emerges smoothly above the skin without gaps or steps.
+    const cuticleTuck =
+      v < 0.14
+        ? -0.105 * Math.pow(Math.cos((v / 0.14) * (Math.PI / 2)), 1.4)
+        : 0;
+
     // Extra concave hollow arch beneath the free edge (v ∈ [0.42, 1.0])
     const hollowProgress =
       v <= 0.42 ? 0 : Math.sin(Math.min(1, (v - 0.42) / 0.58) * (Math.PI / 2));
@@ -139,7 +147,7 @@ export function createVolumetricNailGeometry(
 
       // Transverse C-Curve (Arco C)
       const zCCurve = -cCurveDepth * (1 - Math.cos(s * Math.PI * 0.48));
-      const zTop = zCCurve + apexZ;
+      const zTop = zCCurve + apexZ + cuticleTuck;
 
       // Ventral concave hollow: center thins slightly more than lateral sidewalls for real C-tunnel depth
       const centerConcavity = (1 - s * s) * 0.014 * hollowProgress * lateralTaper;

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { createVolumetricNailGeometry } from './nail3DGeometry';
+import { createVolumetricNailGeometry, evalNailHalfWidth } from './nail3DGeometry';
 import {
   ORDERED_FINGERS,
   buildFingerSpecsFromStudioDesign,
@@ -35,13 +35,23 @@ const SHAPE_LENGTH_MULT: Record<NailShape, number> = {
   stiletto: 1.26,
 };
 
-const ANATOMICAL_FINGER_SCALE: Record<FingerId, number> = {
-  thumb: 1.25,
-  index: 1.0,
-  middle: 1.0,
-  ring: 1.0,
-  pinky: 0.78,
+const ANATOMICAL_DISTAL_METERS: Record<FingerId, number> = {
+  thumb: 0.029,
+  index: 0.021,
+  middle: 0.023,
+  ring: 0.021,
+  pinky: 0.0175,
 };
+
+const ANATOMICAL_WIDTH_METERS: Record<FingerId, number> = {
+  thumb: 0.0175,
+  index: 0.0138,
+  middle: 0.0144,
+  ring: 0.0132,
+  pinky: 0.0108,
+};
+
+const PALM_WRIST_TO_MIDDLE_MCP_METERS = 0.085;
 
 /**
  * Generates an in-memory Softbox Studio Environment Map using THREE.PMREMGenerator
@@ -258,14 +268,6 @@ class OneEuroFilter {
   }
 }
 
-const FINGER_OCCLUDER_RADIUS_FACTOR: Record<FingerId, number> = {
-  thumb: 0.48,
-  index: 0.45,
-  middle: 0.45,
-  ring: 0.44,
-  pinky: 0.42,
-};
-
 interface PhalanxOccluderRig {
   mesh: THREE.Mesh;
   pos: THREE.Vector3;
@@ -304,7 +306,7 @@ interface FingerRig {
 export class ThreeNailScene {
   private renderer: THREE.WebGLRenderer | null = null;
   private scene: THREE.Scene;
-  private camera: THREE.PerspectiveCamera;
+  private camera: THREE.OrthographicCamera;
   private envMap: THREE.Texture | null = null;
 
   private dirLight: THREE.DirectionalLight;
@@ -317,9 +319,10 @@ export class ThreeNailScene {
   private aoShadowGeometry: THREE.PlaneGeometry;
   private aoShadowTexture: THREE.CanvasTexture;
   private occluderMaterial: THREE.MeshBasicMaterial;
-  private occluderGeometry: THREE.CylinderGeometry;
+  private occluderGeometry: THREE.CapsuleGeometry;
 
   private fingerRigs = new Map<FingerId, FingerRig>();
+  private handScaleFilter = new OneEuroFilter(0.9, 0.03, 1.0);
   private ready = false;
 
   // Design & PBR bundle cache — ensures zero texture creation or canvas drawing inside RAF
@@ -355,8 +358,10 @@ export class ThreeNailScene {
 
   constructor(canvas: HTMLCanvasElement) {
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(36, 1, 0.1, 5000);
-    this.camera.position.set(0, 0, 1000);
+    // Right-handed 1:1 pixel OrthographicCamera: left=0, right=cssW, top=cssH, bottom=0, near=-1000, far=1000
+    // det(Projection) > 0 preserves Three.js FrontSide winding without inversion.
+    this.camera = new THREE.OrthographicCamera(0, 1, 1, 0, -1000, 1000);
+    this.camera.position.set(0, 0, 500);
     this.camera.lookAt(0, 0, 0);
 
     this.dirLight = new THREE.DirectionalLight(0xfff6ef, 1.55);
@@ -395,9 +400,10 @@ export class ThreeNailScene {
       colorWrite: false,
       depthWrite: true,
       depthTest: true,
+      side: THREE.FrontSide,
     });
-    // Unit cylinder: radius = 1.0, height = 1.0 (spans y ∈ [-0.5, +0.5]) so scale(r, len, r) stops exactly at start & end
-    this.occluderGeometry = new THREE.CylinderGeometry(1.0, 1.0, 1.0, 14, 1, false);
+    // CapsuleGeometry(0.5, 1.0): base radius = 0.5, base total height = 2.0 -> scaleXZ = radius * 2, scaleY = totalLen * 0.5
+    this.occluderGeometry = new THREE.CapsuleGeometry(0.5, 1.0, 8, 16);
 
     try {
       const renderer = new THREE.WebGLRenderer({
@@ -484,13 +490,13 @@ export class ThreeNailScene {
           currentSpecHash: '',
           initialized: false,
           posFilters: [
-            new OneEuroFilter(1.18, 0.05, 1.0), // X: firm anti-sway + responsive real motion
-            new OneEuroFilter(1.18, 0.05, 1.0), // Y: firm anti-sway + responsive real motion
-            new OneEuroFilter(0.75, 0.025, 1.0), // Z: strong depth jitter suppression
+            new OneEuroFilter(0.85, 0.04, 1.0), // X: locked 2D anchor with 0.35px deadband
+            new OneEuroFilter(0.85, 0.04, 1.0), // Y: locked 2D anchor with 0.35px deadband
+            new OneEuroFilter(0.65, 0.02, 1.0), // Z: strongly smoothed wrist-relative depth
           ],
           scaleFilters: [
-            new OneEuroFilter(1.05, 0.035, 1.0),
-            new OneEuroFilter(1.05, 0.035, 1.0),
+            new OneEuroFilter(0.95, 0.03, 1.0),
+            new OneEuroFilter(0.95, 0.03, 1.0),
             new OneEuroFilter(0.85, 0.025, 1.0),
           ],
           currentPos: new THREE.Vector3(),
@@ -532,14 +538,16 @@ export class ThreeNailScene {
       renderer.setSize(cssW, cssH, false);
     }
 
-    const halfH = cssH * 0.5;
-    const fovRad = (this.camera.fov * Math.PI) / 180;
-    const camDist = halfH / Math.tan(fovRad / 2);
-
-    this.camera.aspect = Math.max(0.1, cssW / Math.max(1, cssH));
-    this.camera.position.set(0, 0, camDist);
-    this.camera.near = Math.max(1, camDist * 0.05);
-    this.camera.far = camDist * 4.5;
+    const safeW = Math.max(1, cssW);
+    const safeH = Math.max(1, cssH);
+    this.camera.left = 0;
+    this.camera.right = safeW;
+    this.camera.top = safeH;
+    this.camera.bottom = 0;
+    this.camera.near = -1000;
+    this.camera.far = 1000;
+    this.camera.position.set(0, 0, 500);
+    this.camera.lookAt(0, 0, 0);
     this.camera.updateProjectionMatrix();
   }
 
@@ -567,31 +575,118 @@ export class ThreeNailScene {
     for (const rig of this.fingerRigs.values()) {
       this.hideRig(rig);
     }
+    this.handScaleFilter.reset();
     this.renderer.clear();
   }
 
   /**
-   * Projects normalized MediaPipe landmark (x, y, z) into 3D scene space centered at (0,0,0),
-   * where 1 world unit = 1 CSS pixel at z = 0.
+   * Projects normalized MediaPipe landmark (x, y, z) 1:1 into Orthographic screen-pixel coordinates
+   * accounting for exact `object-fit: cover` crop (`rect`), with `z` relative to wrist/base centered near 0.
    */
   private landmarkToScene(
     pt: { x: number; y: number; z?: number },
     rect: ImageLayoutRect,
-    cssW: number,
     cssH: number,
     mirrorX: boolean,
+    refZ: number,
     out: THREE.Vector3
   ): THREE.Vector3 {
     const nx = mirrorX ? 1 - pt.x : pt.x;
-    const px = rect.drawX + nx * rect.drawW - cssW * 0.5;
-    const py = cssH * 0.5 - (rect.drawY + pt.y * rect.drawH);
-    const pz = -(pt.z ?? 0) * rect.drawW * 0.95;
+    const px = rect.drawX + nx * rect.drawW;
+    const py = cssH - (rect.drawY + pt.y * rect.drawH);
+    const pz = -((pt.z ?? 0) - refZ) * rect.drawW * 0.95;
     return out.set(px, py, pz);
   }
 
   private computeDesignKey(design: NailDesign): string {
     const fingerSpecsPart = design.fingerSpecs ? JSON.stringify(design.fingerSpecs) : '';
     return `${design.id}|${design.name}|${design.baseColor}|${design.secondaryColor ?? ''}|${design.accentColor ?? ''}|${design.finish}|${design.patternType}|${design.imageDataUrl ?? ''}|${fingerSpecsPart}`;
+  }
+
+  private paintMetallicOutlineOnBundle(
+    bundle: ProceduralPBRBundle,
+    shape: NailShape,
+    outlineColor: string
+  ): void {
+    const traceSilhouette = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+      const steps = 40;
+      ctx.beginPath();
+      // Left edge from cuticle (v=0.05) to free tip (v=0.985)
+      for (let i = 0; i <= steps; i++) {
+        const v = 0.05 + (i / steps) * 0.935;
+        const hw = evalNailHalfWidth(v, shape) * 0.91;
+        const u = 0.5 - hw * 0.96;
+        const x = u * w;
+        const y = (1 - v) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      // Right edge from free tip (v=0.985) back to cuticle (v=0.05)
+      for (let i = steps; i >= 0; i--) {
+        const v = 0.05 + (i / steps) * 0.935;
+        const hw = evalNailHalfWidth(v, shape) * 0.91;
+        const u = 0.5 + hw * 0.96;
+        const x = u * w;
+        const y = (1 - v) * h;
+        ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+    };
+
+    const mapImg = bundle.map?.image as CanvasImageSource | undefined;
+    if (mapImg && 'getContext' in mapImg && typeof mapImg.getContext === 'function') {
+      const canvas = mapImg as HTMLCanvasElement;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.save();
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        traceSilhouette(ctx, canvas.width, canvas.height);
+        ctx.strokeStyle = outlineColor;
+        ctx.lineWidth = Math.max(10, canvas.width * 0.024);
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(255, 250, 236, 0.34)';
+        ctx.lineWidth = Math.max(3, canvas.width * 0.007);
+        ctx.stroke();
+        ctx.restore();
+        bundle.map.needsUpdate = true;
+      }
+    }
+
+    const metalImg = bundle.metalnessMap?.image as CanvasImageSource | undefined;
+    if (metalImg && 'getContext' in metalImg && typeof metalImg.getContext === 'function') {
+      const canvas = metalImg as HTMLCanvasElement;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.save();
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        traceSilhouette(ctx, canvas.width, canvas.height);
+        ctx.strokeStyle = '#EFEFEF';
+        ctx.lineWidth = Math.max(10, canvas.width * 0.024);
+        ctx.stroke();
+        ctx.restore();
+        bundle.metalnessMap.needsUpdate = true;
+      }
+    }
+
+    const roughImg = bundle.roughnessMap?.image as CanvasImageSource | undefined;
+    if (roughImg && 'getContext' in roughImg && typeof roughImg.getContext === 'function') {
+      const canvas = roughImg as HTMLCanvasElement;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.save();
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        traceSilhouette(ctx, canvas.width, canvas.height);
+        ctx.strokeStyle = '#1E1E1E';
+        ctx.lineWidth = Math.max(10, canvas.width * 0.024);
+        ctx.stroke();
+        ctx.restore();
+        bundle.roughnessMap.needsUpdate = true;
+      }
+    }
   }
 
   private ensureDesignPBRCache(design: NailDesign): void {
@@ -608,6 +703,12 @@ export class ThreeNailScene {
     for (const id of ORDERED_FINGERS) {
       const spec = specs[id];
       const bundle = synthesizeProceduralPBRBundle(spec);
+
+      // Paint metallic perimeter outline once inside cache (never inside RAF)
+      if (spec.hasMetallicOutline && spec.outlineColor) {
+        this.paintMetallicOutlineOnBundle(bundle, spec.shape, spec.outlineColor);
+      }
+
       this.cachedPBRBundles.set(id, bundle);
 
       const rig = this.fingerRigs.get(id);
@@ -622,7 +723,9 @@ export class ThreeNailScene {
         rig.currentSpecHash = bundle.specHash;
 
         const isRelief =
-          spec.pattern === 'gold_3d_waves' || spec.pattern === 'floral_accent';
+          spec.pattern === 'gold_3d_waves' ||
+          spec.pattern === 'floral_accent' ||
+          Boolean(spec.hasMetallicOutline);
         const isChrome = spec.pattern === 'chrome_mirror';
         const isVelvet = spec.glossIntensity < 0.65;
 
@@ -655,20 +758,21 @@ export class ThreeNailScene {
     this.tmpOccStart.copy(start);
     this.tmpOccEnd.copy(end);
     this.tmpOccDir.copy(this.tmpOccEnd).sub(this.tmpOccStart);
-    const segLen = this.tmpOccDir.length();
+    const totalLen = this.tmpOccDir.length();
 
-    if (segLen < 1.5) {
+    if (totalLen < 1.5) {
       occ.mesh.visible = false;
       return;
     }
 
-    this.tmpOccDir.divideScalar(segLen);
+    this.tmpOccDir.divideScalar(totalLen);
     this.tmpOccQuat.setFromUnitVectors(this.tmpOccUp, this.tmpOccDir);
 
-    // Center unit cylinder (height = 1.0, radius = 1.0) strictly on phalanx axis so distal end stops exactly at `end` (TIP)
+    // CapsuleGeometry(0.5, 1.0): base radius = 0.5, base total height = 2.0
+    // => scaleXZ = radius * 2, scaleY = totalLen * 0.5 centers capsule strictly between start & end
     this.tmpOccCenter
       .copy(this.tmpOccStart)
-      .addScaledVector(this.tmpOccDir, segLen * 0.5);
+      .addScaledVector(this.tmpOccDir, totalLen * 0.5);
 
     if (!initialized) {
       occ.pos.copy(this.tmpOccCenter);
@@ -680,7 +784,7 @@ export class ThreeNailScene {
 
     occ.mesh.position.copy(occ.pos);
     occ.mesh.quaternion.copy(occ.quat);
-    occ.mesh.scale.set(radius, segLen, radius);
+    occ.mesh.scale.set(radius * 2, totalLen * 0.5, radius * 2);
     occ.mesh.visible = true;
   }
 
@@ -731,23 +835,63 @@ export class ThreeNailScene {
     const geo = this.getOrCreateGeometry(adjustment.shape);
     const seenIds = new Set<FingerId>();
 
-    // Estimate reference hand distal phalanx scale from all visible fingers in the current frame
-    // so small, medium, and large hands in camera receive proportionally accurate nail width & length.
-    let handScaleAcc = 0;
-    let handScaleWeight = 0;
-    for (const p of poses) {
-      this.landmarkToScene(p.tip, rect, cssW, cssH, mirrorX, this.tmpTip);
-      this.landmarkToScene(p.dip, rect, cssW, cssH, mirrorX, this.tmpDip);
-      const d3 = this.tmpTip.distanceTo(this.tmpDip);
-      const factor = ANATOMICAL_FINGER_SCALE[p.id] ?? 1.0;
-      if (d3 >= 5) {
-        const w = p.id === 'middle' || p.id === 'index' ? 1.4 : 1.0;
-        handScaleAcc += (d3 / factor) * w;
-        handScaleWeight += w;
+    // True anatomical hand scale (pxPerMeter) from 3D palm span wrist -> middle.mcp (~8.5 cm)
+    // with median wrist -> finger.mcp fallback, smoothed via dedicated OneEuroFilter(0.9, 0.03).
+    const middlePose = poses.find((p) => p.id === 'middle');
+    const refWristZ =
+      middlePose?.wrist?.z ??
+      poses.find((p) => p.wrist)?.wrist?.z ??
+      poses.find((p) => p.mcp)?.mcp?.z ??
+      0;
+
+    let rawPalmLen3D = 0;
+    if (middlePose?.wrist && middlePose?.mcp) {
+      this.landmarkToScene(middlePose.wrist, rect, cssH, mirrorX, refWristZ, this.tmpWrist);
+      this.landmarkToScene(middlePose.mcp, rect, cssH, mirrorX, refWristZ, this.tmpMcp);
+      rawPalmLen3D = this.tmpWrist.distanceTo(this.tmpMcp);
+    }
+
+    if (rawPalmLen3D < 8) {
+      const palmSamples: number[] = [];
+      for (const p of poses) {
+        if (p.wrist && p.mcp) {
+          this.landmarkToScene(p.wrist, rect, cssH, mirrorX, refWristZ, this.tmpWrist);
+          this.landmarkToScene(p.mcp, rect, cssH, mirrorX, refWristZ, this.tmpMcp);
+          const d = this.tmpWrist.distanceTo(this.tmpMcp);
+          if (d >= 8) palmSamples.push(d);
+        }
+      }
+      if (palmSamples.length > 0) {
+        palmSamples.sort((a, b) => a - b);
+        rawPalmLen3D = palmSamples[Math.floor(palmSamples.length / 2)];
       }
     }
-    const refHandDistalLen =
-      handScaleWeight > 0 ? handScaleAcc / handScaleWeight : rect.drawW * 0.065;
+
+    let rawPxPerMeter: number;
+    if (rawPalmLen3D >= 8) {
+      rawPxPerMeter = rawPalmLen3D / PALM_WRIST_TO_MIDDLE_MCP_METERS;
+    } else {
+      const fallbackPxPerM: number[] = [];
+      for (const p of poses) {
+        const pwZ = p.wrist?.z ?? refWristZ;
+        this.landmarkToScene(p.tip, rect, cssH, mirrorX, pwZ, this.tmpTip);
+        this.landmarkToScene(p.dip, rect, cssH, mirrorX, pwZ, this.tmpDip);
+        const d3 = this.tmpTip.distanceTo(this.tmpDip);
+        const distM = ANATOMICAL_DISTAL_METERS[p.id] ?? 0.021;
+        if (d3 >= 4) fallbackPxPerM.push(d3 / distM);
+      }
+      if (fallbackPxPerM.length > 0) {
+        fallbackPxPerM.sort((a, b) => a - b);
+        rawPxPerMeter = fallbackPxPerM[Math.floor(fallbackPxPerM.length / 2)];
+      } else {
+        rawPxPerMeter = (rect.drawW * 0.24) / PALM_WRIST_TO_MIDDLE_MCP_METERS;
+      }
+    }
+
+    const pxPerMeter = Math.max(
+      180,
+      Math.min(18000, this.handScaleFilter.filter(rawPxPerMeter, dt, 1.5))
+    );
 
     for (const pose of poses) {
       const rig = this.fingerRigs.get(pose.id);
@@ -760,18 +904,20 @@ export class ThreeNailScene {
         rig.nailMesh.geometry = geo;
       }
 
-      // Project all 4 phalanx joints (MCP, PIP, DIP, TIP) using real MediaPipe 3D depth
-      this.landmarkToScene(pose.tip, rect, cssW, cssH, mirrorX, this.tmpTip);
-      this.landmarkToScene(pose.dip, rect, cssW, cssH, mirrorX, this.tmpDip);
+      const poseRefZ = pose.wrist?.z ?? refWristZ;
+
+      // Project all 4 phalanx joints (MCP, PIP, DIP, TIP) 1:1 into Orthographic pixel space
+      this.landmarkToScene(pose.tip, rect, cssH, mirrorX, poseRefZ, this.tmpTip);
+      this.landmarkToScene(pose.dip, rect, cssH, mirrorX, poseRefZ, this.tmpDip);
       if (pose.pip) {
-        this.landmarkToScene(pose.pip, rect, cssW, cssH, mirrorX, this.tmpPip);
+        this.landmarkToScene(pose.pip, rect, cssH, mirrorX, poseRefZ, this.tmpPip);
       } else {
         this.tmpPip
           .copy(this.tmpDip)
           .addScaledVector(this.tmpVecA.copy(this.tmpDip).sub(this.tmpTip), 1.25);
       }
       if (pose.mcp) {
-        this.landmarkToScene(pose.mcp, rect, cssW, cssH, mirrorX, this.tmpMcp);
+        this.landmarkToScene(pose.mcp, rect, cssH, mirrorX, poseRefZ, this.tmpMcp);
       } else {
         this.tmpMcp
           .copy(this.tmpPip)
@@ -779,15 +925,11 @@ export class ThreeNailScene {
       }
 
       // Finger axis Y = normalize(TIP - DIP) in full 3D (x, y, z)
+      // NEVER reject or scale based on dist2D(DIP, TIP) so pointing at the lens never triggers triangular explosion!
       this.tmpAxisY.copy(this.tmpTip).sub(this.tmpDip);
       const segLen3D = this.tmpAxisY.length();
-      const segLen2D = Math.hypot(
-        this.tmpTip.x - this.tmpDip.x,
-        this.tmpTip.y - this.tmpDip.y
-      );
 
-      // Hide nail cleanly if landmarks collapse or finger is completely end-on occluded
-      if (segLen3D < 5 || segLen2D < 2.5) {
+      if (segLen3D < 3) {
         this.hideRig(rig);
         continue;
       }
@@ -816,7 +958,7 @@ export class ThreeNailScene {
           this.tmpPalmNormal.normalize();
         }
       } else if (pose.wrist) {
-        this.landmarkToScene(pose.wrist, rect, cssW, cssH, mirrorX, this.tmpWrist);
+        this.landmarkToScene(pose.wrist, rect, cssH, mirrorX, poseRefZ, this.tmpWrist);
         this.tmpVecA.copy(this.tmpMcp).sub(this.tmpWrist);
         this.tmpVecB.copy(this.tmpPip).sub(this.tmpMcp);
         this.tmpPalmNormal.crossVectors(this.tmpVecA, this.tmpVecB);
@@ -875,35 +1017,30 @@ export class ThreeNailScene {
         this.tmpTargetQuat.premultiply(this.tmpRotOffsetQuat);
       }
 
-      // Cuticle anchor strictly at lerp(DIP, TIP, 0.42) to cover full nail bed seamlessly
-      this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, 0.42);
+      // Cuticle anchor strictly at lerp(DIP, TIP, 0.40)
+      this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, 0.40);
 
-      // Dynamic per-finger anatomical scaling proportional to dist3D(DIP, TIP) & scene hand reference:
-      // thumb = 1.25, index = 1.0, middle = 1.0, ring = 1.0, pinky = 0.78
-      const fingerAnatomicalFactor = ANATOMICAL_FINGER_SCALE[pose.id] ?? 1.0;
+      // True anatomical 3D nail sizing driven strictly by pxPerMeter & 3D distal length (zero 2D foreshortening distortion!)
       const fingerSpec = this.cachedFingerSpecs?.[pose.id];
       const specLengthMult = Math.max(
         0.85,
         Math.min(1.85, fingerSpec?.lengthMultiplier ?? fingerSpec?.relativeLength ?? 1.0)
       );
 
-      // Blend individual distal phalanx length with hand-wide reference distal scale
-      const normalizedDistal = segLen3D / fingerAnatomicalFactor;
-      const effectiveBaseDistal = refHandDistalLen * 0.62 + normalizedDistal * 0.38;
-      const poseWidthPx = pose.widthScale * rect.drawW;
-      const anatomicalNailW = effectiveBaseDistal * 0.56 * fingerAnatomicalFactor;
-      const rawNailW =
-        (anatomicalNailW * 0.72 + poseWidthPx * 0.28) * adjustment.scale;
+      const anatomicalW = pxPerMeter * (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138);
       const minSensibleW = Math.max(4.5, rect.drawW * 0.014);
-      const maxSensibleW = rect.drawW * 0.19;
-      const nailW = Math.max(minSensibleW, Math.min(maxSensibleW, rawNailW));
-
-      // Adapt length proportionally to real distal phalanx + per-finger 3D lengthMultiplier [0.85..1.85]
-      const anatomicalBaseH = Math.max(
-        segLen3D * 0.88,
-        effectiveBaseDistal * 1.02 * fingerAnatomicalFactor
+      const maxSensibleW = rect.drawW * 0.22;
+      const nailW = Math.max(
+        minSensibleW,
+        Math.min(maxSensibleW, anatomicalW * adjustment.scale)
       );
-      const clampedBaseH = Math.max(nailW * 1.08, Math.min(nailW * 2.55, anatomicalBaseH));
+
+      const anatomicalDistal3D = pxPerMeter * (ANATOMICAL_DISTAL_METERS[pose.id] ?? 0.021);
+      const stabilizedDistal3D = anatomicalDistal3D * 0.72 + segLen3D * 0.28;
+      const clampedBaseH = Math.max(
+        nailW * 1.12,
+        Math.min(nailW * 2.45, stabilizedDistal3D * 0.92)
+      );
       const nailH =
         clampedBaseH *
         specLengthMult *
@@ -912,15 +1049,20 @@ export class ThreeNailScene {
         shapeMult;
       const nailDepth = nailW;
 
-      // Seat nail plate cleanly on dorsal surface above the DIP->TIP occluder cylinder (radius = 1.12 * halfWidth)
-      const fingerHalfW = nailW * 0.5;
-      const distalOccluderRadius = fingerHalfW * 1.12;
-      const dorsalOffset = distalOccluderRadius + nailW * 0.03;
+      // Seat nail with 2mm cuticle embedding inside dorsal finger capsule while dorsal body clears capsule cleanly
+      const distalOccluderRadius = 1.12 * (nailW * 0.5);
+      const embed2mmPx = Math.min(
+        distalOccluderRadius * 0.24,
+        Math.max(1.5, 0.002 * pxPerMeter)
+      );
+      const dorsalOffset = distalOccluderRadius - embed2mmPx * 0.35;
 
       this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, dorsalOffset);
       this.tmpTargetScale.set(nailW, nailH, nailDepth);
 
-      // One-Euro Adaptive Filter (axis-differentiated + sub-pixel deadband) & Angular Deadband + Adaptive Slerp
+      // High-stability One-Euro Filter:
+      // XY locked with minCutoff: 0.85, beta: 0.04, deadband: 0.35px
+      // Z wrist-relative smoothed with minCutoff: 0.65, beta: 0.02, deadband: 0.45px
       const wasInitialized = rig.initialized;
       let slerpAlpha = 0.22;
 
@@ -938,11 +1080,9 @@ export class ThreeNailScene {
         rig.currentQuat.copy(this.tmpTargetQuat);
         rig.initialized = true;
       } else {
-        const xyDeadband = Math.max(0.32, nailW * 0.012);
-        const zDeadband = Math.max(0.55, nailW * 0.02);
-        const fx = rig.posFilters[0].filter(this.tmpTargetPos.x, dt, xyDeadband);
-        const fy = rig.posFilters[1].filter(this.tmpTargetPos.y, dt, xyDeadband);
-        const fz = rig.posFilters[2].filter(this.tmpTargetPos.z, dt, zDeadband);
+        const fx = rig.posFilters[0].filter(this.tmpTargetPos.x, dt, 0.35);
+        const fy = rig.posFilters[1].filter(this.tmpTargetPos.y, dt, 0.35);
+        const fz = rig.posFilters[2].filter(this.tmpTargetPos.z, dt, 0.45);
         const moveDist = Math.hypot(
           fx - rig.currentPos.x,
           fy - rig.currentPos.y,
@@ -950,7 +1090,7 @@ export class ThreeNailScene {
         );
         rig.currentPos.set(fx, fy, fz);
 
-        const scaleDeadband = Math.max(0.15, nailW * 0.006);
+        const scaleDeadband = Math.max(0.18, nailW * 0.006);
         rig.currentScale.set(
           rig.scaleFilters[0].filter(this.tmpTargetScale.x, dt, scaleDeadband),
           rig.scaleFilters[1].filter(this.tmpTargetScale.y, dt, scaleDeadband),
@@ -995,11 +1135,11 @@ export class ThreeNailScene {
         rig.aoShadowMesh.visible = false;
       }
 
-      // 3 physical invisible phalanx occluder cylinders per finger (`renderOrder: 1`)
-      // Centered strictly on the 3D phalanx axes (zero ventral offset) and ending exactly at TIP
-      const fingerScaleRatio = (FINGER_OCCLUDER_RADIUS_FACTOR[pose.id] ?? 0.45) / 0.45;
-      const proximalRadius = distalOccluderRadius * 1.12 * fingerScaleRatio;
-      const middleRadius = distalOccluderRadius * 1.05 * fingerScaleRatio;
+      // 3 physical invisible CapsuleGeometry phalanx occluders per finger (`renderOrder: 1`)
+      const fingerWidthRatio =
+        (ANATOMICAL_WIDTH_METERS[pose.id] ?? 0.0138) / ANATOMICAL_WIDTH_METERS.index;
+      const proximalRadius = distalOccluderRadius * 1.14 * Math.max(0.88, Math.min(1.12, fingerWidthRatio));
+      const middleRadius = distalOccluderRadius * 1.06 * Math.max(0.9, Math.min(1.1, fingerWidthRatio));
 
       // 1. Proximal phalanx (MCP -> PIP)
       this.updatePhalanxOccluder(
@@ -1021,13 +1161,14 @@ export class ThreeNailScene {
         wasInitialized
       );
 
-      // 3. Distal phalanx (DIP -> TIP): radius = 1.05 * halfWidth, stops strictly at TIP
-      //    so back-of-hand shows full Group 0 nail above cylinder, while palm-facing-camera
-      //    occludes nail bed up to TIP and leaves only the Group 1 free-edge extension visible!
+      // 3. Distal phalanx (DIP -> TIP + 18%): extends +18% beyond TIP landmark to cover full fleshy fingertip pulp
+      this.tmpVecA
+        .copy(this.tmpDip)
+        .addScaledVector(this.tmpVecB.copy(this.tmpTip).sub(this.tmpDip), 1.18);
       this.updatePhalanxOccluder(
         rig.distalOccluder,
         this.tmpDip,
-        this.tmpTip,
+        this.tmpVecA,
         distalOccluderRadius,
         slerpAlpha,
         wasInitialized
