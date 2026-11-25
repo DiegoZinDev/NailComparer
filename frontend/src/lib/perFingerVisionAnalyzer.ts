@@ -3,10 +3,22 @@ import type {
   ArtisticPattern,
   FingerId,
   NailDesign,
-  NailFingerDesignSpec,
+  NailFingerDesignSpec as BaseNailFingerDesignSpec,
   NailShape,
   StrokeAnchor,
 } from '../types/nail';
+
+export type NailExtensionLevel =
+  | 'Curta/Natural'
+  | 'Pouco Alongada'
+  | 'Alongada'
+  | 'Muito Alongada (Extrema)';
+
+export type NailFingerDesignSpec = BaseNailFingerDesignSpec & {
+  extensionLevel?: NailExtensionLevel;
+  aspectRatio?: number;
+  lengthMultiplier?: number;
+};
 
 export const ORDERED_FINGERS: FingerId[] = ['thumb', 'index', 'middle', 'ring', 'pinky'];
 
@@ -33,6 +45,8 @@ export interface PerFingerAnalysisResult {
   method: 'mediapipe' | 'smart-macro';
   primaryShape: NailShape;
   primaryLength: number;
+  primaryExtensionLevel?: NailExtensionLevel;
+  primaryAspectRatio?: number;
   primaryBaseColor: string;
   primarySecondaryColor: string;
   primaryAccentColor: string;
@@ -181,6 +195,47 @@ function isGoldOrMetallicPixel(r: number, g: number, b: number, gradMag: number)
   return isWarmGold || isPearlRidge;
 }
 
+function classifyExtensionFromAspectRatio(aspectRatio: number): {
+  extensionLevel: NailExtensionLevel;
+  lengthMultiplier: number;
+} {
+  const ar = Math.max(0.75, Math.min(3.4, aspectRatio));
+
+  if (ar < 1.30) {
+    const t = Math.max(0, Math.min(1, (ar - 0.85) / (1.30 - 0.85)));
+    return {
+      extensionLevel: 'Curta/Natural',
+      lengthMultiplier: Number((0.85 + t * (1.02 - 0.85)).toFixed(2)),
+    };
+  }
+  if (ar < 1.72) {
+    const t = Math.max(0, Math.min(1, (ar - 1.30) / (1.72 - 1.30)));
+    return {
+      extensionLevel: 'Pouco Alongada',
+      lengthMultiplier: Number((1.05 + t * (1.25 - 1.05)).toFixed(2)),
+    };
+  }
+  if (ar < 2.25) {
+    const t = Math.max(0, Math.min(1, (ar - 1.72) / (2.25 - 1.72)));
+    return {
+      extensionLevel: 'Alongada',
+      lengthMultiplier: Number((1.28 + t * (1.52 - 1.28)).toFixed(2)),
+    };
+  }
+  const t = Math.max(0, Math.min(1, (ar - 2.25) / (3.10 - 2.25)));
+  return {
+    extensionLevel: 'Muito Alongada (Extrema)',
+    lengthMultiplier: Number((1.55 + t * (1.85 - 1.55)).toFixed(2)),
+  };
+}
+
+function classifyExtensionFromMultiplier(lengthMultiplier: number): NailExtensionLevel {
+  if (lengthMultiplier <= 1.03) return 'Curta/Natural';
+  if (lengthMultiplier <= 1.26) return 'Pouco Alongada';
+  if (lengthMultiplier <= 1.53) return 'Alongada';
+  return 'Muito Alongada (Extrema)';
+}
+
 /**
  * Segments strictly the nail plate pixels inside an upright ROI, measures 3D shape & proportions,
  * extracts 3 chromatic layers (base, secondary, accent), classifies the artistic pattern, and
@@ -198,11 +253,15 @@ function analyzeSingleNailROI(
   const imgH = img.naturalHeight;
   const cfg = FINGER_LANDMARKS[fingerId];
 
+  const defaultMult = Number(Math.max(0.85, Math.min(1.85, cfg.defaultLength)).toFixed(2));
   const defaultSpec: NailFingerDesignSpec = {
     fingerId,
     detectedFromPhoto,
     shape: 'almond',
-    relativeLength: cfg.defaultLength,
+    relativeLength: defaultMult,
+    lengthMultiplier: defaultMult,
+    extensionLevel: classifyExtensionFromMultiplier(defaultMult),
+    aspectRatio: Number((1.15 * defaultMult).toFixed(2)),
     relativeWidth: cfg.defaultWidth,
     baseColor: '#E5BEB3',
     secondaryColor: '#FFF7F3',
@@ -367,7 +426,6 @@ function analyzeSingleNailROI(
     }
 
     const nailLength = Math.max(12, maxY - minY);
-    const aspectRatio = nailLength / Math.max(6, maxWidth);
 
     const sampleBandWidth = (fracFromCuticle: number): number => {
       const targetY = Math.round(maxY - nailLength * fracFromCuticle);
@@ -383,28 +441,44 @@ function analyzeSingleNailROI(
       return cnt > 0 ? acc / cnt : maxWidth;
     };
 
-    const widthAt45 = Math.max(5, sampleBandWidth(0.45));
-    const widthAt85 = sampleBandWidth(0.85);
-    const tipTaper = Math.max(0.08, Math.min(1.15, widthAt85 / widthAt45));
+    const baseWidth = Math.max(6, sampleBandWidth(0.34), maxWidth * 0.88);
+    const aspectRatio = Number((nailLength / baseWidth).toFixed(2));
 
+    const widthAt76 = sampleBandWidth(0.76);
+    const widthAt86 = sampleBandWidth(0.86);
+    const widthAt95 = sampleBandWidth(0.95);
+
+    // Relative width near tip (topWidth / baseWidth) & tip apex curvature
+    const tipTapering = Math.max(0.06, Math.min(1.15, widthAt86 / baseWidth));
+    const tipFlatness = Math.max(0, Math.min(1, widthAt95 / Math.max(3, widthAt86)));
+    const midToTipSlope = Math.max(0, Math.min(1, (widthAt76 - widthAt95) / baseWidth));
+    const apexCurvature = Math.max(
+      0,
+      Math.min(1, (1 - tipFlatness) * 0.65 + midToTipSlope * 0.35)
+    );
+
+    // Shape classification combining aspectRatio, tipTapering (topWidth/baseWidth), and apexCurvature
+    // Note: NailShape 'coffin' represents Bailarina in the 3D geometry/material catalog.
     let shape: NailShape = 'almond';
-    if (aspectRatio < 1.32) {
-      shape = 'natural';
-    } else if (tipTaper < 0.34) {
+    if (aspectRatio < 1.30) {
+      shape = tipTapering >= 0.82 && apexCurvature < 0.32 ? 'square' : 'natural';
+    } else if (
+      tipTapering < 0.34 ||
+      (aspectRatio >= 1.68 && tipTapering < 0.44 && apexCurvature >= 0.46)
+    ) {
       shape = 'stiletto';
-    } else if (tipTaper < 0.58) {
-      shape = 'almond';
-    } else if (tipTaper < 0.76) {
+    } else if (tipTapering >= 0.78 && apexCurvature < 0.36) {
+      shape = 'square';
+    } else if (tipTapering >= 0.46 && tipTapering < 0.78 && apexCurvature < 0.44) {
       shape = 'coffin';
     } else {
-      shape = 'square';
+      shape = 'almond';
     }
 
-    const relativeLength = Number(
-      Math.max(0.85, Math.min(1.65, 0.75 + (aspectRatio - 0.95) * 0.5)).toFixed(2)
-    );
+    const { extensionLevel, lengthMultiplier } = classifyExtensionFromAspectRatio(aspectRatio);
+    const relativeLength = lengthMultiplier;
     const relativeWidth = Number(
-      Math.max(0.9, Math.min(1.25, cfg.defaultWidth * (maxWidth / (roiW * 0.36)))).toFixed(2)
+      Math.max(0.78, Math.min(1.30, cfg.defaultWidth * (baseWidth / (roiW * 0.36)))).toFixed(2)
     );
 
     // 4. Extract 3 chromatic layers & classify artistic pattern strictly inside segmented nail plate
@@ -542,6 +616,9 @@ function analyzeSingleNailROI(
       detectedFromPhoto,
       shape,
       relativeLength,
+      lengthMultiplier,
+      extensionLevel,
+      aspectRatio,
       relativeWidth,
       baseColor,
       secondaryColor,
@@ -645,13 +722,25 @@ function applyHarmonicInheritance(
           : donor.pattern
         : donor.pattern;
 
+    const inheritedLengthMult = Number(
+      Math.max(
+        0.85,
+        Math.min(
+          1.85,
+          (donor.lengthMultiplier ?? donor.relativeLength) * (cfg.defaultLength / 1.0)
+        )
+      ).toFixed(2)
+    );
+
     result[id] = {
       ...donor,
       fingerId: id,
       detectedFromPhoto: false,
-      relativeLength: Number(
-        Math.max(0.85, Math.min(1.65, donor.relativeLength * (cfg.defaultLength / 1.0))).toFixed(2)
-      ),
+      relativeLength: inheritedLengthMult,
+      lengthMultiplier: inheritedLengthMult,
+      extensionLevel:
+        donor.extensionLevel ?? classifyExtensionFromMultiplier(inheritedLengthMult),
+      aspectRatio: donor.aspectRatio,
       relativeWidth: cfg.defaultWidth,
       pattern: inheritedPattern,
       strokeAnchors:
@@ -693,7 +782,9 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
     detectedFingerIds: ['index', 'middle', 'ring'],
     method: 'smart-macro',
     primaryShape: primary.shape,
-    primaryLength: primary.relativeLength,
+    primaryLength: primary.lengthMultiplier ?? primary.relativeLength,
+    primaryExtensionLevel: primary.extensionLevel,
+    primaryAspectRatio: primary.aspectRatio,
     primaryBaseColor: primary.baseColor,
     primarySecondaryColor: primary.secondaryColor,
     primaryAccentColor: primary.accentColor,
@@ -760,7 +851,9 @@ export async function analyzeReferencePerFinger(file: File): Promise<PerFingerAn
           detectedFingerIds,
           method: 'mediapipe',
           primaryShape: primary.shape,
-          primaryLength: primary.relativeLength,
+          primaryLength: primary.lengthMultiplier ?? primary.relativeLength,
+          primaryExtensionLevel: primary.extensionLevel,
+          primaryAspectRatio: primary.aspectRatio,
           primaryBaseColor: primary.baseColor,
           primarySecondaryColor: primary.secondaryColor,
           primaryAccentColor: primary.accentColor,
@@ -799,7 +892,7 @@ export function buildFingerSpecsFromStudioDesign(
     pattern = 'aura_gradient';
 
   const shape: NailShape = design.detectedShape ?? 'almond';
-  const baseLen = design.detectedLength ?? 1.05;
+  const baseLen = Math.max(0.85, Math.min(1.85, design.detectedLength ?? 1.05));
   const metallicIntensity =
     design.finish === 'chrome' || pattern === 'chrome_mirror'
       ? 0.9
@@ -811,11 +904,16 @@ export function buildFingerSpecsFromStudioDesign(
   const map = {} as Record<FingerId, NailFingerDesignSpec>;
   for (const id of ORDERED_FINGERS) {
     const cfg = FINGER_LANDMARKS[id];
+    const fingerLenMult = Number(
+      Math.max(0.85, Math.min(1.85, baseLen * cfg.defaultLength)).toFixed(2)
+    );
     map[id] = {
       fingerId: id,
       detectedFromPhoto: false,
       shape,
-      relativeLength: Number(Math.max(0.85, Math.min(1.65, baseLen * cfg.defaultLength)).toFixed(2)),
+      relativeLength: fingerLenMult,
+      lengthMultiplier: fingerLenMult,
+      extensionLevel: classifyExtensionFromMultiplier(fingerLenMult),
       relativeWidth: cfg.defaultWidth,
       baseColor,
       secondaryColor,

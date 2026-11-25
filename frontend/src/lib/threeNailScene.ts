@@ -3,6 +3,7 @@ import { createVolumetricNailGeometry } from './nail3DGeometry';
 import {
   ORDERED_FINGERS,
   buildFingerSpecsFromStudioDesign,
+  type NailFingerDesignSpec,
 } from './perFingerVisionAnalyzer';
 import {
   type ProceduralPBRBundle,
@@ -14,7 +15,6 @@ import type {
   FingerPose,
   NailAdjustment,
   NailDesign,
-  NailFingerDesignSpec,
   NailShape,
 } from '../types/nail';
 
@@ -33,6 +33,14 @@ const SHAPE_LENGTH_MULT: Record<NailShape, number> = {
   almond: 1.1,
   coffin: 1.18,
   stiletto: 1.26,
+};
+
+const ANATOMICAL_FINGER_SCALE: Record<FingerId, number> = {
+  thumb: 1.25,
+  index: 1.0,
+  middle: 1.0,
+  ring: 1.0,
+  pinky: 0.78,
 };
 
 /**
@@ -124,8 +132,75 @@ function createAOShadowTexture(): THREE.CanvasTexture {
 }
 
 /**
- * Adaptive One-Euro Filter (Casiez et al.) to eliminate micro-jitter at rest
- * while preserving near-zero latency during fast hand movement.
+ * Generates a dedicated 256×256 procedural underside occlusion + milky translucent gel texture ONCE
+ * at initialization (never inside RAF):
+ * - Warm deep skin-contact AO shadow near hyponychium base (v -> 0, canvas bottom) and inner lateral margins
+ * - Smooth gradient lightening to natural milky rosy-pearl translucent gel with subtle longitudinal striations (v -> 1, canvas top)
+ */
+function createUndersideOcclusionTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  if (ctx) {
+    // Base longitudinal gradient: v=1 (top of canvas, free tip) -> v=0 (bottom of canvas, hyponychium/skin base)
+    const baseGrad = ctx.createLinearGradient(0, 0, 0, size);
+    baseGrad.addColorStop(0.0, '#FBF3EE'); // Milky pearl translucent free edge (v = 1)
+    baseGrad.addColorStop(0.38, '#F2DFD5'); // Soft rosy cream gel body
+    baseGrad.addColorStop(0.72, '#C89888'); // Warm translucent transition near hyponychium
+    baseGrad.addColorStop(0.9, '#8E5A4D'); // Deep warm skin-pocket AO shadow
+    baseGrad.addColorStop(1.0, '#5E362E'); // Hyponychium crease occlusion (v = 0)
+    ctx.fillStyle = baseGrad;
+    ctx.fillRect(0, 0, size, size);
+
+    // Subtle longitudinal micro-striations along v for authentic sculpted gel/nail underside fiber depth
+    for (let x = 0; x < size; x += 2) {
+      const wave = Math.sin(x * 0.45) * 0.5 + Math.cos(x * 1.15) * 0.5;
+      const alpha = 0.028 + Math.abs(wave) * 0.022;
+      ctx.fillStyle = wave >= 0 ? `rgba(255, 250, 246, ${alpha})` : `rgba(110, 68, 58, ${alpha})`;
+      ctx.fillRect(x, 0, 1, size);
+    }
+
+    // Soft lateral inner-margin occlusion darkening along u=0 and u=1 (C-curve sidewall shadow)
+    const sideGrad = ctx.createLinearGradient(0, 0, size, 0);
+    sideGrad.addColorStop(0.0, 'rgba(68, 36, 30, 0.52)');
+    sideGrad.addColorStop(0.14, 'rgba(84, 46, 38, 0.16)');
+    sideGrad.addColorStop(0.35, 'rgba(84, 46, 38, 0.0)');
+    sideGrad.addColorStop(0.65, 'rgba(84, 46, 38, 0.0)');
+    sideGrad.addColorStop(0.86, 'rgba(84, 46, 38, 0.16)');
+    sideGrad.addColorStop(1.0, 'rgba(68, 36, 30, 0.52)');
+    ctx.fillStyle = sideGrad;
+    ctx.fillRect(0, 0, size, size);
+
+    // Warm radial hyponychium pocket AO at bottom-center (v -> 0)
+    const hyponychiumAO = ctx.createRadialGradient(
+      size * 0.5,
+      size * 1.02,
+      size * 0.05,
+      size * 0.5,
+      size * 0.92,
+      size * 0.58
+    );
+    hyponychiumAO.addColorStop(0.0, 'rgba(52, 24, 20, 0.58)');
+    hyponychiumAO.addColorStop(0.55, 'rgba(78, 38, 32, 0.24)');
+    hyponychiumAO.addColorStop(1.0, 'rgba(78, 38, 32, 0.0)');
+    ctx.fillStyle = hyponychiumAO;
+    ctx.fillRect(0, 0, size, size);
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * Adaptive One-Euro Filter (Casiez et al.) with optional sub-pixel deadband
+ * to eliminate micro-jitter at rest while preserving near-zero latency during fast hand movement.
  */
 class OneEuroFilter {
   private minCutoff: number;
@@ -135,7 +210,7 @@ class OneEuroFilter {
   private xPrev = 0;
   private dxPrev = 0;
 
-  constructor(minCutoff = 1.6, beta = 0.035, dCutoff = 1.0) {
+  constructor(minCutoff = 1.2, beta = 0.05, dCutoff = 1.0) {
     this.minCutoff = minCutoff;
     this.beta = beta;
     this.dCutoff = dCutoff;
@@ -152,7 +227,7 @@ class OneEuroFilter {
     this.dxPrev = 0;
   }
 
-  public filter(x: number, dt: number): number {
+  public filter(x: number, dt: number, deadband = 0): number {
     if (!this.initialized || dt <= 0) {
       this.initialized = true;
       this.xPrev = x;
@@ -161,13 +236,21 @@ class OneEuroFilter {
     }
 
     const safeDt = Math.max(1e-4, dt);
-    const dx = (x - this.xPrev) / safeDt;
+    const delta = x - this.xPrev;
+    // Soft sub-pixel deadband suppresses stationary MediaPipe micro-oscillations without step artifacts
+    const effectiveDelta =
+      deadband > 0 && Math.abs(delta) < deadband
+        ? delta * (Math.abs(delta) / deadband) * 0.2
+        : delta;
+    const targetX = this.xPrev + effectiveDelta;
+
+    const dx = effectiveDelta / safeDt;
     const aD = OneEuroFilter.alpha(safeDt, this.dCutoff);
     const dxHat = aD * dx + (1.0 - aD) * this.dxPrev;
 
     const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
     const a = OneEuroFilter.alpha(safeDt, cutoff);
-    const xHat = a * x + (1.0 - a) * this.xPrev;
+    const xHat = a * targetX + (1.0 - a) * this.xPrev;
 
     this.xPrev = xHat;
     this.dxPrev = dxHat;
@@ -204,6 +287,7 @@ interface FingerRig {
   currentPos: THREE.Vector3;
   currentQuat: THREE.Quaternion;
   currentScale: THREE.Vector3;
+  filteredDorsalNormal: THREE.Vector3;
 }
 
 /**
@@ -228,6 +312,7 @@ export class ThreeNailScene {
   private rimLight: THREE.DirectionalLight;
 
   private geometries = new Map<NailShape, THREE.BufferGeometry>();
+  private undersideTexture: THREE.CanvasTexture;
   private undersideMaterial: THREE.MeshPhysicalMaterial;
   private aoShadowGeometry: THREE.PlaneGeometry;
   private aoShadowTexture: THREE.CanvasTexture;
@@ -285,14 +370,17 @@ export class ThreeNailScene {
     this.hemiLight = new THREE.HemisphereLight(0xfff5ee, 0x5c3e36, 1.15);
     this.scene.add(this.hemiLight);
 
-    // Group 1 Material: Concave hollowed translucent milky-gel underside
+    // Group 1 Material: Concave hollowed translucent milky-gel underside with internal AO occlusion map
+    this.undersideTexture = createUndersideOcclusionTexture();
     this.undersideMaterial = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color('#F0E2D8'),
-      roughness: 0.26,
+      color: new THREE.Color('#FFFFFF'),
+      map: this.undersideTexture,
+      roughness: 0.28,
       metalness: 0.0,
-      clearcoat: 0.4,
-      clearcoatRoughness: 0.22,
+      clearcoat: 0.45,
+      clearcoatRoughness: 0.24,
       ior: 1.48,
+      reflectivity: 0.45,
       transparent: true,
       opacity: 0.92,
       depthWrite: true,
@@ -396,18 +484,19 @@ export class ThreeNailScene {
           currentSpecHash: '',
           initialized: false,
           posFilters: [
-            new OneEuroFilter(1.6, 0.035, 1.0),
-            new OneEuroFilter(1.6, 0.035, 1.0),
-            new OneEuroFilter(1.6, 0.035, 1.0),
+            new OneEuroFilter(1.18, 0.05, 1.0), // X: firm anti-sway + responsive real motion
+            new OneEuroFilter(1.18, 0.05, 1.0), // Y: firm anti-sway + responsive real motion
+            new OneEuroFilter(0.75, 0.025, 1.0), // Z: strong depth jitter suppression
           ],
           scaleFilters: [
-            new OneEuroFilter(1.6, 0.035, 1.0),
-            new OneEuroFilter(1.6, 0.035, 1.0),
-            new OneEuroFilter(1.6, 0.035, 1.0),
+            new OneEuroFilter(1.05, 0.035, 1.0),
+            new OneEuroFilter(1.05, 0.035, 1.0),
+            new OneEuroFilter(0.85, 0.025, 1.0),
           ],
           currentPos: new THREE.Vector3(),
           currentQuat: new THREE.Quaternion(),
           currentScale: new THREE.Vector3(1, 1, 1),
+          filteredDorsalNormal: new THREE.Vector3(0, 0, 1),
         });
       }
 
@@ -468,6 +557,7 @@ export class ThreeNailScene {
       rig.scaleFilters[0].reset();
       rig.scaleFilters[1].reset();
       rig.scaleFilters[2].reset();
+      rig.filteredDorsalNormal.set(0, 0, 1);
     }
   }
 
@@ -641,6 +731,24 @@ export class ThreeNailScene {
     const geo = this.getOrCreateGeometry(adjustment.shape);
     const seenIds = new Set<FingerId>();
 
+    // Estimate reference hand distal phalanx scale from all visible fingers in the current frame
+    // so small, medium, and large hands in camera receive proportionally accurate nail width & length.
+    let handScaleAcc = 0;
+    let handScaleWeight = 0;
+    for (const p of poses) {
+      this.landmarkToScene(p.tip, rect, cssW, cssH, mirrorX, this.tmpTip);
+      this.landmarkToScene(p.dip, rect, cssW, cssH, mirrorX, this.tmpDip);
+      const d3 = this.tmpTip.distanceTo(this.tmpDip);
+      const factor = ANATOMICAL_FINGER_SCALE[p.id] ?? 1.0;
+      if (d3 >= 5) {
+        const w = p.id === 'middle' || p.id === 'index' ? 1.4 : 1.0;
+        handScaleAcc += (d3 / factor) * w;
+        handScaleWeight += w;
+      }
+    }
+    const refHandDistalLen =
+      handScaleWeight > 0 ? handScaleAcc / handScaleWeight : rect.drawW * 0.065;
+
     for (const pose of poses) {
       const rig = this.fingerRigs.get(pose.id);
       // Strictly 1 unique rig per FingerId; ignore duplicate finger poses in the same frame
@@ -721,6 +829,20 @@ export class ThreeNailScene {
         this.tmpPalmNormal.set(0, 0, 1);
       }
 
+      // Stabilize dorsalNormal via angular deadband (< 0.035 rad) + velocity-adaptive lerp
+      if (!rig.initialized) {
+        rig.filteredDorsalNormal.copy(this.tmpPalmNormal);
+      } else {
+        const dotN = Math.max(-1, Math.min(1, rig.filteredDorsalNormal.dot(this.tmpPalmNormal)));
+        const angleN = Math.acos(dotN);
+        const normalAlpha =
+          angleN < 0.035
+            ? 0.08
+            : Math.min(0.78, 0.22 + ((angleN - 0.035) / 0.28) * 0.56);
+        rig.filteredDorsalNormal.lerp(this.tmpPalmNormal, normalAlpha).normalize();
+      }
+      this.tmpPalmNormal.copy(rig.filteredDorsalNormal);
+
       // Gram-Schmidt right-handed orthonormal basis (det = +1):
       // Z = dorsalNormal orthogonalized against Y, X = normalize(Y × Z), Z = normalize(X × Y)
       this.tmpAxisZ
@@ -756,26 +878,49 @@ export class ThreeNailScene {
       // Cuticle anchor strictly at lerp(DIP, TIP, 0.42) to cover full nail bed seamlessly
       this.tmpCuticle.copy(this.tmpDip).lerp(this.tmpTip, 0.42);
 
-      // Clamp foreshortened scale cleanly when finger turns sideways in profile
-      const rawNailW = pose.widthScale * rect.drawW * 1.12 * adjustment.scale;
-      const minSensibleW = Math.max(8, rect.drawW * 0.025);
-      const maxSensibleW = rect.drawW * 0.14;
+      // Dynamic per-finger anatomical scaling proportional to dist3D(DIP, TIP) & scene hand reference:
+      // thumb = 1.25, index = 1.0, middle = 1.0, ring = 1.0, pinky = 0.78
+      const fingerAnatomicalFactor = ANATOMICAL_FINGER_SCALE[pose.id] ?? 1.0;
+      const fingerSpec = this.cachedFingerSpecs?.[pose.id];
+      const specLengthMult = Math.max(
+        0.85,
+        Math.min(1.85, fingerSpec?.lengthMultiplier ?? fingerSpec?.relativeLength ?? 1.0)
+      );
+
+      // Blend individual distal phalanx length with hand-wide reference distal scale
+      const normalizedDistal = segLen3D / fingerAnatomicalFactor;
+      const effectiveBaseDistal = refHandDistalLen * 0.62 + normalizedDistal * 0.38;
+      const poseWidthPx = pose.widthScale * rect.drawW;
+      const anatomicalNailW = effectiveBaseDistal * 0.56 * fingerAnatomicalFactor;
+      const rawNailW =
+        (anatomicalNailW * 0.72 + poseWidthPx * 0.28) * adjustment.scale;
+      const minSensibleW = Math.max(4.5, rect.drawW * 0.014);
+      const maxSensibleW = rect.drawW * 0.19;
       const nailW = Math.max(minSensibleW, Math.min(maxSensibleW, rawNailW));
 
-      const baseH = Math.max(pose.lengthScale * rect.drawH, segLen3D * 0.92);
-      const clampedBaseH = Math.max(nailW * 1.05, Math.min(nailW * 2.9, baseH));
-      const nailH = clampedBaseH * adjustment.scale * adjustment.extensionLength * shapeMult;
+      // Adapt length proportionally to real distal phalanx + per-finger 3D lengthMultiplier [0.85..1.85]
+      const anatomicalBaseH = Math.max(
+        segLen3D * 0.88,
+        effectiveBaseDistal * 1.02 * fingerAnatomicalFactor
+      );
+      const clampedBaseH = Math.max(nailW * 1.08, Math.min(nailW * 2.55, anatomicalBaseH));
+      const nailH =
+        clampedBaseH *
+        specLengthMult *
+        adjustment.scale *
+        adjustment.extensionLength *
+        shapeMult;
       const nailDepth = nailW;
 
-      // Seat nail plate cleanly on dorsal surface just above the DIP->TIP occluder cylinder (radius = 1.05 * halfWidth)
+      // Seat nail plate cleanly on dorsal surface above the DIP->TIP occluder cylinder (radius = 1.12 * halfWidth)
       const fingerHalfW = nailW * 0.5;
-      const distalOccluderRadius = fingerHalfW * 1.05;
-      const dorsalOffset = distalOccluderRadius + nailW * 0.05;
+      const distalOccluderRadius = fingerHalfW * 1.12;
+      const dorsalOffset = distalOccluderRadius + nailW * 0.03;
 
       this.tmpTargetPos.copy(this.tmpCuticle).addScaledVector(this.tmpAxisZ, dorsalOffset);
       this.tmpTargetScale.set(nailW, nailH, nailDepth);
 
-      // One-Euro Adaptive Filter for 3D position & scale + velocity-responsive Quaternion slerp
+      // One-Euro Adaptive Filter (axis-differentiated + sub-pixel deadband) & Angular Deadband + Adaptive Slerp
       const wasInitialized = rig.initialized;
       let slerpAlpha = 0.22;
 
@@ -793,9 +938,11 @@ export class ThreeNailScene {
         rig.currentQuat.copy(this.tmpTargetQuat);
         rig.initialized = true;
       } else {
-        const fx = rig.posFilters[0].filter(this.tmpTargetPos.x, dt);
-        const fy = rig.posFilters[1].filter(this.tmpTargetPos.y, dt);
-        const fz = rig.posFilters[2].filter(this.tmpTargetPos.z, dt);
+        const xyDeadband = Math.max(0.32, nailW * 0.012);
+        const zDeadband = Math.max(0.55, nailW * 0.02);
+        const fx = rig.posFilters[0].filter(this.tmpTargetPos.x, dt, xyDeadband);
+        const fy = rig.posFilters[1].filter(this.tmpTargetPos.y, dt, xyDeadband);
+        const fz = rig.posFilters[2].filter(this.tmpTargetPos.z, dt, zDeadband);
         const moveDist = Math.hypot(
           fx - rig.currentPos.x,
           fy - rig.currentPos.y,
@@ -803,17 +950,24 @@ export class ThreeNailScene {
         );
         rig.currentPos.set(fx, fy, fz);
 
+        const scaleDeadband = Math.max(0.15, nailW * 0.006);
         rig.currentScale.set(
-          rig.scaleFilters[0].filter(this.tmpTargetScale.x, dt),
-          rig.scaleFilters[1].filter(this.tmpTargetScale.y, dt),
-          rig.scaleFilters[2].filter(this.tmpTargetScale.z, dt)
+          rig.scaleFilters[0].filter(this.tmpTargetScale.x, dt, scaleDeadband),
+          rig.scaleFilters[1].filter(this.tmpTargetScale.y, dt, scaleDeadband),
+          rig.scaleFilters[2].filter(this.tmpTargetScale.z, dt, scaleDeadband)
         );
 
+        const angleDelta = rig.currentQuat.angleTo(this.tmpTargetQuat);
         const posSpeed = moveDist / Math.max(1, nailW) / dt;
-        const rotSpeed = rig.currentQuat.angleTo(this.tmpTargetQuat) / dt;
-        const velocityNorm = Math.min(1, posSpeed * 0.14 + rotSpeed * 0.22);
-        // Smoothly scale slerp alpha from 0.22 (still) to 0.68 (fast hand motion)
-        slerpAlpha = 0.22 + velocityNorm * (0.68 - 0.22);
+        const rotSpeed = angleDelta / dt;
+        if (angleDelta < 0.035 && posSpeed < 0.65) {
+          // Strong rotational damping when hand is still (< 0.035 rad) to eliminate jitter
+          slerpAlpha = 0.09 + (angleDelta / 0.035) * 0.07;
+        } else {
+          // Low-latency adaptive slerp when hand turns deliberately
+          const velocityNorm = Math.min(1, posSpeed * 0.16 + rotSpeed * 0.28);
+          slerpAlpha = 0.24 + velocityNorm * (0.78 - 0.24);
+        }
         rig.currentQuat.slerp(this.tmpTargetQuat, slerpAlpha);
       }
 
@@ -903,6 +1057,7 @@ export class ThreeNailScene {
     this.cachedPBRBundles.clear();
     this.aoShadowGeometry.dispose();
     this.aoShadowTexture.dispose();
+    this.undersideTexture.dispose();
     this.undersideMaterial.dispose();
     this.occluderGeometry.dispose();
     this.occluderMaterial.dispose();
