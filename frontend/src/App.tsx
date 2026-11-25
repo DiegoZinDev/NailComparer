@@ -368,6 +368,8 @@ export function App(): React.ReactElement {
           designs={designs}
           activeTab={activeTab}
           onTabChange={setActiveTab}
+          activeShape={adjustment.shape}
+          onShapeChange={(shape) => setAdjustment((prev) => ({ ...prev, shape }))}
           activeDesignId={activeDesign.id}
           onSelectDesign={(d) => {
             setCompareClean(false);

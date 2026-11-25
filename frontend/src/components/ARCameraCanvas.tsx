@@ -6,6 +6,11 @@ import {
   computeCoverRect,
   renderNailsOnRect,
 } from '../lib/nailRenderer';
+import {
+  type AmbientLightSample,
+  WebGLNailEngine,
+  sampleFingerSkinAmbient,
+} from '../lib/webglNailEngine';
 import type { ARViewMode, FingerPose, NailAdjustment, NailDesign } from '../types/nail';
 
 export interface ARCameraCanvasHandle {
@@ -23,7 +28,8 @@ interface ARCameraCanvasProps {
   onCameraNotice?: (message: string | null) => void;
 }
 
-const SMOOTHING_ALPHA = 0.42;
+const SMOOTHING_ALPHA = 0.44;
+const DEFAULT_AMBIENT: AmbientLightSample = { r: 0.78, g: 0.63, b: 0.54, luma: 0.66 };
 
 export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCanvasProps>(
   function ARCameraCanvas(
@@ -40,10 +46,13 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     ref
   ) {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const glEngineRef = useRef<WebGLNailEngine | null>(null);
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const demoImgRef = useRef<HTMLImageElement | null>(null);
     const landmarkerRef = useRef<HandLandmarker | null>(null);
     const smoothedPosesRef = useRef<FingerPose[] | null>(null);
+    const ambientRef = useRef<AmbientLightSample>(DEFAULT_AMBIENT);
     const lastVideoTimeRef = useRef<number>(-1);
     const lastTrackingRef = useRef<boolean>(false);
 
@@ -63,6 +72,20 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       'idle'
     );
     const [modelReady, setModelReady] = useState(false);
+
+    // Initialize WebGL 3D Cylindrical Arco-C Engine once on mount
+    useEffect(() => {
+      const glCanvas = glCanvasRef.current;
+      if (!glCanvas) return;
+      const engine = new WebGLNailEngine(glCanvas);
+      if (engine.isReady()) {
+        glEngineRef.current = engine;
+      }
+      return () => {
+        engine.dispose();
+        glEngineRef.current = null;
+      };
+    }, []);
 
     // Preload studio model hand image
     useEffect(() => {
@@ -103,20 +126,19 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           landmarkerRef.current = handLandmarker;
           setModelReady(true);
         } catch {
-          // If WASM or CDN unavailable offline, fall back gracefully to studio demo
           if (!cancelled) {
             setModelReady(false);
           }
         }
       }
 
-      initLandmarker();
+      void initLandmarker();
       return () => {
         cancelled = true;
       };
     }, [mode]);
 
-    // Manage WebRTC camera stream
+    // Manage WebRTC camera stream with HTTPS secure-context validation & Android fallback
     useEffect(() => {
       if (mode !== 'camera') {
         setCameraState('idle');
@@ -222,7 +244,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         }
       }
 
-      startCamera();
+      void startCamera();
 
       return () => {
         active = false;
@@ -232,7 +254,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, facingMode, onModeChange, onCameraNotice]);
 
-    // Main 60fps render + tracking loop
+    // Main 60fps render + MediaPipe tracking + Ambient Light Matching + WebGL 3D C-Curve pass
     useEffect(() => {
       let rafId = 0;
 
@@ -264,6 +286,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, cssW, cssH);
 
+        const glEngine = glEngineRef.current;
         const currentMode = modeRef.current;
         const video = videoRef.current;
         const demoImg = demoImgRef.current;
@@ -293,7 +316,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           }
           ctx.restore();
 
-          // Run MediaPipe detection when a new video frame arrives
+          // Run MediaPipe HandLandmarker on each new video frame
           const landmarker = landmarkerRef.current;
           if (landmarker && video.currentTime !== lastVideoTimeRef.current) {
             lastVideoTimeRef.current = video.currentTime;
@@ -321,6 +344,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                     id: cfg.id,
                     tip: { x: tip.x, y: tip.y },
                     dip: { x: dip.x, y: dip.y },
+                    pip: { x: pip.x, y: pip.y },
                     widthScale: widthNorm,
                     lengthScale: lenNorm,
                   };
@@ -341,6 +365,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                         x: prev.dip.x + (next.dip.x - prev.dip.x) * SMOOTHING_ALPHA,
                         y: prev.dip.y + (next.dip.y - prev.dip.y) * SMOOTHING_ALPHA,
                       },
+                      pip: next.pip,
                       widthScale:
                         prev.widthScale + (next.widthScale - prev.widthScale) * SMOOTHING_ALPHA,
                       lengthScale:
@@ -348,6 +373,13 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                     };
                   });
                 }
+
+                // Sample live ambient skin light between PIP and DIP
+                ambientRef.current = sampleFingerSkinAmbient(
+                  video,
+                  smoothedPosesRef.current,
+                  ambientRef.current
+                );
 
                 if (!lastTrackingRef.current) {
                   lastTrackingRef.current = true;
@@ -361,39 +393,76 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                 }
               }
             } catch {
-              // Skip transient frame inference errors
+              // Ignore transient frame inference errors
             }
           }
 
           if (!compareCleanRef.current && smoothedPosesRef.current) {
-            renderNailsOnRect(
-              ctx,
-              rect,
-              smoothedPosesRef.current,
-              designRef.current,
-              adjustmentRef.current,
-              mirrorX
-            );
+            if (glEngine) {
+              glEngine.renderNails(
+                cssW,
+                cssH,
+                dpr,
+                rect,
+                smoothedPosesRef.current,
+                designRef.current,
+                adjustmentRef.current,
+                ambientRef.current,
+                mirrorX
+              );
+            } else {
+              renderNailsOnRect(
+                ctx,
+                rect,
+                smoothedPosesRef.current,
+                designRef.current,
+                adjustmentRef.current,
+                mirrorX
+              );
+            }
+          } else {
+            glEngine?.clear(cssW, cssH, dpr);
           }
         } else if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
-          // Studio Model Hand (Offline Demo Mode)
           const rect = computeCoverRect(cssW, cssH, demoImg.naturalWidth, demoImg.naturalHeight);
-
-          // Soft ambient backdrop in studio tones around edges if needed
           ctx.fillStyle = '#120E10';
           ctx.fillRect(0, 0, cssW, cssH);
           ctx.drawImage(demoImg, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
 
+          ambientRef.current = sampleFingerSkinAmbient(
+            demoImg,
+            DEMO_HAND_POSES,
+            ambientRef.current
+          );
+
           if (!compareCleanRef.current) {
-            renderNailsOnRect(
-              ctx,
-              rect,
-              DEMO_HAND_POSES,
-              designRef.current,
-              adjustmentRef.current,
-              false
-            );
+            if (glEngine) {
+              glEngine.renderNails(
+                cssW,
+                cssH,
+                dpr,
+                rect,
+                DEMO_HAND_POSES,
+                designRef.current,
+                adjustmentRef.current,
+                ambientRef.current,
+                false
+              );
+            } else {
+              renderNailsOnRect(
+                ctx,
+                rect,
+                DEMO_HAND_POSES,
+                designRef.current,
+                adjustmentRef.current,
+                false
+              );
+            }
+          } else {
+            glEngine?.clear(cssW, cssH, dpr);
           }
+        } else {
+          glEngine?.clear(cssW, cssH, dpr);
         }
 
         // Subtle editorial vignette for floating glass HUD legibility
@@ -403,11 +472,11 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.fillStyle = topVig;
         ctx.fillRect(0, 0, cssW, 140);
 
-        const botVig = ctx.createLinearGradient(0, cssH - 210, 0, cssH);
+        const botVig = ctx.createLinearGradient(0, cssH - 220, 0, cssH);
         botVig.addColorStop(0, 'rgba(10, 8, 9, 0)');
-        botVig.addColorStop(1, 'rgba(10, 8, 9, 0.55)');
+        botVig.addColorStop(1, 'rgba(10, 8, 9, 0.58)');
         ctx.fillStyle = botVig;
-        ctx.fillRect(0, cssH - 210, cssW, 210);
+        ctx.fillRect(0, cssH - 220, cssW, 220);
 
         ctx.restore();
         rafId = requestAnimationFrame(renderFrame);
@@ -428,9 +497,16 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         const ctx = out.getContext('2d');
         if (!ctx) return null;
 
+        // Layer 1: Camera / Model Hand background
         ctx.drawImage(srcCanvas, 0, 0);
 
-        // Editorial studio watermark in bottom-right corner
+        // Layer 2: WebGL 3D Cylindrical Nails overlay
+        const glCanvas = glCanvasRef.current;
+        if (glCanvas && glCanvas.width > 0 && glCanvas.height > 0) {
+          ctx.drawImage(glCanvas, 0, 0, out.width, out.height);
+        }
+
+        // Layer 3: Editorial studio watermark
         const pad = Math.round(out.width * 0.045);
         const fontSize = Math.max(20, Math.round(out.width * 0.032));
         ctx.save();
@@ -446,7 +522,13 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             const size = fontSize * 1.45;
             ctx.save();
             ctx.beginPath();
-            ctx.arc(out.width - pad - size / 2, out.height - pad - size / 2 - fontSize * 0.9, size / 2, 0, Math.PI * 2);
+            ctx.arc(
+              out.width - pad - size / 2,
+              out.height - pad - size / 2 - fontSize * 0.9,
+              size / 2,
+              0,
+              Math.PI * 2
+            );
             ctx.clip();
             ctx.drawImage(
               logo,
@@ -466,7 +548,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.fillStyle = 'rgba(255, 248, 244, 0.68)';
         ctx.font = `500 ${Math.round(fontSize * 0.48)}px "Plus Jakarta Sans", sans-serif`;
         ctx.fillText(
-          `${designRef.current.name} • Provador AR`,
+          `${designRef.current.name} • Provador AR 3D`,
           out.width - pad,
           out.height - pad
         );
@@ -487,10 +569,11 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           aria-hidden="true"
         />
         <canvas ref={canvasRef} className="ar-canvas" />
+        <canvas ref={glCanvasRef} className="ar-webgl-overlay" aria-hidden="true" />
 
         {mode === 'camera' && cameraState === 'starting' && (
           <div className="ar-camera-status glass-pill">
-            Iniciando câmera {modelReady ? 'e rastreamento...' : 'HD...'}
+            Iniciando câmera {modelReady ? 'e motor 3D WebGL...' : 'HD...'}
           </div>
         )}
       </div>

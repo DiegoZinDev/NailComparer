@@ -108,13 +108,13 @@ export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
             <div className="slider-two-col">
               <label className="slider-row">
                 <div className="slider-meta">
-                  <span>Largura</span>
+                  <span>Largura de Encaixe</span>
                   <span className="slider-val">{adjustment.scale.toFixed(2)}x</span>
                 </div>
                 <input
                   type="range"
-                  min={0.75}
-                  max={1.35}
+                  min={0.85}
+                  max={1.4}
                   step={0.02}
                   value={adjustment.scale}
                   onChange={(e) =>
@@ -131,7 +131,7 @@ export const NailAdjustControls: React.FC<NailAdjustControlsProps> = ({
                 </div>
                 <input
                   type="range"
-                  min={0.65}
+                  min={0.7}
                   max={1}
                   step={0.01}
                   value={adjustment.opacity}

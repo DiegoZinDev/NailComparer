@@ -14,17 +14,14 @@ O **Nail AR Studio** elimina a indecisão da cliente na cadeira de atendimento e
 
 ---
 
-## 2. Motor AR Realista 60fps (Efeito Gel/Alongamento Real + MediaPipe Hands)
+## 2. Motor AR 3D WebGL / GLSL 60fps (Arco C + Bump Map + Luz Ambiente)
 
-Os módulos `frontend/src/components/ARCameraCanvas.tsx` e `frontend/src/lib/nailRenderer.ts` combinam o rastreamento anatômico de mãos via `@mediapipe/tasks-vision` (`HandLandmarker`) a uma composição em camadas realistas no HTML5 Canvas (`requestAnimationFrame` a 60fps):
+Os módulos `frontend/src/lib/webglNailEngine.ts` e `frontend/src/components/ARCameraCanvas.tsx` combinam MediaPipe Hands (`HandLandmarker` em modo `VIDEO`, 21 landmarks) a um **Shader WebGL / GLSL 3D em tempo real a 60fps**:
 
-- **Alinhamento Anatômico Individual (21 Landmarks)**: Calcula o vetor exato `DIP -> TIP` e largura proporcional para cada dedo individualmente (incluindo o polegar), ancorando a base da unha exatamente na linha da cutícula (logo abaixo do ponto médio entre `DIP` e `TIP`) para que o alongamento cresça naturalmente para fora.
-- **Composição Realista em Camadas (Buffer Offscreen)**:
-  - **Skin-Melt Cuticle Feather (`destination-in`)**: Suavização gradiente na base da cutícula que funde a unha à pele sem degrau artificial.
-  - **Volume 3D Cilíndrico & Oclusão**: Sombreamento interno lateral, profundidade proximal na prega ungueal e sombra quente de contato sob a borda livre.
-  - **Brilho Especular Dinâmico (Topcoat Gel)**: Reflexo de estúdio que acompanha em tempo real a inclinação de cada dedo (`Math.sin(angle)`).
-- **Alongamento & 5 Formatos de Salão (`NailAdjustControls`)**: Seletor elegante para **Natural**, **Amendoada**, **Quadrada**, **Bailarina** e **Stiletto**, acompanhado por slider fino de **Comprimento do Alongamento** (*Curto → Longo*, `0.75x–1.75x`), largura e intensidade, além do botão **Antes / Depois**.
-- **Suavização Temporal (EMA)** (`SMOOTHING_ALPHA = 0.42`), **Modo Mão Modelo (`/hand-demo.png`)** e alternância entre câmera traseira (`environment`) e frontal (`user`).
+- **Geometria Curva Anatômica 3D (Arco C)**: Malha subdividida (`20×26`) projetada sobre superfície cilíndrica curva alinhada ao eixo `DIP -> TIP` de cada dedo individualmente, com cobertura de largura ampliada (`1.12x`) para evitar vazamento da unha natural e mapeamento UV conformal sem distorção ao trocar o formato.
+- **Relevo 3D & Reflexo Metálico/Gel (Procedural Bump/Normal Map)**: O fragment shader calcula em tempo real o gradiente de luminância da textura (`gx`, `gy`) para gerar relevo tátil e reflexos especulares metálicos/glossy (ex.: fios dourados 3D, cromado, pérola e topcoat em gel) que deslizam dinamicamente sobre a curvatura da unha conforme a inclinação do dedo.
+- **Adaptação à Luz do Ambiente (Ambient Light Matching)**: Amostra em tempo real a cor e luminância média da pele entre `PIP` e `DIP` (`sampleFingerSkinAmbient`) para modular exposição, temperatura de cor, oclusão lateral (*Ambient Occlusion*) e fusão suave na cutícula (*subsurface feathering*).
+- **Seletor Rápido de Formato & Alongamento**: Barra discreta acima do dock para alternar em 1 toque entre **Natural**, **Amendoada**, **Bailarina**, **Quadrada** e **Stiletto**, combinada aos sliders de **Comprimento do Alongamento** e **Largura de Encaixe** (`NailAdjustControls`).
 
 ---
 
@@ -101,13 +98,13 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
 
 ---
 
-## 6. Extrator Inteligente de Textura, UI Limpa em 2 Abas & Captura WhatsApp
+## 6. Extrator de Unha de Alta Precisão ("Nail Loupe Extractor") & UI Limpa
 
-- **Extrator Inteligente de Unha (`frontend/src/lib/nailExtractor.ts` + `ImportReferenceModal.tsx`)**:
-  - Ao importar uma foto de referência (Pinterest/Instagram ou câmera na hora), o app executa automaticamente o `HandLandmarker` do MediaPipe em modo **`IMAGE`** sobre a foto enviada, localiza o dedo central mais nítido (`DIP -> TIP`), calcula o ângulo exato, endireita e realiza um **recorte cirúrgico apenas da placa interna da unha** — eliminando fundo e dedos vizinhos.
-  - Em fotos de *close-up* extremo sem mão inteira visível, aplica detecção inteligente de saliência na área de maior detalhe e libera **ajuste interativo por arraste/pinça (zoom e alinhamento)** dentro do molde da unha antes de salvar.
-- **Dock Inferior Limpo (2 Abas + CTA Principal)**: Sem filtros de categoria estilo jogo — apenas duas abas limpas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**) acima do dock com destaque máximo para o botão **`+ Importar Referência`** ao lado das miniaturas.
-- **Captura com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Gera PNG composto da mão da cliente com o preview aplicado + selo editorial do estúdio, pronto para compartilhar via `navigator.share` ou deep link do WhatsApp.
+- **Nail Loupe Extractor (`frontend/src/lib/nailExtractor.ts` + `ImportReferenceModal.tsx`)**:
+  - Ao importar uma foto de referência (Pinterest/Instagram ou câmera), executa automaticamente o MediaPipe `HandLandmarker` em modo **`IMAGE`**, calcula o centro exato da placa ungueal (`nailCenter = DIP + 0.65 * (TIP - DIP)`) e aplica **zoom automático de `4.5x`** estritamente no interior da unha (excluindo pele, anéis e fundo).
+  - **Lupa Interativa (`2.0x` a `8.0x`) + Extração Rápida por Dedo (`Unha 1`, `Unha 2`, `Unha 3`...)**: permite alternar em 1 toque entre as diferentes unhas decoradas detectadas na mesma foto e refinar o enquadramento arrastando com o dedo ou com gesto de pinça.
+- **Seletor Rápido + Dock Limpo em 2 Abas**: Seletor discreto de 5 formatos acima do dock, 2 abas limpas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**) e destaque máximo para o botão **`+ Importar Referência`**.
+- **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera + overlay WebGL 3D + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
 
 ---
 

@@ -83,6 +83,7 @@ export interface FingerPose {
   id: 'thumb' | 'index' | 'middle' | 'ring' | 'pinky';
   tip: NormalizedPoint;
   dip: NormalizedPoint;
+  pip?: NormalizedPoint;
   widthScale: number;
   lengthScale: number;
 }

@@ -9,12 +9,16 @@ import {
   Sparkles,
   Upload,
   X,
+  ZoomIn,
 } from 'lucide-react';
 import {
-  type CropAdjustment,
+  DEFAULT_LOUPE_ADJUSTMENT,
+  MAX_LOUPE_ZOOM,
+  MIN_LOUPE_ZOOM,
+  type LoupeAdjustment,
   type NailExtractionResult,
   analyzeReferencePhoto,
-  renderExtractedNailTexture,
+  renderLoupeNailTexture,
 } from '../lib/nailExtractor';
 import type { NailDesign } from '../types/nail';
 
@@ -24,13 +28,6 @@ interface ImportReferenceModalProps {
   onCreateDesign: (design: Omit<NailDesign, 'id' | 'createdAt'>) => Promise<void>;
 }
 
-const DEFAULT_CROP: CropAdjustment = {
-  offsetX: 0,
-  offsetY: 0,
-  zoom: 1,
-  rotationDeg: 0,
-};
-
 export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   open,
   onClose,
@@ -38,13 +35,13 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 }) => {
   const [name, setName] = useState('');
   const [extraction, setExtraction] = useState<NailExtractionResult | null>(null);
-  const [cropAdjust, setCropAdjust] = useState<CropAdjustment>(DEFAULT_CROP);
+  const [selectedNailIdx, setSelectedNailIdx] = useState(0);
+  const [loupeAdjust, setLoupeAdjust] = useState<LoupeAdjustment>(DEFAULT_LOUPE_ADJUSTMENT);
   const [finish, setFinish] = useState<NailDesign['finish']>('glossy');
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Interactive pointer / pinch framing refs
   const dragRef = useRef<{
     active: boolean;
     startX: number;
@@ -54,16 +51,21 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   }>({ active: false, startX: 0, startY: 0, origOffsetX: 0, origOffsetY: 0 });
   const pinchRef = useRef<{ dist: number; origZoom: number } | null>(null);
 
+  const activeTarget = useMemo(() => {
+    if (!extraction || extraction.detectedNails.length === 0) return null;
+    return extraction.detectedNails[selectedNailIdx] ?? extraction.detectedNails[0];
+  }, [extraction, selectedNailIdx]);
+
   const previewDataUrl = useMemo(() => {
-    if (!extraction) return null;
-    return renderExtractedNailTexture(
+    if (!extraction || !activeTarget) return null;
+    return renderLoupeNailTexture(
       extraction.sourceImage,
-      extraction.initialFrame,
-      cropAdjust,
-      240,
-      360
+      activeTarget.frame,
+      loupeAdjust,
+      260,
+      390
     );
-  }, [extraction, cropAdjust]);
+  }, [extraction, activeTarget, loupeAdjust]);
 
   useEffect(() => {
     if (!open) {
@@ -79,7 +81,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     try {
       const result = await analyzeReferencePhoto(file);
       setExtraction(result);
-      setCropAdjust(DEFAULT_CROP);
+      setSelectedNailIdx(result.initialIndex);
+      setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
       if (!name.trim()) {
         const cleanFile = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
         setName(cleanFile.slice(0, 26) || 'Referência da Cliente');
@@ -92,23 +95,29 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     }
   };
 
+  const handleSelectFinger = (index: number) => {
+    setSelectedNailIdx(index);
+    setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
+  };
+
   const resetAndClose = () => {
     setName('');
     setExtraction(null);
-    setCropAdjust(DEFAULT_CROP);
+    setSelectedNailIdx(0);
+    setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT);
     setError(null);
     onClose();
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!extraction) return;
+    if (!activeTarget) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = {
       active: true,
       startX: e.clientX,
       startY: e.clientY,
-      origOffsetX: cropAdjust.offsetX,
-      origOffsetY: cropAdjust.offsetY,
+      origOffsetX: loupeAdjust.offsetX,
+      origOffsetY: loupeAdjust.offsetY,
     };
   };
 
@@ -116,10 +125,10 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     if (!dragRef.current.active || pinchRef.current) return;
     const dx = e.clientX - dragRef.current.startX;
     const dy = e.clientY - dragRef.current.startY;
-    setCropAdjust((prev) => ({
+    setLoupeAdjust((prev) => ({
       ...prev,
-      offsetX: Math.max(-0.9, Math.min(0.9, dragRef.current.origOffsetX + dx / 130)),
-      offsetY: Math.max(-0.9, Math.min(0.9, dragRef.current.origOffsetY + dy / 180)),
+      offsetX: Math.max(-2.2, Math.min(2.2, dragRef.current.origOffsetX + dx / 130)),
+      offsetY: Math.max(-2.2, Math.min(2.2, dragRef.current.origOffsetY + dy / 190)),
     }));
   };
 
@@ -133,7 +142,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         e.touches[0].clientX - e.touches[1].clientX,
         e.touches[0].clientY - e.touches[1].clientY
       );
-      pinchRef.current = { dist, origZoom: cropAdjust.zoom };
+      pinchRef.current = { dist, origZoom: loupeAdjust.zoom };
       dragRef.current.active = false;
     }
   };
@@ -145,8 +154,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         e.touches[0].clientY - e.touches[1].clientY
       );
       const ratio = dist / Math.max(10, pinchRef.current.dist);
-      const nextZoom = Math.max(0.65, Math.min(2.6, pinchRef.current.origZoom * ratio));
-      setCropAdjust((prev) => ({ ...prev, zoom: Number(nextZoom.toFixed(2)) }));
+      const nextZoom = Math.max(
+        MIN_LOUPE_ZOOM,
+        Math.min(MAX_LOUPE_ZOOM, pinchRef.current.origZoom * ratio)
+      );
+      setLoupeAdjust((prev) => ({ ...prev, zoom: Number(nextZoom.toFixed(2)) }));
     }
   };
 
@@ -156,24 +168,24 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!extraction) {
+    if (!extraction || !activeTarget) {
       setError('Selecione ou fotografe uma referência da cliente primeiro.');
       return;
     }
     setSaving(true);
     try {
-      const finalTexture = renderExtractedNailTexture(
+      const finalTexture = renderLoupeNailTexture(
         extraction.sourceImage,
-        extraction.initialFrame,
-        cropAdjust,
-        300,
-        450
+        activeTarget.frame,
+        loupeAdjust,
+        320,
+        480
       );
       await onCreateDesign({
         name: name.trim() || 'Referência da Cliente',
         category: 'Cliente',
         patternType: 'solid',
-        baseColor: extraction.dominantColor || '#D4A383',
+        baseColor: activeTarget.dominantColor || '#D4A383',
         secondaryColor: '#FFFFFF',
         accentColor: '#F3D5C0',
         finish,
@@ -211,7 +223,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
           >
             <div className="modal-header">
               <div>
-                <span className="modal-eyebrow">Extrator Inteligente de Textura</span>
+                <span className="modal-eyebrow">Nail Loupe Extractor • Zoom 4.5x</span>
                 <h2 id="import-title" className="modal-title">
                   Importar Referência
                 </h2>
@@ -229,7 +241,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
             <form onSubmit={handleSubmit} className="modal-body">
               <div className="import-preview-stage">
                 <div
-                  className={`nail-crop-preview is-interactive ${extraction ? 'has-texture' : ''}`}
+                  className={`nail-crop-preview is-loupe is-interactive ${activeTarget ? 'has-texture' : ''}`}
                   onPointerDown={handlePointerDown}
                   onPointerMove={handlePointerMove}
                   onPointerUp={handlePointerUp}
@@ -237,33 +249,43 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   onTouchStart={handleTouchStart}
                   onTouchMove={handleTouchMove}
                   onTouchEnd={handleTouchEnd}
-                  title={extraction ? 'Arraste ou faça pinça para ajustar o recorte' : undefined}
+                  title={
+                    activeTarget
+                      ? 'Arraste ou faça pinça (2x–8x) para isolar exatamente a arte da unha'
+                      : undefined
+                  }
                 >
                   {analyzing ? (
                     <div className="nail-crop-placeholder">
                       <Loader2 size={22} className="spin-icon" />
-                      <span>Extraindo unha...</span>
+                      <span>Focando unha...</span>
                     </div>
                   ) : previewDataUrl ? (
-                    <img src={previewDataUrl} alt="Textura extraída da unha" draggable={false} />
+                    <img src={previewDataUrl} alt="Lupa da placa da unha" draggable={false} />
                   ) : (
                     <div className="nail-crop-placeholder">
                       <Sparkles size={22} />
-                      <span>Amostra da Unha</span>
+                      <span>Lupa da Unha</span>
                     </div>
                   )}
                   <div className="nail-crop-gloss" aria-hidden="true" />
-                  {extraction && (
-                    <div className="nail-crop-drag-badge" aria-hidden="true">
-                      <Move size={11} />
-                    </div>
+                  {activeTarget && (
+                    <>
+                      <div className="loupe-zoom-pill" aria-hidden="true">
+                        <ZoomIn size={10} />
+                        <span>{loupeAdjust.zoom.toFixed(1)}x</span>
+                      </div>
+                      <div className="nail-crop-drag-badge" aria-hidden="true">
+                        <Move size={11} />
+                      </div>
+                    </>
                   )}
                 </div>
 
                 <div className="import-upload-buttons">
                   <label className="upload-action-btn">
                     <Upload size={16} />
-                    <span>{analyzing ? 'Analisando mão...' : 'Foto da Galeria'}</span>
+                    <span>{analyzing ? 'Detectando unhas...' : 'Foto da Galeria'}</span>
                     <input
                       type="file"
                       accept="image/*"
@@ -284,43 +306,66 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                     />
                   </label>
 
-                  {extraction && (
+                  {extraction && activeTarget && (
                     <div className="extractor-status-note">
                       {extraction.method === 'mediapipe'
-                        ? `Unha isolada via IA (${extraction.detectedFingerLabel}). Arraste para refinar.`
-                        : 'Close detectado • Arraste ou dê zoom na textura da unha.'}
+                        ? `Lupa IA focada em ${activeTarget.fingerName} (${loupeAdjust.zoom.toFixed(1)}x). Arraste para ajustar.`
+                        : `Close focado (${loupeAdjust.zoom.toFixed(1)}x). Arraste ou dê zoom dentro da unha.`}
                     </div>
                   )}
                 </div>
               </div>
 
-              {extraction && (
+              {/* 1-Tap Quick Finger Extraction Switcher (Unha 1, Unha 2, Unha 3...) */}
+              {extraction && extraction.detectedNails.length > 1 && (
+                <div className="finger-extract-strip" role="group" aria-label="Unhas detectadas na foto">
+                  <span className="field-label">Extração Rápida por Dedo (1 toque)</span>
+                  <div className="finger-extract-row">
+                    {extraction.detectedNails.map((target, idx) => {
+                      const isActive = idx === selectedNailIdx;
+                      return (
+                        <button
+                          key={target.id}
+                          type="button"
+                          onClick={() => handleSelectFinger(idx)}
+                          className={`finger-extract-btn ${isActive ? 'is-active' : ''}`}
+                        >
+                          <img src={target.thumbDataUrl} alt={target.shortLabel} />
+                          <span>{target.shortLabel}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {activeTarget && (
                 <div className="extractor-refine-box">
                   <div className="extractor-refine-head">
-                    <span>Ajuste Fino do Recorte</span>
+                    <span>Lupa de Precisão (2x – 8x)</span>
                     <button
                       type="button"
                       className="icon-text-btn"
-                      onClick={() => setCropAdjust(DEFAULT_CROP)}
+                      onClick={() => setLoupeAdjust(DEFAULT_LOUPE_ADJUSTMENT)}
                     >
                       <RotateCcw size={12} />
-                      <span>Recentralizar</span>
+                      <span>Resetar 4.5x</span>
                     </button>
                   </div>
                   <div className="extractor-refine-sliders">
                     <label className="slider-row">
                       <div className="slider-meta">
-                        <span>Zoom na Arte</span>
-                        <span className="slider-val">{cropAdjust.zoom.toFixed(2)}x</span>
+                        <span>Zoom Lupa</span>
+                        <span className="slider-val">{loupeAdjust.zoom.toFixed(1)}x</span>
                       </div>
                       <input
                         type="range"
-                        min={0.65}
-                        max={2.6}
-                        step={0.05}
-                        value={cropAdjust.zoom}
+                        min={MIN_LOUPE_ZOOM}
+                        max={MAX_LOUPE_ZOOM}
+                        step={0.1}
+                        value={loupeAdjust.zoom}
                         onChange={(e) =>
-                          setCropAdjust((prev) => ({
+                          setLoupeAdjust((prev) => ({
                             ...prev,
                             zoom: parseFloat(e.target.value),
                           }))
@@ -330,11 +375,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                     </label>
                     <label className="slider-row">
                       <div className="slider-meta">
-                        <span>Alinhamento</span>
+                        <span>Ângulo</span>
                         <span className="slider-val">
-                          {cropAdjust.rotationDeg > 0
-                            ? `+${cropAdjust.rotationDeg}°`
-                            : `${cropAdjust.rotationDeg}°`}
+                          {loupeAdjust.rotationDeg > 0
+                            ? `+${loupeAdjust.rotationDeg}°`
+                            : `${loupeAdjust.rotationDeg}°`}
                         </span>
                       </div>
                       <input
@@ -342,9 +387,9 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                         min={-45}
                         max={45}
                         step={1}
-                        value={cropAdjust.rotationDeg}
+                        value={loupeAdjust.rotationDeg}
                         onChange={(e) =>
-                          setCropAdjust((prev) => ({
+                          setLoupeAdjust((prev) => ({
                             ...prev,
                             rotationDeg: parseInt(e.target.value, 10),
                           }))
@@ -363,19 +408,19 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   value={name}
                   maxLength={32}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="Ex: Pinterest Pérola Dourada"
+                  placeholder="Ex: Vermelha com Fio Dourado 3D"
                   className="glass-input"
                 />
               </label>
 
               <div className="field-group">
-                <span className="field-label">Brilho do Topcoat Gel</span>
+                <span className="field-label">Acabamento 3D no Shader WebGL</span>
                 <div className="shape-selector">
                   {(
                     [
                       { id: 'glossy', label: 'Gel Brilho' },
-                      { id: 'chrome', label: 'Cromado' },
-                      { id: 'velvet', label: 'Veludo' },
+                      { id: 'chrome', label: 'Metálico / Cromado' },
+                      { id: 'velvet', label: 'Veludo Fosco' },
                     ] as const
                   ).map((item) => (
                     <button
@@ -399,10 +444,10 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 <button
                   type="submit"
                   className="btn-primary"
-                  disabled={!extraction || analyzing || saving}
+                  disabled={!activeTarget || analyzing || saving}
                 >
                   <Check size={16} />
-                  <span>{saving ? 'Aplicando...' : 'Aplicar na Mão'}</span>
+                  <span>{saving ? 'Aplicando em 3D...' : 'Aplicar na Mão 3D'}</span>
                 </button>
               </div>
             </form>

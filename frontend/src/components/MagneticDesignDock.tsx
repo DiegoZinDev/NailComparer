@@ -2,17 +2,27 @@ import React, { useMemo, useRef } from 'react';
 import { motion, useMotionValue, useSpring, useTransform } from 'framer-motion';
 import { Camera, Plus, Trash2 } from 'lucide-react';
 import { getSwatchBackground } from '../lib/swatchPreview';
-import type { DockTab, NailDesign } from '../types/nail';
+import type { DockTab, NailDesign, NailShape } from '../types/nail';
 
 const TABS: Array<{ id: DockTab; label: string }> = [
   { id: 'client', label: 'Referência da Cliente' },
   { id: 'studio', label: 'Catálogo do Estúdio' },
 ];
 
+const QUICK_SHAPES: Array<{ id: NailShape; label: string }> = [
+  { id: 'natural', label: 'Natural' },
+  { id: 'almond', label: 'Amendoada' },
+  { id: 'coffin', label: 'Bailarina' },
+  { id: 'square', label: 'Quadrada' },
+  { id: 'stiletto', label: 'Stiletto' },
+];
+
 interface MagneticDesignDockProps {
   designs: NailDesign[];
   activeTab: DockTab;
   onTabChange: (tab: DockTab) => void;
+  activeShape: NailShape;
+  onShapeChange: (shape: NailShape) => void;
   activeDesignId: string;
   onSelectDesign: (design: NailDesign) => void;
   onOpenImport: () => void;
@@ -94,6 +104,8 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
   designs,
   activeTab,
   onTabChange,
+  activeShape,
+  onShapeChange,
   activeDesignId,
   onSelectDesign,
   onOpenImport,
@@ -110,7 +122,24 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
 
   return (
     <div className="dock-container">
-      {/* Clean 2-Tab Editorial Switcher (Zero game-like category filters) */}
+      {/* Discreet 1-Tap Anatomical Shape & Extension Selector above the dock */}
+      <div className="quick-shape-strip" role="group" aria-label="Formato do alongamento">
+        {QUICK_SHAPES.map((shape) => {
+          const isSelected = shape.id === activeShape;
+          return (
+            <button
+              key={shape.id}
+              type="button"
+              onClick={() => onShapeChange(shape.id)}
+              className={`quick-shape-pill ${isSelected ? 'is-active' : ''}`}
+            >
+              {shape.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Clean 2-Tab Switcher (Referência da Cliente / Catálogo do Estúdio) */}
       <div className="dock-tabs-bar" role="tablist" aria-label="Origem das artes">
         {TABS.map((tab) => {
           const active = tab.id === activeTab;
@@ -166,13 +195,9 @@ export const MagneticDesignDock: React.FC<MagneticDesignDockProps> = ({
 
         <div className="dock-scroll-track">
           {visibleDesigns.length === 0 ? (
-            <button
-              type="button"
-              onClick={onOpenImport}
-              className="dock-empty-cta"
-            >
+            <button type="button" onClick={onOpenImport} className="dock-empty-cta">
               <Camera size={15} />
-              <span>Toque para importar a foto que a cliente trouxe</span>
+              <span>Toque para extrair a unha da foto da cliente</span>
             </button>
           ) : (
             visibleDesigns.map((design) => (
