@@ -19,8 +19,16 @@ import {
   type NailExtractionResult,
   analyzeReferencePhoto,
   renderLoupeNailTexture,
-} from '../lib/nailExtractor';
-import type { NailDesign } from '../types/nail';
+} from '../lib/nail3DReconstructor';
+import type { NailDesign, NailShape } from '../types/nail';
+
+const SHAPE_LABELS: Record<NailShape, string> = {
+  natural: 'Natural',
+  almond: 'Amendoada',
+  square: 'Quadrada',
+  coffin: 'Bailarina',
+  stiletto: 'Stiletto',
+};
 
 interface ImportReferenceModalProps {
   open: boolean;
@@ -191,6 +199,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         finish,
         imageDataUrl: finalTexture,
         isCustom: true,
+        detectedShape: activeTarget.detectedShape,
+        detectedLength: activeTarget.detectedLength,
       });
       resetAndClose();
     } finally {
@@ -309,7 +319,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   {extraction && activeTarget && (
                     <div className="extractor-status-note">
                       {extraction.method === 'mediapipe'
-                        ? `Lupa IA focada em ${activeTarget.fingerName} (${loupeAdjust.zoom.toFixed(1)}x). Arraste para ajustar.`
+                        ? `Lupa 3D focada em ${activeTarget.fingerName} (${loupeAdjust.zoom.toFixed(1)}x) • Formato detectado: ${SHAPE_LABELS[activeTarget.detectedShape]} (${activeTarget.detectedLength.toFixed(2)}x).`
                         : `Close focado (${loupeAdjust.zoom.toFixed(1)}x). Arraste ou dê zoom dentro da unha.`}
                     </div>
                   )}

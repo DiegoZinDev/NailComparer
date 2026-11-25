@@ -4,14 +4,13 @@ import {
   DEMO_HAND_POSES,
   MEDIAPIPE_FINGER_PAIRS,
   computeCoverRect,
-  renderNailsOnRect,
 } from '../lib/nailRenderer';
 import {
   type AmbientLightSample,
-  WebGLNailEngine,
+  ThreeNailScene,
   sampleFingerSkinAmbient,
-} from '../lib/webglNailEngine';
-import type { ARViewMode, FingerPose, NailAdjustment, NailDesign } from '../types/nail';
+} from '../lib/threeNailScene';
+import type { ARViewMode, FingerPose, NailAdjustment, NailDesign, Vec3 } from '../types/nail';
 
 export interface ARCameraCanvasHandle {
   captureCompositeDataUrl: (studioName: string, logoDataUrl: string | null) => string | null;
@@ -31,6 +30,47 @@ interface ARCameraCanvasProps {
 const SMOOTHING_ALPHA = 0.44;
 const DEFAULT_AMBIENT: AmbientLightSample = { r: 0.78, g: 0.63, b: 0.54, luma: 0.66 };
 
+const FINGER_MCP_IDX: Record<FingerPose['id'], number> = {
+  thumb: 1,
+  index: 5,
+  middle: 9,
+  ring: 13,
+  pinky: 17,
+};
+
+function computePalmNormal(
+  wrist: { x: number; y: number; z?: number },
+  indexMcp: { x: number; y: number; z?: number },
+  pinkyMcp: { x: number; y: number; z?: number }
+): Vec3 {
+  const ax = indexMcp.x - wrist.x;
+  const ay = indexMcp.y - wrist.y;
+  const az = (indexMcp.z ?? 0) - (wrist.z ?? 0);
+
+  const bx = pinkyMcp.x - wrist.x;
+  const by = pinkyMcp.y - wrist.y;
+  const bz = (pinkyMcp.z ?? 0) - (wrist.z ?? 0);
+
+  const cx = ay * bz - az * by;
+  const cy = az * bx - ax * bz;
+  const cz = ax * by - ay * bx;
+  const len = Math.hypot(cx, cy, cz) || 1;
+
+  return { x: cx / len, y: cy / len, z: cz / len };
+}
+
+const DEMO_3D_HAND_POSES: FingerPose[] = DEMO_HAND_POSES.map((p) => {
+  const dx = p.tip.x - p.dip.x;
+  const dy = p.tip.y - p.dip.y;
+  return {
+    ...p,
+    tip: { ...p.tip, z: 0 },
+    dip: { ...p.dip, z: 0 },
+    pip: p.pip ?? { x: p.dip.x - dx * 1.15, y: p.dip.y - dy * 1.15, z: 0 },
+    palmNormal: { x: 0, y: 0, z: 1 },
+  };
+});
+
 export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCanvasProps>(
   function ARCameraCanvas(
     {
@@ -47,7 +87,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
   ) {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
-    const glEngineRef = useRef<WebGLNailEngine | null>(null);
+    const threeSceneRef = useRef<ThreeNailScene | null>(null);
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const demoImgRef = useRef<HTMLImageElement | null>(null);
     const landmarkerRef = useRef<HandLandmarker | null>(null);
@@ -73,17 +113,17 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     );
     const [modelReady, setModelReady] = useState(false);
 
-    // Initialize WebGL 3D Cylindrical Arco-C Engine once on mount
+    // Initialize Three.js PBR 3D Nail Scene once on mount
     useEffect(() => {
       const glCanvas = glCanvasRef.current;
       if (!glCanvas) return;
-      const engine = new WebGLNailEngine(glCanvas);
-      if (engine.isReady()) {
-        glEngineRef.current = engine;
+      const sceneEngine = new ThreeNailScene(glCanvas);
+      if (sceneEngine.isReady()) {
+        threeSceneRef.current = sceneEngine;
       }
       return () => {
-        engine.dispose();
-        glEngineRef.current = null;
+        sceneEngine.dispose();
+        threeSceneRef.current = null;
       };
     }, []);
 
@@ -254,7 +294,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, facingMode, onModeChange, onCameraNotice]);
 
-    // Main 60fps render + MediaPipe tracking + Ambient Light Matching + WebGL 3D C-Curve pass
+    // Main 60fps background draw + MediaPipe 3D tracking + Ambient Skin Lighting + Three.js PBR 3D render
     useEffect(() => {
       let rafId = 0;
 
@@ -286,7 +326,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, cssW, cssH);
 
-        const glEngine = glEngineRef.current;
+        const threeScene = threeSceneRef.current;
         const currentMode = modeRef.current;
         const video = videoRef.current;
         const demoImg = demoImgRef.current;
@@ -324,10 +364,16 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
               const result = landmarker.detectForVideo(video, performance.now());
               const hand = result.landmarks?.[0];
               if (hand && hand.length >= 21) {
+                const wrist = hand[0];
+                const indexMcp = hand[5];
+                const pinkyMcp = hand[17];
+                const palmNormal = computePalmNormal(wrist, indexMcp, pinkyMcp);
+
                 const rawPoses: FingerPose[] = MEDIAPIPE_FINGER_PAIRS.map((cfg) => {
                   const tip = hand[cfg.tipIdx];
                   const dip = hand[cfg.dipIdx];
                   const pip = hand[cfg.pipIdx];
+                  const mcp = hand[FINGER_MCP_IDX[cfg.id]];
                   const segLen = Math.hypot(
                     (tip.x - dip.x) * rect.drawW,
                     (tip.y - dip.y) * rect.drawH
@@ -342,9 +388,12 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
 
                   return {
                     id: cfg.id,
-                    tip: { x: tip.x, y: tip.y },
-                    dip: { x: dip.x, y: dip.y },
-                    pip: { x: pip.x, y: pip.y },
+                    tip: { x: tip.x, y: tip.y, z: tip.z },
+                    dip: { x: dip.x, y: dip.y, z: dip.z },
+                    pip: { x: pip.x, y: pip.y, z: pip.z },
+                    mcp: { x: mcp.x, y: mcp.y, z: mcp.z },
+                    wrist: { x: wrist.x, y: wrist.y, z: wrist.z },
+                    palmNormal,
                     widthScale: widthNorm,
                     lengthScale: lenNorm,
                   };
@@ -360,12 +409,19 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                       tip: {
                         x: prev.tip.x + (next.tip.x - prev.tip.x) * SMOOTHING_ALPHA,
                         y: prev.tip.y + (next.tip.y - prev.tip.y) * SMOOTHING_ALPHA,
+                        z:
+                          (prev.tip.z ?? 0) +
+                          ((next.tip.z ?? 0) - (prev.tip.z ?? 0)) * SMOOTHING_ALPHA,
                       },
                       dip: {
                         x: prev.dip.x + (next.dip.x - prev.dip.x) * SMOOTHING_ALPHA,
                         y: prev.dip.y + (next.dip.y - prev.dip.y) * SMOOTHING_ALPHA,
+                        z:
+                          (prev.dip.z ?? 0) +
+                          ((next.dip.z ?? 0) - (prev.dip.z ?? 0)) * SMOOTHING_ALPHA,
                       },
                       pip: next.pip,
+                      palmNormal: next.palmNormal,
                       widthScale:
                         prev.widthScale + (next.widthScale - prev.widthScale) * SMOOTHING_ALPHA,
                       lengthScale:
@@ -397,31 +453,20 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             }
           }
 
-          if (!compareCleanRef.current && smoothedPosesRef.current) {
-            if (glEngine) {
-              glEngine.renderNails(
-                cssW,
-                cssH,
-                dpr,
-                rect,
-                smoothedPosesRef.current,
-                designRef.current,
-                adjustmentRef.current,
-                ambientRef.current,
-                mirrorX
-              );
-            } else {
-              renderNailsOnRect(
-                ctx,
-                rect,
-                smoothedPosesRef.current,
-                designRef.current,
-                adjustmentRef.current,
-                mirrorX
-              );
-            }
+          if (!compareCleanRef.current && smoothedPosesRef.current && threeScene) {
+            threeScene.renderNails(
+              cssW,
+              cssH,
+              dpr,
+              rect,
+              smoothedPosesRef.current,
+              designRef.current,
+              adjustmentRef.current,
+              ambientRef.current,
+              mirrorX
+            );
           } else {
-            glEngine?.clear(cssW, cssH, dpr);
+            threeScene?.clear(cssW, cssH, dpr);
           }
         } else if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
           const rect = computeCoverRect(cssW, cssH, demoImg.naturalWidth, demoImg.naturalHeight);
@@ -431,38 +476,27 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
 
           ambientRef.current = sampleFingerSkinAmbient(
             demoImg,
-            DEMO_HAND_POSES,
+            DEMO_3D_HAND_POSES,
             ambientRef.current
           );
 
-          if (!compareCleanRef.current) {
-            if (glEngine) {
-              glEngine.renderNails(
-                cssW,
-                cssH,
-                dpr,
-                rect,
-                DEMO_HAND_POSES,
-                designRef.current,
-                adjustmentRef.current,
-                ambientRef.current,
-                false
-              );
-            } else {
-              renderNailsOnRect(
-                ctx,
-                rect,
-                DEMO_HAND_POSES,
-                designRef.current,
-                adjustmentRef.current,
-                false
-              );
-            }
+          if (!compareCleanRef.current && threeScene) {
+            threeScene.renderNails(
+              cssW,
+              cssH,
+              dpr,
+              rect,
+              DEMO_3D_HAND_POSES,
+              designRef.current,
+              adjustmentRef.current,
+              ambientRef.current,
+              false
+            );
           } else {
-            glEngine?.clear(cssW, cssH, dpr);
+            threeScene?.clear(cssW, cssH, dpr);
           }
         } else {
-          glEngine?.clear(cssW, cssH, dpr);
+          threeScene?.clear(cssW, cssH, dpr);
         }
 
         // Subtle editorial vignette for floating glass HUD legibility
