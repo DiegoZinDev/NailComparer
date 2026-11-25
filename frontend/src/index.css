@@ -1301,3 +1301,133 @@ body,
   border-color: var(--glass-border);
   color: var(--glass-text);
 }
+
+/* V5 5-Finger Procedural Reconstruction Strip */
+.v5-five-finger-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.v5-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.v5-five-finger-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.v5-finger-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 4px 7px;
+  border-radius: 14px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--glass-text);
+  cursor: pointer;
+  transition: border-color 0.18s ease, background 0.18s ease, transform 0.14s ease;
+}
+
+.v5-finger-card.is-active {
+  border-color: var(--primary);
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-1px);
+}
+
+.v5-finger-thumb {
+  width: 34px;
+  height: 48px;
+  border-radius: 10px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: rgba(16, 13, 15, 0.45);
+}
+
+.v5-finger-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.v5-finger-name {
+  font-size: 0.64rem;
+  font-weight: 700;
+  color: var(--glass-text);
+  white-space: nowrap;
+}
+
+.v5-finger-badge {
+  width: 100%;
+  text-align: center;
+  font-size: 0.56rem;
+  font-weight: 500;
+  color: var(--glass-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.v5-palette-dots {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 1px;
+}
+
+.v5-palette-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.v5-source-pill {
+  font-size: 0.6rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--glass-muted);
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+.v5-color-trio {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.v5-color-swatch-edit {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--glass-muted);
+  cursor: pointer;
+}
+
+.v5-color-swatch-edit input[type='color'] {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+

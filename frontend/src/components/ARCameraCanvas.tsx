@@ -363,6 +363,9 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             try {
               const result = landmarker.detectForVideo(video, performance.now());
               const hand = result.landmarks?.[0];
+              const rawHandedness = result.handednesses?.[0]?.[0]?.categoryName;
+              const handedness: FingerPose['handedness'] =
+                rawHandedness === 'Left' ? 'Left' : 'Right';
               if (hand && hand.length >= 21) {
                 const wrist = hand[0];
                 const indexMcp = hand[5];
@@ -394,6 +397,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                     mcp: { x: mcp.x, y: mcp.y, z: mcp.z },
                     wrist: { x: wrist.x, y: wrist.y, z: wrist.z },
                     palmNormal,
+                    handedness,
                     widthScale: widthNorm,
                     lengthScale: lenNorm,
                   };
@@ -421,7 +425,9 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                           ((next.dip.z ?? 0) - (prev.dip.z ?? 0)) * SMOOTHING_ALPHA,
                       },
                       pip: next.pip,
+                      mcp: next.mcp,
                       palmNormal: next.palmNormal,
+                      handedness: next.handedness,
                       widthScale:
                         prev.widthScale + (next.widthScale - prev.widthScale) * SMOOTHING_ALPHA,
                       lengthScale:
