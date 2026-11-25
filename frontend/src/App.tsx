@@ -493,6 +493,7 @@ export function App(): React.ReactElement {
         targetMode={importModalMode}
         onClose={() => setImportOpen(false)}
         onCreateDesign={handleCreateDesign}
+        onOpenSettings={() => setWhiteLabelOpen(true)}
       />
 
       {activeDesign && (

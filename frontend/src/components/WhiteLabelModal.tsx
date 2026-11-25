@@ -1,7 +1,20 @@
 import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Check, ImagePlus, Palette, Plus, RotateCcw, Sparkles, X } from 'lucide-react';
+import {
+  Check,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  ImagePlus,
+  KeyRound,
+  Palette,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  X,
+} from 'lucide-react';
 import { DEFAULT_STUDIO_CONFIG, THEME_PRESETS } from '../data/presets';
+import { getSavedGeminiApiKey, saveGeminiApiKey } from '../lib/deepNailReconstructor';
 import { resizeImageToDataUrl } from '../lib/offlineStore';
 import { getStudioMonogram } from '../lib/swatchPreview';
 import type { StudioConfig, ThemePresetDefinition } from '../types/nail';
@@ -25,10 +38,14 @@ export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
 }) => {
   const [draft, setDraft] = useState<StudioConfig>(config);
   const [saving, setSaving] = useState(false);
+  const [geminiKey, setGeminiKey] = useState<string>(() => getSavedGeminiApiKey());
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
 
   useEffect(() => {
     if (open) {
       setDraft(config);
+      setGeminiKey(getSavedGeminiApiKey());
+      setShowGeminiKey(false);
     }
   }, [open, config]);
 
@@ -63,6 +80,7 @@ export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
     e.preventDefault();
     setSaving(true);
     try {
+      saveGeminiApiKey(geminiKey);
       await onSave(draft);
       onClose();
     } finally {
@@ -265,6 +283,56 @@ export const WhiteLabelModal: React.FC<WhiteLabelModalProps> = ({
                     </div>
                   </label>
                 </div>
+              </div>
+
+              {/* V11 Free Google AI Studio Vision Key (R$ 0,00) */}
+              <div className="gemini-key-card">
+                <div className="gemini-key-head">
+                  <span className="field-label" style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                    <KeyRound size={13} /> Visão 3D Profunda (Google AI Studio — R$ 0,00)
+                  </span>
+                  <span
+                    className={`gemini-key-status ${geminiKey.trim() ? 'is-configured' : ''}`}
+                  >
+                    {geminiKey.trim()
+                      ? 'Chave local configurada ✓'
+                      : 'Usando servidor / offline'}
+                  </span>
+                </div>
+
+                <div className="gemini-key-input-row">
+                  <input
+                    type={showGeminiKey ? 'text' : 'password'}
+                    value={geminiKey}
+                    onChange={(e) => setGeminiKey(e.target.value)}
+                    placeholder="Cole sua chave gratuita AIza... (opcional)"
+                    className="glass-input"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="icon-mini-btn"
+                    onClick={() => setShowGeminiKey((prev) => !prev)}
+                    aria-label={showGeminiKey ? 'Ocultar chave' : 'Mostrar chave'}
+                  >
+                    {showGeminiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+                  </button>
+                </div>
+
+                <p className="gemini-key-help">
+                  100% gratuita, sem cartão de crédito. Ativa a análise profunda unha-por-unha com
+                  auto-verificação visual e acessórios 3D reais.{' '}
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="gemini-key-link"
+                  >
+                    <span>Gerar chave gratuita</span>
+                    <ExternalLink size={11} />
+                  </a>
+                </p>
               </div>
 
               {onOpenStudioCatalogImport && (

@@ -6,7 +6,13 @@ import {
 } from './perFingerVisionAnalyzer';
 import type {
   MicroGemElement,
+  Nail3DAccessorySpec,
+  Nail3DFinishType,
+  Nail3DManufacturingSpec,
+  Nail3DMotifSpec,
+  Nail3DStrokeSpec,
   NailDesignBlueprint,
+  NailShape,
   OrganicMotifElement,
   RibbonStrokeElement,
 } from '../types/nail';
@@ -58,12 +64,16 @@ function clamp(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
 }
 
+function clamp01(v: number): number {
+  return clamp(v, 0, 1);
+}
+
 function clampByte(n: number): number {
   return Math.max(0, Math.min(255, Math.round(n)));
 }
 
 function parseHex(hex: string): [number, number, number] {
-  const clean = hex.replace('#', '').trim();
+  const clean = (hex || '').replace('#', '').trim();
   if (clean.length === 3) {
     const r = parseInt(clean[0] + clean[0], 16);
     const g = parseInt(clean[1] + clean[1], 16);
@@ -87,18 +97,99 @@ function shadeHex(hex: string, delta: number, alpha = 1): string {
 function mixHex(hexA: string, hexB: string, t: number, alpha = 1): string {
   const [r1, g1, b1] = parseHex(hexA);
   const [r2, g2, b2] = parseHex(hexB);
-  const tc = clamp(t, 0, 1);
+  const tc = clamp01(t);
   const rr = clampByte(r1 * (1 - tc) + r2 * tc);
   const gg = clampByte(g1 * (1 - tc) + g2 * tc);
   const bb = clampByte(b1 * (1 - tc) + b2 * tc);
   return alpha < 1 ? `rgba(${rr},${gg},${bb},${alpha})` : `rgb(${rr},${gg},${bb})`;
 }
 
+function hexWithAlpha(hex: string, alpha: number): string {
+  const [r, g, b] = parseHex(hex);
+  return `rgba(${r},${g},${b},${clamp01(alpha)})`;
+}
+
+function deterministicHash(seed: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function createSeededRng(seedStr: string): () => number {
+  let state = deterministicHash(seedStr) || 0x9e3779b9;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 function resolveBlueprint(spec: NailFingerDesignSpec): NailDesignBlueprint {
   return spec.blueprint ?? buildBlueprintFromLegacySpec(spec);
 }
 
+function hashManufacturingSpec(m: Nail3DManufacturingSpec): string {
+  const strokeSig = (m.strokes3D ?? [])
+    .map(
+      (s) =>
+        `S:${s.p0[0].toFixed(3)},${s.p0[1].toFixed(3)}:${s.c1[0].toFixed(3)},${s.c1[1].toFixed(3)}:${s.c2[0].toFixed(3)},${s.c2[1].toFixed(3)}:${s.p1[0].toFixed(3)},${s.p1[1].toFixed(3)}:${s.widthNorm.toFixed(3)}:${s.colorHex}:${s.isMetallic ? 1 : 0}:${s.metalness.toFixed(2)}:${s.reliefHeight.toFixed(2)}`
+    )
+    .join(';');
+
+  const motifSig = (m.motifs ?? [])
+    .map(
+      (mt) =>
+        `M:${mt.kind}:${mt.center[0].toFixed(3)},${mt.center[1].toFixed(3)}:${mt.scale.toFixed(3)}:${mt.rotationDeg.toFixed(1)}:${mt.primaryColorHex}:${mt.secondaryColorHex}:${mt.centerDotColorHex ?? ''}:${mt.is3DRaised ? 1 : 0}:${mt.opacity.toFixed(2)}`
+    )
+    .join(';');
+
+  const accSig = (m.accessories3D ?? [])
+    .map(
+      (a) =>
+        `A:${a.kind}:${a.u.toFixed(3)},${a.v.toFixed(3)}:${a.radiusNorm.toFixed(3)}:${a.heightRatio.toFixed(2)}:${a.colorHex}:${a.hasBezelRing ? 1 : 0}`
+    )
+    .join(';');
+
+  return [
+    'v11',
+    m.fingerId,
+    m.handSide ?? '',
+    m.shape,
+    m.freeEdgeRatio.toFixed(2),
+    m.tipRoundness.toFixed(2),
+    m.cCurveDepth.toFixed(2),
+    m.apexHeight.toFixed(3),
+    m.substrateType,
+    m.finishType,
+    m.trueBaseColorHex,
+    m.secondaryColorHex,
+    m.cuticleColorHex,
+    m.tipColorHex,
+    m.gradientType,
+    m.metalness.toFixed(2),
+    m.roughness.toFixed(2),
+    m.clearcoat.toFixed(2),
+    m.translucency.toFixed(2),
+    m.borderType,
+    m.borderColorHex,
+    m.borderWidthNorm.toFixed(3),
+    m.borderIsMetallic ? '1' : '0',
+    m.borderIs3DRaised ? '1' : '0',
+    strokeSig,
+    motifSig,
+    accSig,
+  ].join('|');
+}
+
 export function hashFingerSpec(spec: NailFingerDesignSpec): string {
+  if (spec.manufacturingSpec) {
+    return hashManufacturingSpec(spec.manufacturingSpec);
+  }
+
   const bp = resolveBlueprint(spec);
   const g = bp.geometry;
   const b = bp.baseLayer;
@@ -135,7 +226,7 @@ export function hashFingerSpec(spec: NailFingerDesignSpec): string {
   ].join('|');
 }
 
-// Coordinate transform from blueprint UV (u=0..1 left..right, v=0 cuticle .. v=1 tip)
+// Coordinate transform from blueprint/manufacturing UV (u=0..1 left..right, v=0 cuticle .. v=1 tip)
 // to Three.js CanvasTexture space (y=0 is top v=1 tip, y=h is bottom v=0 cuticle)
 function uvToCanvas(u: number, v: number, w: number, h: number): [number, number] {
   return [u * w, (1 - v) * h];
@@ -144,19 +235,25 @@ function uvToCanvas(u: number, v: number, w: number, h: number): [number, number
 // Maps UV (u, v) to anatomical silhouette coordinate inside UV space
 function traceBorderSilhouetteUV(
   ctx: CanvasCtx2D,
-  bp: NailDesignBlueprint,
+  shape: NailShape,
+  tipRoundness: number,
+  bedFraction: number,
+  profileHalfWidths:
+    | [number, number, number, number, number, number, number, number]
+    | undefined,
   w: number,
   h: number,
   insetFactor = 0.90
 ): void {
-  const steps = 28;
+  const steps = 32;
   ctx.beginPath();
   for (let i = 0; i <= steps; i++) {
     const v = 0.04 + (i / steps) * 0.935;
     const hw =
-      evalNailHalfWidth(v, bp.geometry.shape, {
-        tipRoundness: bp.geometry.tipRoundness,
-        profileHalfWidths: bp.geometry.profileHalfWidths,
+      evalNailHalfWidth(v, shape, {
+        bedFraction,
+        tipRoundness,
+        profileHalfWidths,
       }) * insetFactor;
     const u = 0.5 - hw * 0.96;
     const [x, y] = uvToCanvas(u, v, w, h);
@@ -166,9 +263,10 @@ function traceBorderSilhouetteUV(
   for (let i = steps; i >= 0; i--) {
     const v = 0.04 + (i / steps) * 0.935;
     const hw =
-      evalNailHalfWidth(v, bp.geometry.shape, {
-        tipRoundness: bp.geometry.tipRoundness,
-        profileHalfWidths: bp.geometry.profileHalfWidths,
+      evalNailHalfWidth(v, shape, {
+        bedFraction,
+        tipRoundness,
+        profileHalfWidths,
       }) * insetFactor;
     const u = 0.5 + hw * 0.96;
     const [x, y] = uvToCanvas(u, v, w, h);
@@ -176,6 +274,1329 @@ function traceBorderSilhouetteUV(
   }
   ctx.closePath();
 }
+
+// =============================================================================
+// V11 Direct PBR Compiler (`Nail3DManufacturingSpec`)
+// =============================================================================
+
+function resolveManufacturingBaseColor(m: Nail3DManufacturingSpec): string {
+  if (m.trueBaseColorHex && m.trueBaseColorHex.trim()) {
+    return m.trueBaseColorHex;
+  }
+  return '#E5BEB3';
+}
+
+function renderManufacturingBaseLayer(
+  m: Nail3DManufacturingSpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): void {
+  const baseHex = resolveManufacturingBaseColor(m);
+  const secondaryHex = m.secondaryColorHex || mixHex(baseHex, '#FFFFFF', 0.35);
+  const cuticleHex = m.cuticleColorHex || shadeHex(baseHex, -6);
+  const tipHex = m.tipColorHex || baseHex;
+  const finish: Nail3DFinishType = m.finishType;
+  const gradType = m.gradientType;
+
+  // 1. Optical Base & Gradient Synthesis (ZERO muddy dark/gray smudges on chrome!)
+  if (finish === 'mirror_chrome' || gradType === 'chrome_sheen') {
+    // Ultra-clean uniform metallic base with subtle warm-bright chrome sheen
+    const chromeGrad = albedoCtx.createLinearGradient(0, 0, w, h);
+    chromeGrad.addColorStop(0.0, mixHex(baseHex, '#FFFFFF', 0.06));
+    chromeGrad.addColorStop(0.32, mixHex(baseHex, '#FFFDF7', 0.16));
+    chromeGrad.addColorStop(0.54, baseHex);
+    chromeGrad.addColorStop(0.78, mixHex(baseHex, secondaryHex, 0.14));
+    chromeGrad.addColorStop(1.0, mixHex(baseHex, '#FFFFFF', 0.05));
+    albedoCtx.fillStyle = chromeGrad;
+    albedoCtx.fillRect(0, 0, w, h);
+
+    // Subtle pearlescent sheen ribbon without ever introducing black/gray blotches
+    const sheen = albedoCtx.createRadialGradient(
+      w * 0.42,
+      h * 0.38,
+      w * 0.04,
+      w * 0.48,
+      h * 0.44,
+      w * 0.62
+    );
+    sheen.addColorStop(0.0, 'rgba(255, 253, 245, 0.22)');
+    sheen.addColorStop(0.55, 'rgba(255, 250, 238, 0.08)');
+    sheen.addColorStop(1.0, 'rgba(255, 255, 255, 0)');
+    albedoCtx.fillStyle = sheen;
+    albedoCtx.fillRect(0, 0, w, h);
+  } else if (finish === 'glazed_pearl') {
+    const pearlGrad = albedoCtx.createLinearGradient(0, 0, w, h);
+    pearlGrad.addColorStop(0.0, mixHex(baseHex, '#FFFDFB', 0.12));
+    pearlGrad.addColorStop(0.36, mixHex(baseHex, secondaryHex, 0.28));
+    pearlGrad.addColorStop(0.62, mixHex(baseHex, '#FFFFFF', 0.34));
+    pearlGrad.addColorStop(1.0, mixHex(baseHex, tipHex, 0.20));
+    albedoCtx.fillStyle = pearlGrad;
+    albedoCtx.fillRect(0, 0, w, h);
+
+    // Iridescent glazed halo
+    const glaze = albedoCtx.createRadialGradient(
+      w * 0.46,
+      h * 0.40,
+      w * 0.04,
+      w * 0.50,
+      h * 0.45,
+      w * 0.56
+    );
+    glaze.addColorStop(0.0, 'rgba(255, 252, 255, 0.36)');
+    glaze.addColorStop(0.52, 'rgba(246, 238, 255, 0.14)');
+    glaze.addColorStop(1.0, 'rgba(255, 255, 255, 0)');
+    albedoCtx.fillStyle = glaze;
+    albedoCtx.fillRect(0, 0, w, h);
+  } else if (finish === 'jelly_translucent') {
+    // Natural rosy nail bed warmth near proximal cuticle transitioning into translucent gel
+    const naturalBedRose = mixHex('#E7B4AD', cuticleHex, 0.38);
+    const jellyGrad = albedoCtx.createLinearGradient(0, 0, 0, h);
+    jellyGrad.addColorStop(0.0, tipHex);
+    jellyGrad.addColorStop(0.42, baseHex);
+    jellyGrad.addColorStop(0.76, mixHex(baseHex, naturalBedRose, 0.42));
+    jellyGrad.addColorStop(1.0, naturalBedRose);
+    albedoCtx.fillStyle = jellyGrad;
+    albedoCtx.fillRect(0, 0, w, h);
+
+    // Soft milky lunula depth at cuticle root
+    const lunula = albedoCtx.createRadialGradient(
+      w * 0.5,
+      h * 0.96,
+      w * 0.04,
+      w * 0.5,
+      h * 0.94,
+      w * 0.28
+    );
+    lunula.addColorStop(0.0, 'rgba(255, 246, 242, 0.26)');
+    lunula.addColorStop(1.0, 'rgba(255, 246, 242, 0)');
+    albedoCtx.fillStyle = lunula;
+    albedoCtx.fillRect(0, h * 0.65, w, h * 0.35);
+  } else if (finish === 'cat_eye_magnetic' || gradType === 'cat_eye_diagonal') {
+    albedoCtx.fillStyle = baseHex;
+    albedoCtx.fillRect(0, 0, w, h);
+
+    // Luminous diagonal magnetic velvet band
+    const band = albedoCtx.createLinearGradient(0, h * 0.10, w, h * 0.90);
+    band.addColorStop(0.0, shadeHex(baseHex, -10));
+    band.addColorStop(0.35, mixHex(baseHex, secondaryHex, 0.44));
+    band.addColorStop(0.50, mixHex(secondaryHex, '#FFF9F2', 0.46));
+    band.addColorStop(0.65, mixHex(baseHex, secondaryHex, 0.44));
+    band.addColorStop(1.0, shadeHex(baseHex, -12));
+    albedoCtx.fillStyle = band;
+    albedoCtx.fillRect(0, 0, w, h);
+  } else {
+    // solid_gloss_gel | velvet_matte | glitter_suspension
+    // Pure rich pigment (preserves deep burgundy #5A0A1E, obsidian, etc. with zero washout!)
+    const solidGrad = albedoCtx.createLinearGradient(0, 0, 0, h);
+    solidGrad.addColorStop(0.0, shadeHex(baseHex, 3));
+    solidGrad.addColorStop(0.55, baseHex);
+    solidGrad.addColorStop(1.0, shadeHex(baseHex, -4));
+    albedoCtx.fillStyle = solidGrad;
+    albedoCtx.fillRect(0, 0, w, h);
+  }
+
+  // Apply explicit vertical_ombre or radial_aura overlays when requested
+  if (gradType === 'vertical_ombre') {
+    const ombre = albedoCtx.createLinearGradient(0, 0, 0, h);
+    ombre.addColorStop(0.0, tipHex);
+    ombre.addColorStop(0.48, baseHex);
+    ombre.addColorStop(0.90, cuticleHex);
+    ombre.addColorStop(1.0, shadeHex(cuticleHex, -5));
+    albedoCtx.fillStyle = ombre;
+    albedoCtx.fillRect(0, 0, w, h);
+  } else if (gradType === 'radial_aura') {
+    const aura = albedoCtx.createRadialGradient(
+      w * 0.5,
+      h * 0.48,
+      w * 0.04,
+      w * 0.5,
+      h * 0.48,
+      h * 0.44
+    );
+    aura.addColorStop(0.0, hexWithAlpha(secondaryHex, 0.96));
+    aura.addColorStop(0.38, hexWithAlpha(mixHex(secondaryHex, baseHex, 0.45), 0.78));
+    aura.addColorStop(0.78, hexWithAlpha(baseHex, 0.25));
+    aura.addColorStop(1.0, hexWithAlpha(baseHex, 0));
+    albedoCtx.fillStyle = aura;
+    albedoCtx.fillRect(0, 0, w, h);
+  }
+
+  // Subtle substrate warmth near proximal root ONLY when non-chrome & translucent/light (zero dark pigment wash)
+  if (finish === 'solid_gloss_gel') {
+    const [br, bg, bb] = parseHex(baseHex);
+    const luma = (0.299 * br + 0.587 * bg + 0.114 * bb) / 255;
+    if (luma > 0.50 || m.substrateType === 'natural_sheer' || m.substrateType === 'milky_jelly') {
+      const microLunula = albedoCtx.createRadialGradient(
+        w * 0.5,
+        h * 0.97,
+        w * 0.03,
+        w * 0.5,
+        h * 0.95,
+        w * 0.24
+      );
+      const strength = m.substrateType === 'natural_sheer' ? 0.20 : 0.09;
+      microLunula.addColorStop(0, `rgba(255, 245, 240, ${strength})`);
+      microLunula.addColorStop(1, 'rgba(255, 245, 240, 0)');
+      albedoCtx.fillStyle = microLunula;
+      albedoCtx.fillRect(0, h * 0.72, w, h * 0.28);
+    } else {
+      // Micro-depth at cuticle crease without lightening or muddying deep burgundy/black
+      const deepRoot = albedoCtx.createLinearGradient(0, h * 0.88, 0, h);
+      deepRoot.addColorStop(0, 'rgba(14, 4, 8, 0)');
+      deepRoot.addColorStop(1, 'rgba(14, 4, 8, 0.14)');
+      albedoCtx.fillStyle = deepRoot;
+      albedoCtx.fillRect(0, h * 0.88, w, h * 0.12);
+    }
+  }
+
+  // 2. Base Metalness & Roughness maps (256×256)
+  let baseMetalFloat = clamp01(m.metalness);
+  let baseRoughFloat = clamp(m.roughness, 0.04, 0.55);
+
+  if (finish === 'mirror_chrome') {
+    baseMetalFloat = Math.max(0.92, baseMetalFloat || 0.96);
+    baseRoughFloat = Math.min(0.08, baseRoughFloat || 0.06);
+  } else if (finish === 'glazed_pearl') {
+    baseMetalFloat = clamp(m.metalness || 0.42, 0.30, 0.65);
+    baseRoughFloat = clamp(m.roughness || 0.12, 0.07, 0.20);
+  } else if (finish === 'velvet_matte') {
+    baseMetalFloat = clamp(m.metalness || 0.02, 0, 0.10);
+    baseRoughFloat = clamp(m.roughness || 0.44, 0.36, 0.55);
+  } else if (finish === 'cat_eye_magnetic') {
+    baseMetalFloat = clamp(m.metalness || 0.45, 0.25, 0.72);
+    baseRoughFloat = clamp(m.roughness || 0.11, 0.06, 0.20);
+  }
+
+  const baseMetalByte = clampByte(baseMetalFloat * 255);
+  const baseRoughByte = clampByte(baseRoughFloat * 255);
+
+  metalCtx.fillStyle = `rgb(${baseMetalByte},${baseMetalByte},${baseMetalByte})`;
+  metalCtx.fillRect(0, 0, auxW, auxH);
+
+  roughCtx.fillStyle = `rgb(${baseRoughByte},${baseRoughByte},${baseRoughByte})`;
+  roughCtx.fillRect(0, 0, auxW, auxH);
+
+  // Elevated metalness along the diagonal magnetic band for cat_eye_magnetic
+  if (finish === 'cat_eye_magnetic' || gradType === 'cat_eye_diagonal') {
+    const bandMetal = clampByte(Math.max(baseMetalFloat, 0.88) * 255);
+    const bandMetalGrad = metalCtx.createLinearGradient(0, auxH * 0.10, auxW, auxH * 0.90);
+    bandMetalGrad.addColorStop(0.0, `rgba(${bandMetal},${bandMetal},${bandMetal},0)`);
+    bandMetalGrad.addColorStop(0.36, `rgba(${bandMetal},${bandMetal},${bandMetal},0.45)`);
+    bandMetalGrad.addColorStop(0.50, `rgba(${bandMetal},${bandMetal},${bandMetal},1.0)`);
+    bandMetalGrad.addColorStop(0.64, `rgba(${bandMetal},${bandMetal},${bandMetal},0.45)`);
+    bandMetalGrad.addColorStop(1.0, `rgba(${bandMetal},${bandMetal},${bandMetal},0)`);
+    metalCtx.fillStyle = bandMetalGrad;
+    metalCtx.fillRect(0, 0, auxW, auxH);
+
+    const bandRough = clampByte(Math.min(baseRoughFloat, 0.08) * 255);
+    const bandRoughGrad = roughCtx.createLinearGradient(0, auxH * 0.10, auxW, auxH * 0.90);
+    bandRoughGrad.addColorStop(0.0, `rgba(${bandRough},${bandRough},${bandRough},0)`);
+    bandRoughGrad.addColorStop(0.50, `rgba(${bandRough},${bandRough},${bandRough},0.92)`);
+    bandRoughGrad.addColorStop(1.0, `rgba(${bandRough},${bandRough},${bandRough},0)`);
+    roughCtx.fillStyle = bandRoughGrad;
+    roughCtx.fillRect(0, 0, auxW, auxH);
+  }
+
+  // Ultra-subtle velvety micro-grain for velvet_matte
+  if (finish === 'velvet_matte') {
+    const rng = createSeededRng(`velvet:${m.fingerId}:${baseHex}`);
+    const step = Math.max(2, Math.round(w / 128));
+    albedoCtx.save();
+    for (let y = 0; y < h; y += step) {
+      for (let x = 0; x < w; x += step) {
+        const n = rng();
+        if (n > 0.65) {
+          albedoCtx.fillStyle = 'rgba(255,255,255,0.018)';
+          albedoCtx.fillRect(x, y, 1, 1);
+        } else if (n < 0.25) {
+          albedoCtx.fillStyle = 'rgba(0,0,0,0.018)';
+          albedoCtx.fillRect(x, y, 1, 1);
+        }
+      }
+    }
+    albedoCtx.restore();
+
+    const rAuxStep = Math.max(2, Math.round(auxW / 64));
+    roughCtx.save();
+    for (let y = 0; y < auxH; y += rAuxStep) {
+      for (let x = 0; x < auxW; x += rAuxStep) {
+        const delta = Math.round((rng() - 0.5) * 18);
+        const rv = clampByte(baseRoughByte + delta);
+        roughCtx.fillStyle = `rgb(${rv},${rv},${rv})`;
+        roughCtx.fillRect(x, y, rAuxStep, rAuxStep);
+      }
+    }
+    roughCtx.restore();
+  }
+
+  // Deterministic metallic micro-glitter particles for glitter_suspension
+  if (finish === 'glitter_suspension') {
+    const rng = createSeededRng(`glitter:${m.fingerId}:${baseHex}:${secondaryHex}`);
+    const count = 135;
+    for (let i = 0; i < count; i++) {
+      const u = 0.08 + rng() * 0.84;
+      const v = 0.06 + rng() * 0.88;
+      const [gx, gy] = uvToCanvas(u, v, w, h);
+      const r = w * (0.004 + rng() * 0.009);
+      const [ax, ay] = uvToCanvas(u, v, auxW, auxH);
+      const rAux = Math.max(1.2, auxW * (0.005 + rng() * 0.01));
+      const useAlt = rng() > 0.45;
+      const flakeHex = useAlt ? mixHex(secondaryHex, '#FFFFFF', 0.55) : mixHex(baseHex, '#FFFDF5', 0.68);
+      const alpha = 0.48 + rng() * 0.48;
+
+      albedoCtx.save();
+      albedoCtx.translate(gx, gy);
+      albedoCtx.rotate(rng() * Math.PI);
+      albedoCtx.fillStyle = hexWithAlpha(flakeHex, alpha);
+      albedoCtx.beginPath();
+      if (i % 3 === 0) {
+        albedoCtx.rect(-r, -r, r * 2, r * 2);
+      } else {
+        albedoCtx.arc(0, 0, r, 0, Math.PI * 2);
+      }
+      albedoCtx.fill();
+      albedoCtx.restore();
+
+      const hPeak = clampByte(115 + rng() * 65);
+      heightCtx.fillStyle = `rgb(${hPeak},${hPeak},${hPeak})`;
+      heightCtx.beginPath();
+      heightCtx.arc(gx, gy, r * 0.9, 0, Math.PI * 2);
+      heightCtx.fill();
+
+      metalCtx.fillStyle = 'rgb(245,245,245)';
+      metalCtx.beginPath();
+      metalCtx.arc(ax, ay, rAux, 0, Math.PI * 2);
+      metalCtx.fill();
+
+      roughCtx.fillStyle = 'rgb(18,18,18)';
+      roughCtx.beginPath();
+      roughCtx.arc(ax, ay, rAux, 0, Math.PI * 2);
+      roughCtx.fill();
+    }
+  }
+}
+
+function renderManufacturingBorderLayer(
+  m: Nail3DManufacturingSpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): void {
+  if (!m.borderType || m.borderType === 'none') return;
+
+  const borderColor = m.borderColorHex || '#D4AF37';
+  const strokeW = Math.max(4, w * clamp(m.borderWidthNorm || 0.055, 0.02, 0.28));
+  const strokeWAux = Math.max(2, strokeW * (auxW / w));
+  const metalByte = m.borderIsMetallic ? 245 : 0;
+  const roughByte = m.borderIsMetallic ? 18 : 28;
+  const reliefByte = m.borderIs3DRaised ? 242 : 148;
+  const bedFraction = clamp(1 / (1 + clamp(m.freeEdgeRatio || 0.42, 0.12, 1.15)), 0.44, 0.90);
+
+  if (m.borderType === 'full_perimeter_outline') {
+    albedoCtx.save();
+    albedoCtx.lineJoin = 'round';
+    albedoCtx.lineCap = 'round';
+    traceBorderSilhouetteUV(
+      albedoCtx,
+      m.shape,
+      m.tipRoundness,
+      bedFraction,
+      undefined,
+      w,
+      h,
+      0.89
+    );
+    if (m.borderIs3DRaised) {
+      albedoCtx.strokeStyle = 'rgba(22, 10, 8, 0.34)';
+      albedoCtx.lineWidth = strokeW * 1.38;
+      albedoCtx.stroke();
+    }
+    albedoCtx.strokeStyle = borderColor;
+    albedoCtx.lineWidth = strokeW;
+    albedoCtx.stroke();
+
+    if (m.borderIsMetallic) {
+      albedoCtx.strokeStyle = mixHex(borderColor, '#FFF8DF', 0.58, 0.72);
+      albedoCtx.lineWidth = strokeW * 0.34;
+      albedoCtx.stroke();
+    }
+    albedoCtx.restore();
+
+    if (m.borderIs3DRaised) {
+      heightCtx.save();
+      heightCtx.lineJoin = 'round';
+      heightCtx.lineCap = 'round';
+      traceBorderSilhouetteUV(
+        heightCtx,
+        m.shape,
+        m.tipRoundness,
+        bedFraction,
+        undefined,
+        w,
+        h,
+        0.89
+      );
+      heightCtx.strokeStyle = `rgb(${reliefByte},${reliefByte},${reliefByte})`;
+      heightCtx.lineWidth = strokeW * 1.06;
+      heightCtx.stroke();
+      heightCtx.strokeStyle = 'rgb(255,255,255)';
+      heightCtx.lineWidth = strokeW * 0.42;
+      heightCtx.stroke();
+      heightCtx.restore();
+    }
+
+    metalCtx.save();
+    metalCtx.lineJoin = 'round';
+    metalCtx.lineCap = 'round';
+    traceBorderSilhouetteUV(
+      metalCtx,
+      m.shape,
+      m.tipRoundness,
+      bedFraction,
+      undefined,
+      auxW,
+      auxH,
+      0.89
+    );
+    metalCtx.strokeStyle = `rgb(${metalByte},${metalByte},${metalByte})`;
+    metalCtx.lineWidth = strokeWAux * 1.05;
+    metalCtx.stroke();
+    metalCtx.restore();
+
+    roughCtx.save();
+    roughCtx.lineJoin = 'round';
+    roughCtx.lineCap = 'round';
+    traceBorderSilhouetteUV(
+      roughCtx,
+      m.shape,
+      m.tipRoundness,
+      bedFraction,
+      undefined,
+      auxW,
+      auxH,
+      0.89
+    );
+    roughCtx.strokeStyle = `rgb(${roughByte},${roughByte},${roughByte})`;
+    roughCtx.lineWidth = strokeWAux * 1.05;
+    roughCtx.stroke();
+    roughCtx.restore();
+    return;
+  }
+
+  if (m.borderType === 'cuticle_cuff') {
+    const drawCuff = (ctx: CanvasCtx2D, cw: number, ch: number) => {
+      const yBase = ch * 0.935;
+      const dip = ch * 0.055;
+      ctx.beginPath();
+      ctx.moveTo(cw * 0.14, yBase - dip * 0.85);
+      ctx.quadraticCurveTo(cw * 0.50, yBase + dip, cw * 0.86, yBase - dip * 0.85);
+    };
+
+    albedoCtx.save();
+    albedoCtx.lineCap = 'round';
+    drawCuff(albedoCtx, w, h);
+    if (m.borderIs3DRaised) {
+      albedoCtx.strokeStyle = 'rgba(22, 10, 8, 0.28)';
+      albedoCtx.lineWidth = strokeW * 1.32;
+      albedoCtx.stroke();
+    }
+    albedoCtx.strokeStyle = borderColor;
+    albedoCtx.lineWidth = strokeW;
+    albedoCtx.stroke();
+    if (m.borderIsMetallic) {
+      albedoCtx.strokeStyle = mixHex(borderColor, '#FFF8DF', 0.58, 0.74);
+      albedoCtx.lineWidth = strokeW * 0.34;
+      albedoCtx.stroke();
+    }
+    albedoCtx.restore();
+
+    if (m.borderIs3DRaised) {
+      heightCtx.save();
+      heightCtx.lineCap = 'round';
+      drawCuff(heightCtx, w, h);
+      heightCtx.strokeStyle = `rgb(${reliefByte},${reliefByte},${reliefByte})`;
+      heightCtx.lineWidth = strokeW;
+      heightCtx.stroke();
+      heightCtx.restore();
+    }
+
+    metalCtx.save();
+    metalCtx.lineCap = 'round';
+    drawCuff(metalCtx, auxW, auxH);
+    metalCtx.strokeStyle = `rgb(${metalByte},${metalByte},${metalByte})`;
+    metalCtx.lineWidth = strokeWAux;
+    metalCtx.stroke();
+    metalCtx.restore();
+
+    roughCtx.save();
+    roughCtx.lineCap = 'round';
+    drawCuff(roughCtx, auxW, auxH);
+    roughCtx.strokeStyle = `rgb(${roughByte},${roughByte},${roughByte})`;
+    roughCtx.lineWidth = strokeWAux;
+    roughCtx.stroke();
+    roughCtx.restore();
+    return;
+  }
+
+  // French tips: classic_french | micro_french | deep_v_french
+  const tipDepth =
+    m.borderType === 'micro_french'
+      ? clamp(m.borderWidthNorm || 0.065, 0.035, 0.11)
+      : m.borderType === 'deep_v_french'
+        ? clamp(m.borderWidthNorm || 0.22, 0.14, 0.32)
+        : clamp(m.borderWidthNorm || 0.17, 0.10, 0.28);
+
+  const smileDepth =
+    m.borderType === 'micro_french'
+      ? 0.085
+      : m.borderType === 'deep_v_french'
+        ? 0.24
+        : 0.15;
+
+  const traceFrenchTip = (ctx: CanvasCtx2D, cw: number, ch: number) => {
+    const tipY = ch * tipDepth;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(cw, 0);
+    if (m.borderType === 'deep_v_french') {
+      ctx.lineTo(cw, tipY * 0.42);
+      ctx.quadraticCurveTo(cw * 0.72, tipY * 0.85, cw * 0.5, tipY + ch * smileDepth * 0.48);
+      ctx.quadraticCurveTo(cw * 0.28, tipY * 0.85, 0, tipY * 0.42);
+    } else {
+      ctx.lineTo(cw, tipY + ch * smileDepth * 0.46);
+      ctx.quadraticCurveTo(
+        cw * 0.5,
+        tipY - ch * smileDepth * 0.58,
+        0,
+        tipY + ch * smileDepth * 0.46
+      );
+    }
+    ctx.closePath();
+  };
+
+  albedoCtx.save();
+  traceFrenchTip(albedoCtx, w, h);
+  const fGrad = albedoCtx.createLinearGradient(0, 0, w, h * tipDepth);
+  fGrad.addColorStop(0.0, shadeHex(borderColor, -6));
+  fGrad.addColorStop(0.5, borderColor);
+  fGrad.addColorStop(1.0, shadeHex(borderColor, -6));
+  albedoCtx.fillStyle = fGrad;
+  albedoCtx.fill();
+
+  if (m.borderIsMetallic) {
+    albedoCtx.strokeStyle = mixHex(borderColor, '#FFF8DF', 0.45, 0.78);
+    albedoCtx.lineWidth = Math.max(2, w * 0.014);
+    albedoCtx.stroke();
+  }
+  albedoCtx.restore();
+
+  if (m.borderIs3DRaised) {
+    heightCtx.save();
+    traceFrenchTip(heightCtx, w, h);
+    const hVal = 196;
+    heightCtx.fillStyle = `rgb(${hVal},${hVal},${hVal})`;
+    heightCtx.fill();
+    heightCtx.restore();
+  }
+
+  metalCtx.save();
+  traceFrenchTip(metalCtx, auxW, auxH);
+  metalCtx.fillStyle = `rgb(${metalByte},${metalByte},${metalByte})`;
+  metalCtx.fill();
+  metalCtx.restore();
+
+  roughCtx.save();
+  traceFrenchTip(roughCtx, auxW, auxH);
+  roughCtx.fillStyle = `rgb(${roughByte},${roughByte},${roughByte})`;
+  roughCtx.fill();
+  roughCtx.restore();
+}
+
+function renderManufacturingStroke3D(
+  stroke: Nail3DStrokeSpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): void {
+  const [x0, y0] = uvToCanvas(stroke.p0[0], stroke.p0[1], w, h);
+  const [cx1, cy1] = uvToCanvas(stroke.c1[0], stroke.c1[1], w, h);
+  const [cx2, cy2] = uvToCanvas(stroke.c2[0], stroke.c2[1], w, h);
+  const [x1, y1] = uvToCanvas(stroke.p1[0], stroke.p1[1], w, h);
+
+  const [ax0, ay0] = uvToCanvas(stroke.p0[0], stroke.p0[1], auxW, auxH);
+  const [acx1, acy1] = uvToCanvas(stroke.c1[0], stroke.c1[1], auxW, auxH);
+  const [acx2, acy2] = uvToCanvas(stroke.c2[0], stroke.c2[1], auxW, auxH);
+  const [ax1, ay1] = uvToCanvas(stroke.p1[0], stroke.p1[1], auxW, auxH);
+
+  const lineW = Math.max(2.5, clamp(stroke.widthNorm, 0.01, 0.16) * w);
+  const lineWAux = Math.max(1.5, clamp(stroke.widthNorm, 0.01, 0.16) * auxW);
+  const relief = clamp01(stroke.reliefHeight ?? 0.75);
+  const colorHex = stroke.colorHex || '#D4AF37';
+  const highlightHex = stroke.isMetallic
+    ? mixHex(colorHex, '#FFF9E3', 0.56)
+    : mixHex(colorHex, '#FFFFFF', 0.34);
+
+  const traceBezier = (ctx: CanvasCtx2D, ox = 0, oy = 0) => {
+    ctx.beginPath();
+    ctx.moveTo(x0 + ox, y0 + oy);
+    ctx.bezierCurveTo(cx1 + ox, cy1 + oy, cx2 + ox, cy2 + oy, x1 + ox, y1 + oy);
+  };
+
+  // 1. Albedo volumetric shading
+  albedoCtx.save();
+  albedoCtx.lineCap = 'round';
+  albedoCtx.lineJoin = 'round';
+
+  // Soft contact AO shadow beneath raised gel/metal stroke
+  if (relief > 0.15) {
+    traceBezier(albedoCtx, 0, lineW * 0.15);
+    albedoCtx.strokeStyle = `rgba(24, 10, 8, ${(0.18 + relief * 0.16).toFixed(2)})`;
+    albedoCtx.lineWidth = lineW * 1.24;
+    albedoCtx.stroke();
+  }
+
+  // Dark sculptural bevel rim
+  traceBezier(albedoCtx);
+  albedoCtx.strokeStyle = shadeHex(colorHex, stroke.isMetallic ? -34 : -22);
+  albedoCtx.lineWidth = lineW * 1.06;
+  albedoCtx.stroke();
+
+  // Main body gradient along Bézier chord
+  const grad = albedoCtx.createLinearGradient(x0, y0, x1, y1);
+  grad.addColorStop(0.0, shadeHex(colorHex, -14));
+  grad.addColorStop(0.38, colorHex);
+  grad.addColorStop(0.56, highlightHex);
+  grad.addColorStop(0.82, colorHex);
+  grad.addColorStop(1.0, shadeHex(colorHex, -18));
+  albedoCtx.strokeStyle = grad;
+  albedoCtx.lineWidth = lineW * 0.90;
+  albedoCtx.stroke();
+
+  // Cylindrical specular crest ridge
+  traceBezier(albedoCtx, -lineW * 0.05, -lineW * 0.07);
+  albedoCtx.strokeStyle = mixHex(highlightHex, '#FFFFFF', 0.45, stroke.isMetallic ? 0.80 : 0.46);
+  albedoCtx.lineWidth = Math.max(1.2, lineW * 0.26);
+  albedoCtx.stroke();
+  albedoCtx.restore();
+
+  // 2. Cylindrical height ridge in heightCanvas (for Sobel normalMap)
+  if (relief > 0.04) {
+    const midH = clampByte(106 + relief * 95);
+    const peakH = clampByte(115 + relief * 140);
+    heightCtx.save();
+    heightCtx.lineCap = 'round';
+    heightCtx.lineJoin = 'round';
+    traceBezier(heightCtx);
+    heightCtx.strokeStyle = `rgb(${midH},${midH},${midH})`;
+    heightCtx.lineWidth = lineW * 1.05;
+    heightCtx.stroke();
+    heightCtx.strokeStyle = `rgb(${peakH},${peakH},${peakH})`;
+    heightCtx.lineWidth = lineW * 0.46;
+    heightCtx.stroke();
+    heightCtx.restore();
+  }
+
+  // 3. Surgical metalness & roughness over stroke (256×256)
+  const metalVal = stroke.isMetallic
+    ? clampByte(clamp(stroke.metalness || 0.95, 0.7, 1.0) * 255)
+    : clampByte(clamp01(stroke.metalness || 0) * 255);
+  const roughVal = stroke.isMetallic ? 18 : 26;
+
+  metalCtx.save();
+  metalCtx.lineCap = 'round';
+  metalCtx.lineJoin = 'round';
+  metalCtx.beginPath();
+  metalCtx.moveTo(ax0, ay0);
+  metalCtx.bezierCurveTo(acx1, acy1, acx2, acy2, ax1, ay1);
+  metalCtx.strokeStyle = `rgb(${metalVal},${metalVal},${metalVal})`;
+  metalCtx.lineWidth = lineWAux * 1.04;
+  metalCtx.stroke();
+  metalCtx.restore();
+
+  roughCtx.save();
+  roughCtx.lineCap = 'round';
+  roughCtx.lineJoin = 'round';
+  roughCtx.beginPath();
+  roughCtx.moveTo(ax0, ay0);
+  roughCtx.bezierCurveTo(acx1, acy1, acx2, acy2, ax1, ay1);
+  roughCtx.strokeStyle = `rgb(${roughVal},${roughVal},${roughVal})`;
+  roughCtx.lineWidth = lineWAux * 1.04;
+  roughCtx.stroke();
+  roughCtx.restore();
+}
+
+function drawRoundedPetal(
+  ctx: CanvasCtx2D,
+  angleRad: number,
+  offsetDist: number,
+  lenR: number,
+  widthR: number
+): void {
+  ctx.save();
+  ctx.rotate(angleRad);
+  ctx.translate(offsetDist, 0);
+  ctx.beginPath();
+  ctx.moveTo(-lenR * 0.42, 0);
+  ctx.bezierCurveTo(-lenR * 0.20, -widthR, lenR * 0.48, -widthR * 0.92, lenR * 0.62, 0);
+  ctx.bezierCurveTo(lenR * 0.48, widthR * 0.92, -lenR * 0.20, widthR, -lenR * 0.42, 0);
+  ctx.closePath();
+  ctx.restore();
+}
+
+function drawHeartPath(ctx: CanvasCtx2D, r: number): void {
+  ctx.beginPath();
+  ctx.moveTo(0, r * 0.78);
+  ctx.bezierCurveTo(-r * 0.95, r * 0.25, -r * 1.05, -r * 0.55, -r * 0.45, -r * 0.78);
+  ctx.bezierCurveTo(-r * 0.15, -r * 0.90, 0, -r * 0.55, 0, -r * 0.36);
+  ctx.bezierCurveTo(0, -r * 0.55, r * 0.15, -r * 0.90, r * 0.45, -r * 0.78);
+  ctx.bezierCurveTo(r * 1.05, -r * 0.55, r * 0.95, r * 0.25, 0, r * 0.78);
+  ctx.closePath();
+}
+
+function drawStar4PtPath(ctx: CanvasCtx2D, r: number): void {
+  const inner = r * 0.24;
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.quadraticCurveTo(inner * 0.6, -inner * 0.6, r, 0);
+  ctx.quadraticCurveTo(inner * 0.6, inner * 0.6, 0, r);
+  ctx.quadraticCurveTo(-inner * 0.6, inner * 0.6, -r, 0);
+  ctx.quadraticCurveTo(-inner * 0.6, -inner * 0.6, 0, -r);
+  ctx.closePath();
+}
+
+function renderManufacturingMotif(
+  motif: Nail3DMotifSpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): void {
+  const [cx, cy] = uvToCanvas(motif.center[0], motif.center[1], w, h);
+  const [ax, ay] = uvToCanvas(motif.center[0], motif.center[1], auxW, auxH);
+  const r = Math.max(6, clamp(motif.scale || 0.18, 0.05, 0.65) * w);
+  const rAux = Math.max(3, clamp(motif.scale || 0.18, 0.05, 0.65) * auxW);
+  const rot = ((motif.rotationDeg || 0) * Math.PI) / 180;
+  const alpha = clamp(motif.opacity ?? 1, 0.05, 1.0);
+  const primary = motif.primaryColorHex || '#FFF8F4';
+  const secondary = motif.secondaryColorHex || shadeHex(primary, -24);
+  const centerDot = motif.centerDotColorHex || '#D4AF37';
+  const raised = Boolean(motif.is3DRaised);
+  const reliefVal = raised ? 236 : 122;
+
+  const drawFlower = (petalCount: number) => {
+    const petalLen = r * 0.56;
+    const petalWid = petalCount === 4 ? r * 0.32 : r * 0.27;
+    const offset = r * 0.44;
+
+    const paintPetals = (
+      ctx: CanvasCtx2D,
+      px: number,
+      py: number,
+      pr: number,
+      pLen: number,
+      pWid: number,
+      pOff: number,
+      mode: 'albedo' | 'height'
+    ) => {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(rot);
+      if (mode === 'albedo') ctx.globalAlpha = alpha;
+
+      for (let i = 0; i < petalCount; i++) {
+        const theta = (i * Math.PI * 2) / petalCount;
+        ctx.save();
+        ctx.rotate(theta);
+        ctx.translate(pOff, 0);
+
+        if (mode === 'albedo' && raised) {
+          ctx.beginPath();
+          ctx.ellipse(pLen * 0.08, pLen * 0.08, pLen * 0.56, pWid * 1.05, 0, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(20, 8, 6, 0.20)';
+          ctx.fill();
+        }
+
+        ctx.beginPath();
+        ctx.moveTo(-pLen * 0.44, 0);
+        ctx.bezierCurveTo(-pLen * 0.18, -pWid, pLen * 0.48, -pWid * 0.90, pLen * 0.64, 0);
+        ctx.bezierCurveTo(pLen * 0.48, pWid * 0.90, -pLen * 0.18, pWid, -pLen * 0.44, 0);
+        ctx.closePath();
+
+        if (mode === 'albedo') {
+          const g = ctx.createRadialGradient(-pLen * 0.12, 0, pLen * 0.06, pLen * 0.10, 0, pLen * 0.65);
+          g.addColorStop(0.0, mixHex(primary, secondary, 0.25));
+          g.addColorStop(0.55, primary);
+          g.addColorStop(1.0, mixHex(primary, '#FFFFFF', 0.28));
+          ctx.fillStyle = g;
+          ctx.fill();
+          ctx.strokeStyle = shadeHex(secondary, -16, 0.42);
+          ctx.lineWidth = Math.max(1, pr * 0.035);
+          ctx.stroke();
+        } else {
+          const hg = ctx.createRadialGradient(pLen * 0.06, 0, 1, pLen * 0.06, 0, pLen * 0.68);
+          hg.addColorStop(0.0, `rgb(${reliefVal},${reliefVal},${reliefVal})`);
+          hg.addColorStop(1.0, 'rgb(110,110,110)');
+          ctx.fillStyle = hg;
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      // Center pistil dot
+      const dotR = Math.max(2, pr * 0.18);
+      if (mode === 'albedo') {
+        const dg = ctx.createRadialGradient(-dotR * 0.3, -dotR * 0.3, 0.5, 0, 0, dotR);
+        dg.addColorStop(0.0, mixHex(centerDot, '#FFFFFF', 0.55));
+        dg.addColorStop(0.6, centerDot);
+        dg.addColorStop(1.0, shadeHex(centerDot, -32));
+        ctx.fillStyle = dg;
+        ctx.beginPath();
+        ctx.arc(0, 0, dotR, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = 'rgb(248,248,248)';
+        ctx.beginPath();
+        ctx.arc(0, 0, dotR, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    };
+
+    paintPetals(albedoCtx, cx, cy, r, petalLen, petalWid, offset, 'albedo');
+    if (raised) {
+      paintPetals(heightCtx, cx, cy, r, petalLen, petalWid, offset, 'height');
+    }
+  };
+
+  if (motif.kind === 'flower_5petal') {
+    drawFlower(5);
+    return;
+  }
+
+  if (motif.kind === 'flower_4petal') {
+    drawFlower(4);
+    return;
+  }
+
+  if (motif.kind === 'cherry') {
+    const berryR = r * 0.28;
+    const leftX = -r * 0.34;
+    const rightX = r * 0.30;
+    const berryY = r * 0.34;
+    const stemTopX = r * 0.04;
+    const stemTopY = -r * 0.62;
+
+    const paintCherry = (ctx: CanvasCtx2D, px: number, py: number, mode: 'albedo' | 'height') => {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(rot);
+      if (mode === 'albedo') ctx.globalAlpha = alpha;
+
+      // Stems
+      ctx.beginPath();
+      ctx.moveTo(leftX, berryY - berryR * 0.65);
+      ctx.quadraticCurveTo(-r * 0.18, -r * 0.16, stemTopX, stemTopY);
+      ctx.moveTo(rightX, berryY - berryR * 0.65);
+      ctx.quadraticCurveTo(r * 0.20, -r * 0.14, stemTopX, stemTopY);
+      ctx.strokeStyle = mode === 'albedo' ? '#3B6E3A' : 'rgb(142,142,142)';
+      ctx.lineWidth = Math.max(1.5, r * 0.055);
+      ctx.lineCap = 'round';
+      ctx.stroke();
+
+      // Leaf
+      ctx.beginPath();
+      ctx.moveTo(stemTopX, stemTopY);
+      ctx.quadraticCurveTo(stemTopX + r * 0.38, stemTopY - r * 0.16, stemTopX + r * 0.44, stemTopY + r * 0.14);
+      ctx.quadraticCurveTo(stemTopX + r * 0.18, stemTopY + r * 0.22, stemTopX, stemTopY);
+      ctx.fillStyle = mode === 'albedo' ? '#4C8B48' : 'rgb(154,154,154)';
+      ctx.fill();
+
+      // Two glossy cherries
+      for (const bx of [leftX, rightX]) {
+        if (mode === 'albedo') {
+          ctx.fillStyle = 'rgba(20, 6, 8, 0.24)';
+          ctx.beginPath();
+          ctx.arc(bx + berryR * 0.10, berryY + berryR * 0.14, berryR * 1.06, 0, Math.PI * 2);
+          ctx.fill();
+
+          const bg = ctx.createRadialGradient(
+            bx - berryR * 0.32,
+            berryY - berryR * 0.32,
+            berryR * 0.08,
+            bx,
+            berryY,
+            berryR
+          );
+          bg.addColorStop(0.0, mixHex(primary, '#FFFFFF', 0.35));
+          bg.addColorStop(0.55, primary);
+          bg.addColorStop(1.0, shadeHex(secondary, -25));
+          ctx.fillStyle = bg;
+          ctx.beginPath();
+          ctx.arc(bx, berryY, berryR, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.beginPath();
+          ctx.ellipse(bx - berryR * 0.32, berryY - berryR * 0.32, berryR * 0.24, berryR * 0.13, -0.6, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          const hg = ctx.createRadialGradient(bx, berryY, 1, bx, berryY, berryR);
+          hg.addColorStop(0.0, `rgb(${reliefVal},${reliefVal},${reliefVal})`);
+          hg.addColorStop(1.0, 'rgb(108,108,108)');
+          ctx.fillStyle = hg;
+          ctx.beginPath();
+          ctx.arc(bx, berryY, berryR, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    };
+
+    paintCherry(albedoCtx, cx, cy, 'albedo');
+    if (raised) paintCherry(heightCtx, cx, cy, 'height');
+    return;
+  }
+
+  if (motif.kind === 'heart') {
+    albedoCtx.save();
+    albedoCtx.translate(cx, cy);
+    albedoCtx.rotate(rot);
+    albedoCtx.globalAlpha = alpha;
+    drawHeartPath(albedoCtx, r * 0.72);
+    const hg = albedoCtx.createRadialGradient(-r * 0.18, -r * 0.18, r * 0.05, 0, 0, r * 0.8);
+    hg.addColorStop(0.0, mixHex(primary, '#FFFFFF', 0.28));
+    hg.addColorStop(0.65, primary);
+    hg.addColorStop(1.0, secondary);
+    albedoCtx.fillStyle = hg;
+    albedoCtx.fill();
+    albedoCtx.strokeStyle = shadeHex(secondary, -14, 0.45);
+    albedoCtx.lineWidth = Math.max(1, r * 0.04);
+    albedoCtx.stroke();
+    albedoCtx.restore();
+
+    if (raised) {
+      heightCtx.save();
+      heightCtx.translate(cx, cy);
+      heightCtx.rotate(rot);
+      drawHeartPath(heightCtx, r * 0.72);
+      heightCtx.fillStyle = `rgb(${reliefVal},${reliefVal},${reliefVal})`;
+      heightCtx.fill();
+      heightCtx.restore();
+    }
+    return;
+  }
+
+  if (motif.kind === 'star_4pt') {
+    const drawStar = (ctx: CanvasCtx2D, px: number, py: number, pr: number, fill: string) => {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(rot);
+      drawStar4PtPath(ctx, pr * 0.88);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.restore();
+    };
+
+    albedoCtx.save();
+    albedoCtx.globalAlpha = alpha;
+    drawStar(albedoCtx, cx + r * 0.04, cy + r * 0.05, r, 'rgba(20, 10, 6, 0.25)');
+    albedoCtx.translate(cx, cy);
+    albedoCtx.rotate(rot);
+    drawStar4PtPath(albedoCtx, r * 0.88);
+    const sg = albedoCtx.createRadialGradient(0, 0, 1, 0, 0, r * 0.85);
+    sg.addColorStop(0.0, mixHex(primary, '#FFFFFF', 0.65));
+    sg.addColorStop(0.55, primary);
+    sg.addColorStop(1.0, secondary);
+    albedoCtx.fillStyle = sg;
+    albedoCtx.fill();
+    albedoCtx.restore();
+
+    if (raised) {
+      drawStar(heightCtx, cx, cy, r, `rgb(${reliefVal},${reliefVal},${reliefVal})`);
+    }
+    // Starbursts are typically metallic/chrome
+    drawStar(metalCtx, ax, ay, rAux, 'rgb(240,240,240)');
+    drawStar(roughCtx, ax, ay, rAux, 'rgb(20,20,20)');
+    return;
+  }
+
+  if (motif.kind === 'bow_3d') {
+    const drawBow = (ctx: CanvasCtx2D, px: number, py: number, pr: number, mode: 'albedo' | 'height') => {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(rot);
+      if (mode === 'albedo') ctx.globalAlpha = alpha;
+
+      // Two drooping ribbons
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * pr * 0.08, pr * 0.08);
+        ctx.quadraticCurveTo(side * pr * 0.34, pr * 0.45, side * pr * 0.50, pr * 0.82);
+        ctx.lineTo(side * pr * 0.30, pr * 0.78);
+        ctx.quadraticCurveTo(side * pr * 0.16, pr * 0.44, side * pr * 0.03, pr * 0.12);
+        ctx.closePath();
+        ctx.fillStyle = mode === 'albedo' ? shadeHex(primary, -12) : 'rgb(184,184,184)';
+        ctx.fill();
+      }
+
+      // Left & right sculpted bow loops
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.bezierCurveTo(
+          side * pr * 0.36,
+          -pr * 0.56,
+          side * pr * 0.96,
+          -pr * 0.38,
+          side * pr * 0.86,
+          0
+        );
+        ctx.bezierCurveTo(
+          side * pr * 0.94,
+          pr * 0.38,
+          side * pr * 0.36,
+          pr * 0.48,
+          0,
+          0
+        );
+        ctx.closePath();
+        if (mode === 'albedo') {
+          const lg = ctx.createLinearGradient(0, -pr * 0.38, side * pr * 0.86, pr * 0.32);
+          lg.addColorStop(0.0, mixHex(primary, '#FFFFFF', 0.38));
+          lg.addColorStop(0.6, primary);
+          lg.addColorStop(1.0, secondary);
+          ctx.fillStyle = lg;
+          ctx.fill();
+          ctx.strokeStyle = shadeHex(secondary, -22, 0.45);
+          ctx.lineWidth = Math.max(1, pr * 0.04);
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = `rgb(${reliefVal},${reliefVal},${reliefVal})`;
+          ctx.fill();
+        }
+      }
+
+      // Center knot
+      ctx.beginPath();
+      ctx.ellipse(0, 0, pr * 0.18, pr * 0.15, 0, 0, Math.PI * 2);
+      ctx.fillStyle = mode === 'albedo' ? centerDot : 'rgb(252,252,252)';
+      ctx.fill();
+      ctx.restore();
+    };
+
+    drawBow(albedoCtx, cx, cy, r, 'albedo');
+    if (raised) drawBow(heightCtx, cx, cy, r, 'height');
+    return;
+  }
+
+  if (motif.kind === 'marble_veins') {
+    const rng = createSeededRng(`marble:${motif.center[0]}:${motif.center[1]}:${primary}`);
+    albedoCtx.save();
+    albedoCtx.translate(cx, cy);
+    albedoCtx.rotate(rot);
+    albedoCtx.globalAlpha = alpha;
+    albedoCtx.lineCap = 'round';
+
+    for (let i = 0; i < 4; i++) {
+      const sy = (i - 1.5) * r * 0.38;
+      albedoCtx.beginPath();
+      albedoCtx.moveTo(-r * 0.92, sy + (rng() - 0.5) * r * 0.25);
+      albedoCtx.bezierCurveTo(
+        -r * 0.3,
+        sy + (rng() - 0.5) * r * 0.5,
+        r * 0.3,
+        sy + (rng() - 0.5) * r * 0.5,
+        r * 0.92,
+        sy + (rng() - 0.5) * r * 0.3
+      );
+      albedoCtx.strokeStyle = i % 2 === 0 ? hexWithAlpha(primary, 0.72) : hexWithAlpha(secondary, 0.54);
+      albedoCtx.lineWidth = Math.max(1.2, r * (0.04 + rng() * 0.04));
+      albedoCtx.stroke();
+    }
+    albedoCtx.restore();
+    return;
+  }
+
+  if (motif.kind === 'tortoiseshell_spots') {
+    const rng = createSeededRng(`tortoise:${motif.center[0]}:${motif.center[1]}:${primary}`);
+    albedoCtx.save();
+    albedoCtx.translate(cx, cy);
+    albedoCtx.rotate(rot);
+    albedoCtx.globalAlpha = alpha;
+    for (let i = 0; i < 6; i++) {
+      const ang = (i / 6) * Math.PI * 2 + rng() * 0.5;
+      const dist = r * (0.15 + rng() * 0.52);
+      const sx = Math.cos(ang) * dist;
+      const sy = Math.sin(ang) * dist;
+      const rx = r * (0.16 + rng() * 0.16);
+      const ry = r * (0.11 + rng() * 0.14);
+      albedoCtx.beginPath();
+      albedoCtx.ellipse(sx, sy, rx, ry, rng() * Math.PI, 0, Math.PI * 2);
+      albedoCtx.fillStyle = i % 2 === 0 ? primary : secondary;
+      albedoCtx.fill();
+    }
+    albedoCtx.restore();
+    return;
+  }
+
+  if (motif.kind === 'aura_bloom') {
+    albedoCtx.save();
+    albedoCtx.globalAlpha = alpha;
+    const bloom = albedoCtx.createRadialGradient(cx, cy, r * 0.05, cx, cy, r);
+    bloom.addColorStop(0.0, hexWithAlpha(primary, 0.92));
+    bloom.addColorStop(0.50, hexWithAlpha(secondary, 0.48));
+    bloom.addColorStop(1.0, hexWithAlpha(secondary, 0));
+    albedoCtx.fillStyle = bloom;
+    albedoCtx.beginPath();
+    albedoCtx.arc(cx, cy, r, 0, Math.PI * 2);
+    albedoCtx.fill();
+    albedoCtx.restore();
+    return;
+  }
+
+  // abstract_organic
+  albedoCtx.save();
+  albedoCtx.translate(cx, cy);
+  albedoCtx.rotate(rot);
+  albedoCtx.globalAlpha = alpha;
+  albedoCtx.beginPath();
+  for (let i = 0; i <= 12; i++) {
+    const t = (i / 12) * Math.PI * 2;
+    const rad = r * (0.58 + 0.24 * Math.sin(t * 3 + 0.7) + 0.12 * Math.cos(t * 2));
+    const px = Math.cos(t) * rad;
+    const py = Math.sin(t) * rad * 0.78;
+    if (i === 0) albedoCtx.moveTo(px, py);
+    else albedoCtx.lineTo(px, py);
+  }
+  albedoCtx.closePath();
+  const og = albedoCtx.createRadialGradient(-r * 0.15, -r * 0.15, r * 0.05, 0, 0, r * 0.9);
+  og.addColorStop(0.0, mixHex(primary, '#FFFFFF', 0.28));
+  og.addColorStop(0.65, primary);
+  og.addColorStop(1.0, secondary);
+  albedoCtx.fillStyle = og;
+  albedoCtx.fill();
+  albedoCtx.restore();
+
+  if (raised) {
+    heightCtx.save();
+    heightCtx.translate(cx, cy);
+    heightCtx.rotate(rot);
+    heightCtx.beginPath();
+    for (let i = 0; i <= 12; i++) {
+      const t = (i / 12) * Math.PI * 2;
+      const rad = r * (0.58 + 0.24 * Math.sin(t * 3 + 0.7) + 0.12 * Math.cos(t * 2));
+      const px = Math.cos(t) * rad;
+      const py = Math.sin(t) * rad * 0.78;
+      if (i === 0) heightCtx.moveTo(px, py);
+      else heightCtx.lineTo(px, py);
+    }
+    heightCtx.closePath();
+    heightCtx.fillStyle = `rgb(${reliefVal},${reliefVal},${reliefVal})`;
+    heightCtx.fill();
+    heightCtx.restore();
+  }
+
+  void drawRoundedPetal;
+}
+
+/**
+ * 5. Contact AO & Bezel Rings Under True 3D Accessories:
+ * The 3D accessories themselves are rendered as real `InstancedMesh` / `Mesh` geometry!
+ * On the 512×512 albedoMap, we ONLY paint a crisp contact AO ring (radius = acc.radiusNorm * 0.56)
+ * plus a subtle metallic seating bezel if `acc.hasBezelRing`.
+ */
+function renderAccessoryContactAO(
+  acc: Nail3DAccessorySpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): void {
+  const [px, py] = uvToCanvas(acc.u, acc.v, w, h);
+  const contactR = Math.max(2.5, acc.radiusNorm * 0.56 * w);
+  const [pxA, pyA] = uvToCanvas(acc.u, acc.v, auxW, auxH);
+  const contactRAux = Math.max(1.5, acc.radiusNorm * 0.56 * auxW);
+
+  albedoCtx.save();
+  // Soft physical contact ambient occlusion beneath the seated 3D piece
+  const aoGrad = albedoCtx.createRadialGradient(
+    px,
+    py,
+    contactR * 0.25,
+    px,
+    py,
+    contactR * 1.48
+  );
+  aoGrad.addColorStop(0.0, 'rgba(18, 8, 10, 0.44)');
+  aoGrad.addColorStop(0.62, 'rgba(22, 10, 12, 0.28)');
+  aoGrad.addColorStop(1.0, 'rgba(22, 10, 12, 0)');
+  albedoCtx.fillStyle = aoGrad;
+  albedoCtx.beginPath();
+  albedoCtx.arc(px, py, contactR * 1.48, 0, Math.PI * 2);
+  albedoCtx.fill();
+
+  // Optional fine metallic bezel seating ring on plate
+  if (acc.hasBezelRing) {
+    const bezelHex =
+      acc.kind === 'pearl_dome' || acc.kind === 'rhinestone'
+        ? '#D8BA73'
+        : acc.colorHex || '#D4AF37';
+    albedoCtx.strokeStyle = mixHex(bezelHex, '#FFF7DF', 0.25, 0.88);
+    albedoCtx.lineWidth = Math.max(1.5, contactR * 0.22);
+    albedoCtx.beginPath();
+    albedoCtx.arc(px, py, contactR * 1.02, 0, Math.PI * 2);
+    albedoCtx.stroke();
+  }
+  albedoCtx.restore();
+
+  if (acc.hasBezelRing) {
+    heightCtx.save();
+    heightCtx.strokeStyle = 'rgb(176,176,176)';
+    heightCtx.lineWidth = Math.max(1.5, contactR * 0.22);
+    heightCtx.beginPath();
+    heightCtx.arc(px, py, contactR * 1.02, 0, Math.PI * 2);
+    heightCtx.stroke();
+    heightCtx.restore();
+
+    metalCtx.save();
+    metalCtx.strokeStyle = 'rgb(240,240,240)';
+    metalCtx.lineWidth = Math.max(1.2, contactRAux * 0.24);
+    metalCtx.beginPath();
+    metalCtx.arc(pxA, pyA, contactRAux * 1.02, 0, Math.PI * 2);
+    metalCtx.stroke();
+    metalCtx.restore();
+
+    roughCtx.save();
+    roughCtx.strokeStyle = 'rgb(22,22,22)';
+    roughCtx.lineWidth = Math.max(1.2, contactRAux * 0.24);
+    roughCtx.beginPath();
+    roughCtx.arc(pxA, pyA, contactRAux * 1.02, 0, Math.PI * 2);
+    roughCtx.stroke();
+    roughCtx.restore();
+  }
+}
+
+function paintManufacturingLayers(
+  m: Nail3DManufacturingSpec,
+  albedoCtx: CanvasCtx2D,
+  heightCtx: CanvasCtx2D,
+  metalCtx: CanvasCtx2D,
+  roughCtx: CanvasCtx2D,
+  w: number,
+  h: number,
+  auxW: number,
+  auxH: number
+): boolean {
+  heightCtx.fillStyle = 'rgb(100,100,100)';
+  heightCtx.fillRect(0, 0, w, h);
+
+  // 1. Optical Base
+  renderManufacturingBaseLayer(
+    m,
+    albedoCtx,
+    heightCtx,
+    metalCtx,
+    roughCtx,
+    w,
+    h,
+    auxW,
+    auxH
+  );
+
+  // 2. Borders & French tips
+  renderManufacturingBorderLayer(
+    m,
+    albedoCtx,
+    heightCtx,
+    metalCtx,
+    roughCtx,
+    w,
+    h,
+    auxW,
+    auxH
+  );
+
+  // 3. Motifs (10 clean vector types)
+  for (const motif of m.motifs ?? []) {
+    renderManufacturingMotif(
+      motif,
+      albedoCtx,
+      heightCtx,
+      metalCtx,
+      roughCtx,
+      w,
+      h,
+      auxW,
+      auxH
+    );
+  }
+
+  // 4. Sculpted 3D cubic Bézier strokes
+  for (const stroke of m.strokes3D ?? []) {
+    renderManufacturingStroke3D(
+      stroke,
+      albedoCtx,
+      heightCtx,
+      metalCtx,
+      roughCtx,
+      w,
+      h,
+      auxW,
+      auxH
+    );
+  }
+
+  // 5. Micro contact AO rings under true 3D accessories
+  for (const acc of m.accessories3D ?? []) {
+    renderAccessoryContactAO(
+      acc,
+      albedoCtx,
+      heightCtx,
+      metalCtx,
+      roughCtx,
+      w,
+      h,
+      auxW,
+      auxH
+    );
+  }
+
+  const hasRaisedRelief =
+    m.borderIs3DRaised ||
+    (m.strokes3D?.some((s) => s.reliefHeight > 0.15) ?? false) ||
+    (m.motifs?.some((mt) => mt.is3DRaised) ?? false) ||
+    m.finishType === 'glitter_suspension';
+
+  return hasRaisedRelief;
+}
+
+// =============================================================================
+// V10 Fallback Blueprint Compiler (`NailDesignBlueprint`)
+// =============================================================================
 
 function renderBaseLayer(
   bp: NailDesignBlueprint,
@@ -198,7 +1619,6 @@ function renderBaseLayer(
     glossiness,
   } = bp.baseLayer;
 
-  // 1. Albedo Base Gradient
   if (gradientMode === 'vertical_ombre') {
     const grad = albedoCtx.createLinearGradient(0, 0, 0, h);
     grad.addColorStop(0.0, tipColorHex);
@@ -237,22 +1657,21 @@ function renderBaseLayer(
     albedoCtx.fillRect(0, 0, w, h);
   } else if (gradientMode === 'pearl_chrome') {
     const pearl = albedoCtx.createLinearGradient(0, 0, w, h);
-    pearl.addColorStop(0.0, shadeHex(baseColorHex, -8));
-    pearl.addColorStop(0.30, mixHex(baseColorHex, '#FFFFFF', 0.35));
-    pearl.addColorStop(0.52, mixHex(midColorHex, '#FFFFFF', 0.52));
-    pearl.addColorStop(0.76, mixHex(baseColorHex, tipColorHex, 0.40));
-    pearl.addColorStop(1.0, shadeHex(baseColorHex, -10));
+    pearl.addColorStop(0.0, mixHex(baseColorHex, '#FFFFFF', 0.08));
+    pearl.addColorStop(0.30, mixHex(baseColorHex, '#FFFFFF', 0.24));
+    pearl.addColorStop(0.52, mixHex(midColorHex, '#FFFFFF', 0.34));
+    pearl.addColorStop(0.76, mixHex(baseColorHex, tipColorHex, 0.30));
+    pearl.addColorStop(1.0, mixHex(baseColorHex, '#FFFFFF', 0.06));
     albedoCtx.fillStyle = pearl;
     albedoCtx.fillRect(0, 0, w, h);
 
     const sheen = albedoCtx.createRadialGradient(w * 0.44, h * 0.38, w * 0.03, w * 0.5, h * 0.44, w * 0.6);
-    sheen.addColorStop(0.0, 'rgba(255,255,255,0.42)');
-    sheen.addColorStop(0.55, 'rgba(255,248,242,0.14)');
+    sheen.addColorStop(0.0, 'rgba(255,255,255,0.28)');
+    sheen.addColorStop(0.55, 'rgba(255,248,242,0.10)');
     sheen.addColorStop(1.0, 'rgba(255,255,255,0)');
     albedoCtx.fillStyle = sheen;
     albedoCtx.fillRect(0, 0, w, h);
   } else {
-    // 'solid' — preserves exact deep colors (e.g. #5A0A1E burgundy, black) with zero brown washout!
     const solidGrad = albedoCtx.createLinearGradient(0, 0, 0, h);
     solidGrad.addColorStop(0.0, shadeHex(baseColorHex, 4));
     solidGrad.addColorStop(0.55, baseColorHex);
@@ -261,8 +1680,6 @@ function renderBaseLayer(
     albedoCtx.fillRect(0, 0, w, h);
   }
 
-  // Organic subsurface lunula warmth near proximal cuticle ONLY for light/translucent finishes
-  // (never wash deep colors like #5A0A1E or #141414!)
   const [br, bg, bb] = parseHex(baseColorHex);
   const baseLuma = (0.299 * br + 0.587 * bg + 0.114 * bb) / 255;
   const lunulaStrength =
@@ -286,7 +1703,6 @@ function renderBaseLayer(
     albedoCtx.fillRect(0, h * 0.68, w, h * 0.32);
   }
 
-  // 2. Base Metalness & Roughness maps (256×256)
   const baseMetalByte =
     finishStyle === 'chrome_mirror'
       ? 235
@@ -332,13 +1748,22 @@ function renderBorderLayer(
   const metalByte = border.isMetallic ? 245 : 0;
   const roughByte = border.isMetallic ? 20 : 32;
   const reliefByte = border.is3DRaised ? 242 : 158;
+  const bedFraction = clamp(1 / (1 + clamp(bp.geometry.freeEdgeRatio || 0.42, 0.12, 1.15)), 0.44, 0.90);
 
   if (border.kind === 'full_metallic_outline') {
-    // Contact shadow beneath raised border
     albedoCtx.save();
     albedoCtx.lineJoin = 'round';
     albedoCtx.lineCap = 'round';
-    traceBorderSilhouetteUV(albedoCtx, bp, w, h, 0.89);
+    traceBorderSilhouetteUV(
+      albedoCtx,
+      bp.geometry.shape,
+      bp.geometry.tipRoundness,
+      bedFraction,
+      bp.geometry.profileHalfWidths,
+      w,
+      h,
+      0.89
+    );
     albedoCtx.strokeStyle = 'rgba(24, 12, 8, 0.34)';
     albedoCtx.lineWidth = strokeW * 1.38;
     albedoCtx.stroke();
@@ -355,7 +1780,16 @@ function renderBorderLayer(
     heightCtx.save();
     heightCtx.lineJoin = 'round';
     heightCtx.lineCap = 'round';
-    traceBorderSilhouetteUV(heightCtx, bp, w, h, 0.89);
+    traceBorderSilhouetteUV(
+      heightCtx,
+      bp.geometry.shape,
+      bp.geometry.tipRoundness,
+      bedFraction,
+      bp.geometry.profileHalfWidths,
+      w,
+      h,
+      0.89
+    );
     heightCtx.strokeStyle = `rgb(${reliefByte},${reliefByte},${reliefByte})`;
     heightCtx.lineWidth = strokeW * 1.05;
     heightCtx.stroke();
@@ -367,7 +1801,16 @@ function renderBorderLayer(
     metalCtx.save();
     metalCtx.lineJoin = 'round';
     metalCtx.lineCap = 'round';
-    traceBorderSilhouetteUV(metalCtx, bp, auxW, auxH, 0.89);
+    traceBorderSilhouetteUV(
+      metalCtx,
+      bp.geometry.shape,
+      bp.geometry.tipRoundness,
+      bedFraction,
+      bp.geometry.profileHalfWidths,
+      auxW,
+      auxH,
+      0.89
+    );
     metalCtx.strokeStyle = `rgb(${metalByte},${metalByte},${metalByte})`;
     metalCtx.lineWidth = strokeWAux * 1.05;
     metalCtx.stroke();
@@ -376,7 +1819,16 @@ function renderBorderLayer(
     roughCtx.save();
     roughCtx.lineJoin = 'round';
     roughCtx.lineCap = 'round';
-    traceBorderSilhouetteUV(roughCtx, bp, auxW, auxH, 0.89);
+    traceBorderSilhouetteUV(
+      roughCtx,
+      bp.geometry.shape,
+      bp.geometry.tipRoundness,
+      bedFraction,
+      bp.geometry.profileHalfWidths,
+      auxW,
+      auxH,
+      0.89
+    );
     roughCtx.strokeStyle = `rgb(${roughByte},${roughByte},${roughByte})`;
     roughCtx.lineWidth = strokeWAux * 1.05;
     roughCtx.stroke();
@@ -385,8 +1837,6 @@ function renderBorderLayer(
   }
 
   if (border.kind === 'cuticle_cuff') {
-    const cuffY = h * (1 - 0.06);
-    const cuffCurve = h * clamp(border.smileCurveDepth, 0.05, 0.25) * 0.35;
     const drawCuff = (ctx: CanvasCtx2D, cw: number, ch: number) => {
       const yBase = ch * 0.94;
       const dip = ch * clamp(border.smileCurveDepth, 0.05, 0.25) * 0.35;
@@ -432,12 +1882,9 @@ function renderBorderLayer(
     roughCtx.lineWidth = strokeWAux;
     roughCtx.stroke();
     roughCtx.restore();
-    void cuffY;
-    void cuffCurve;
     return;
   }
 
-  // French tip variants: 'classic_french' | 'micro_french' | 'v_french'
   const tipDepth =
     border.kind === 'micro_french'
       ? clamp(border.thicknessNorm, 0.04, 0.11)
@@ -549,25 +1996,21 @@ function renderRibbonStroke(
     return { x, y };
   });
 
-  // 1. Albedo volumetric metallic/pigment ribbon (shadow -> dark rim -> body -> specular ridge)
   albedoCtx.save();
   albedoCtx.lineCap = 'round';
   albedoCtx.lineJoin = 'round';
 
-  // Soft contact shadow below ribbon
   const shadowPts = pts.map((p) => ({ x: p.x, y: p.y + lineW * 0.14 }));
   traceSmoothCatmullRom(albedoCtx, shadowPts);
   albedoCtx.strokeStyle = 'rgba(26, 12, 8, 0.28)';
   albedoCtx.lineWidth = lineW * 1.26;
   albedoCtx.stroke();
 
-  // Dark metallic/sculpted outer contour
   traceSmoothCatmullRom(albedoCtx, pts);
   albedoCtx.strokeStyle = shadeHex(el.colorHex, -34);
   albedoCtx.lineWidth = lineW * 1.06;
   albedoCtx.stroke();
 
-  // Main ribbon body gradient
   const pFirst = pts[0];
   const pLast = pts[pts.length - 1];
   const bodyGrad = albedoCtx.createLinearGradient(pFirst.x, pFirst.y, pLast.x, pLast.y);
@@ -580,7 +2023,6 @@ function renderRibbonStroke(
   albedoCtx.lineWidth = lineW * 0.90;
   albedoCtx.stroke();
 
-  // Crisp crest highlight along cylindrical dome
   const ridgePts = pts.map((p) => ({ x: p.x - lineW * 0.05, y: p.y - lineW * 0.08 }));
   traceSmoothCatmullRom(albedoCtx, ridgePts);
   albedoCtx.strokeStyle = mixHex(el.highlightHex, '#FFFFFF', 0.45, 0.78);
@@ -588,7 +2030,6 @@ function renderRibbonStroke(
   albedoCtx.stroke();
   albedoCtx.restore();
 
-  // 2. Cylindrical dome height profile in heightCanvas (512×512)
   const peakH = clampByte(115 + el.reliefHeight * 140);
   const midH = clampByte(108 + el.reliefHeight * 95);
   heightCtx.save();
@@ -603,7 +2044,6 @@ function renderRibbonStroke(
   heightCtx.stroke();
   heightCtx.restore();
 
-  // 3. Surgical metalness & roughness over ribbon (256×256)
   if (el.isMetallic) {
     metalCtx.save();
     metalCtx.lineCap = 'round';
@@ -702,7 +2142,6 @@ function renderOrganicMotif(
   albedoCtx.stroke();
   albedoCtx.restore();
 
-  // Sculpted dome height in heightCanvas
   const hPeak = clampByte(115 + el.reliefHeight * 125);
   heightCtx.save();
   traceSmoothClosedPolygon(heightCtx, pts);
@@ -745,7 +2184,6 @@ function renderMicroGem(
   const rA = Math.max(2, el.radius * auxW);
 
   albedoCtx.save();
-  // Contact AO shadow
   albedoCtx.fillStyle = 'rgba(22, 10, 8, 0.34)';
   albedoCtx.beginPath();
   albedoCtx.arc(px + r * 0.10, py + r * 0.14, r * 1.12, 0, Math.PI * 2);
@@ -780,14 +2218,12 @@ function renderMicroGem(
   albedoCtx.arc(px, py, r, 0, Math.PI * 2);
   albedoCtx.fill();
 
-  // Sharp studio specular pinpoint
   albedoCtx.fillStyle = 'rgba(255,255,255,0.88)';
   albedoCtx.beginPath();
   albedoCtx.arc(px - r * 0.30, py - r * 0.30, Math.max(1.2, r * 0.22), 0, Math.PI * 2);
   albedoCtx.fill();
   albedoCtx.restore();
 
-  // Hemispherical dome in heightCanvas
   heightCtx.save();
   const hGrad = heightCtx.createRadialGradient(px, py, 0.5, px, py, r);
   hGrad.addColorStop(0.0, 'rgb(255,255,255)');
@@ -826,7 +2262,7 @@ function paintBlueprintOntoMaps(
   h: number,
   auxW: number,
   auxH: number
-): void {
+): boolean {
   heightCtx.fillStyle = 'rgb(100,100,100)';
   heightCtx.fillRect(0, 0, w, h);
 
@@ -848,6 +2284,8 @@ function paintBlueprintOntoMaps(
       renderMicroGem(el, albedoCtx, heightCtx, metalCtx, roughCtx, w, h, auxW, auxH);
     }
   }
+
+  return bp.borderLayer.is3DRaised || bp.artElements.length > 0;
 }
 
 /**
@@ -909,11 +2347,12 @@ function buildFastSobelNormalMap(
 }
 
 /**
- * V10 Lean Clean Vector PBR Compiler (`< 15ms/finger`, ~12 MB total VRAM across all 5 fingers):
- * - Compiles 100% vectorially from `NailDesignBlueprint` (ZERO raw photo pixels, ZERO `displacementMap`, ZERO `bumpMap`).
+ * V11 Lean Clean Vector PBR Compiler (`< 15ms/finger`, ~12 MB total VRAM across all 5 fingers):
+ * - Compiles directly from `spec.manufacturingSpec` (V11) or falls back cleanly to `spec.blueprint` (V10).
+ * - ZERO raw photo pixels, ZERO `displacementMap`, ZERO `bumpMap`.
  * - `map` (`512×512`) & Sobel `normalMap` (`512×512`) for razor-sharp 3D curves & relief.
  * - `roughnessMap` (`256×256`), `metalnessMap` (`256×256`), and `alphaMap` (`256×256` pure opaque on 96%,
- *   soft cuticle feathering strictly on `v ∈ [0, 0.04]`) for 4× lower VRAM footprint.
+ *   soft cuticle feathering strictly on `v ∈ [0, 0.04]`).
  */
 export function synthesizeCleanPBRBundle(
   spec: NailFingerDesignSpec
@@ -922,32 +2361,40 @@ export function synthesizeCleanPBRBundle(
   const cached = pbrBundleCache.get(specHash);
   if (cached) return cached;
 
-  const bp = resolveBlueprint(spec);
-
   const { canvas: albedoCanvas, ctx: albedoCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
   const { ctx: heightCtx } = makeSurface(ALBEDO_SIZE, ALBEDO_SIZE);
   const { canvas: metalCanvas, ctx: metalCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
   const { canvas: roughCanvas, ctx: roughCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
 
-  paintBlueprintOntoMaps(
-    bp,
-    albedoCtx,
-    heightCtx,
-    metalCtx,
-    roughCtx,
-    ALBEDO_SIZE,
-    ALBEDO_SIZE,
-    AUX_SIZE,
-    AUX_SIZE
-  );
+  const hasRaisedRelief = spec.manufacturingSpec
+    ? paintManufacturingLayers(
+        spec.manufacturingSpec,
+        albedoCtx,
+        heightCtx,
+        metalCtx,
+        roughCtx,
+        ALBEDO_SIZE,
+        ALBEDO_SIZE,
+        AUX_SIZE,
+        AUX_SIZE
+      )
+    : paintBlueprintOntoMaps(
+        resolveBlueprint(spec),
+        albedoCtx,
+        heightCtx,
+        metalCtx,
+        roughCtx,
+        ALBEDO_SIZE,
+        ALBEDO_SIZE,
+        AUX_SIZE,
+        AUX_SIZE
+      );
 
   const heightPixels = heightCtx.getImageData(0, 0, ALBEDO_SIZE, ALBEDO_SIZE).data;
   const { canvas: normalCanvas, ctx: normalCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
   const normalData = normalCtx.createImageData(ALBEDO_SIZE, ALBEDO_SIZE);
 
-  const hasRaisedRelief =
-    bp.borderLayer.is3DRaised || bp.artElements.length > 0;
-  const normalStrength = hasRaisedRelief ? 4.4 : 2.2;
+  const normalStrength = hasRaisedRelief ? 4.4 : 2.0;
   buildFastSobelNormalMap(heightPixels, ALBEDO_SIZE, ALBEDO_SIZE, normalStrength, normalData);
   normalCtx.putImageData(normalData, 0, 0);
 
@@ -1017,7 +2464,12 @@ export const synthesizeProceduralPBRBundle = synthesizeCleanPBRBundle;
 
 function traceAnatomicalSwatchClip(
   ctx: CanvasRenderingContext2D,
-  bp: NailDesignBlueprint,
+  shape: NailShape,
+  tipRoundness: number,
+  bedFraction: number,
+  profileHalfWidths:
+    | [number, number, number, number, number, number, number, number]
+    | undefined,
   outW: number,
   outH: number
 ): { padX: number; padY: number; topY: number; bottomY: number } {
@@ -1031,35 +2483,33 @@ function traceAnatomicalSwatchClip(
 
   const steps = 32;
   ctx.beginPath();
-  // Left boundary from cuticle (v=0) up to tip (v=1)
   for (let i = 0; i <= steps; i++) {
     const v = i / steps;
-    const hw = evalNailHalfWidth(v, bp.geometry.shape, {
-      bedFraction: 0.55,
-      tipRoundness: bp.geometry.tipRoundness,
-      profileHalfWidths: bp.geometry.profileHalfWidths,
+    const hw = evalNailHalfWidth(v, shape, {
+      bedFraction,
+      tipRoundness,
+      profileHalfWidths,
     });
     const x = cx - hw * w * 0.98;
     const y = bottomY - v * h;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
-  // Right boundary from tip (v=1) back down to cuticle (v=0)
   for (let i = steps; i >= 0; i--) {
     const v = i / steps;
-    const hw = evalNailHalfWidth(v, bp.geometry.shape, {
-      bedFraction: 0.55,
-      tipRoundness: bp.geometry.tipRoundness,
-      profileHalfWidths: bp.geometry.profileHalfWidths,
+    const hw = evalNailHalfWidth(v, shape, {
+      bedFraction,
+      tipRoundness,
+      profileHalfWidths,
     });
     const x = cx + hw * w * 0.98;
     const y = bottomY - v * h;
     ctx.lineTo(x, y);
   }
-  // Smooth rounded proximal cuticle base curve
-  const hw0 = evalNailHalfWidth(0, bp.geometry.shape, {
-    bedFraction: 0.55,
-    profileHalfWidths: bp.geometry.profileHalfWidths,
+  const hw0 = evalNailHalfWidth(0, shape, {
+    bedFraction,
+    tipRoundness,
+    profileHalfWidths,
   });
   ctx.quadraticCurveTo(cx, bottomY + h * 0.055, cx - hw0 * w * 0.98, bottomY);
   ctx.closePath();
@@ -1076,24 +2526,21 @@ function applyStudioSwatchLighting(
   bottomY: number,
   isVelvet: boolean
 ): void {
-  // Cylindrical C-curve sidewall shading
   const cyl = ctx.createLinearGradient(padX, 0, outW - padX, 0);
-  cyl.addColorStop(0.0, 'rgba(16, 8, 10, 0.30)');
+  cyl.addColorStop(0.0, 'rgba(16, 8, 10, 0.28)');
   cyl.addColorStop(0.22, 'rgba(255, 255, 255, 0.06)');
   cyl.addColorStop(0.78, 'rgba(255, 255, 255, 0.02)');
-  cyl.addColorStop(1.0, 'rgba(16, 8, 10, 0.32)');
+  cyl.addColorStop(1.0, 'rgba(16, 8, 10, 0.30)');
   ctx.fillStyle = cyl;
   ctx.fillRect(0, 0, outW, outH);
 
-  // Subtle cuticle base depth
   const rootShade = ctx.createLinearGradient(0, bottomY - outH * 0.16, 0, bottomY);
   rootShade.addColorStop(0, 'rgba(20, 8, 10, 0)');
-  rootShade.addColorStop(1, 'rgba(20, 8, 10, 0.22)');
+  rootShade.addColorStop(1, 'rgba(20, 8, 10, 0.20)');
   ctx.fillStyle = rootShade;
   ctx.fillRect(0, bottomY - outH * 0.16, outW, outH * 0.18);
 
-  // Studio gel catchlight reflection
-  const peakAlpha = isVelvet ? 0.16 : 0.48;
+  const peakAlpha = isVelvet ? 0.14 : 0.46;
   const gloss = ctx.createLinearGradient(outW * 0.28, topY, outW * 0.52, bottomY * 0.72);
   gloss.addColorStop(0.0, `rgba(255,255,255,${peakAlpha})`);
   gloss.addColorStop(0.45, `rgba(255,255,255,${peakAlpha * 0.22})`);
@@ -1104,9 +2551,51 @@ function applyStudioSwatchLighting(
   ctx.fill();
 }
 
+function drawSwatchAccessoriesPreview(
+  accessories: Nail3DAccessorySpec[],
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number
+): void {
+  for (const acc of accessories) {
+    const [px, py] = uvToCanvas(acc.u, acc.v, w, h);
+    const r = Math.max(2.5, acc.radiusNorm * w * 0.65);
+    ctx.save();
+    ctx.fillStyle = 'rgba(18, 8, 10, 0.32)';
+    ctx.beginPath();
+    ctx.arc(px + r * 0.12, py + r * 0.16, r * 1.15, 0, Math.PI * 2);
+    ctx.fill();
+
+    const grad = ctx.createRadialGradient(px - r * 0.3, py - r * 0.3, r * 0.08, px, py, r);
+    if (acc.kind === 'pearl_dome') {
+      grad.addColorStop(0.0, '#FFFFFF');
+      grad.addColorStop(0.55, acc.colorHex || '#F9F4EE');
+      grad.addColorStop(1.0, '#BFB0A8');
+    } else if (acc.kind === 'rhinestone' || acc.kind === '3d_drop_clear') {
+      grad.addColorStop(0.0, '#FFFFFF');
+      grad.addColorStop(0.45, mixHex(acc.colorHex || '#E8F4FF', '#FFFFFF', 0.45));
+      grad.addColorStop(1.0, '#A5B8CC');
+    } else {
+      grad.addColorStop(0.0, '#FFFDF2');
+      grad.addColorStop(0.45, acc.colorHex || '#D4AF37');
+      grad.addColorStop(1.0, shadeHex(acc.colorHex || '#D4AF37', -42));
+    }
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    ctx.beginPath();
+    ctx.arc(px - r * 0.28, py - r * 0.28, Math.max(1, r * 0.22), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
 /**
- * Renders a crisp 100% vector nail preview onto an `HTMLCanvasElement` directly from the
- * `NailDesignBlueprint` with anatomical `profileHalfWidths` silhouette & studio gel lighting
+ * Renders a crisp 100% vector nail preview onto an `HTMLCanvasElement` directly from
+ * `Nail3DManufacturingSpec` (V11) or `NailDesignBlueprint` (V10 fallback)
  * (ZERO raw photo pixels).
  */
 export function renderBlueprintNailCanvas(
@@ -1114,7 +2603,6 @@ export function renderBlueprintNailCanvas(
   width = 180,
   height = 260
 ): HTMLCanvasElement {
-  const bp = resolveBlueprint(spec);
   const { canvas, ctx } = makeTextureSurface(width, height);
   const { ctx: dummyHeight } = makeSurface(width, height);
   const { ctx: dummyMetal } = makeSurface(width, height);
@@ -1122,8 +2610,61 @@ export function renderBlueprintNailCanvas(
 
   ctx.clearRect(0, 0, width, height);
 
+  if (spec.manufacturingSpec) {
+    const m = spec.manufacturingSpec;
+    const bedFraction = clamp(1 / (1 + clamp(m.freeEdgeRatio || 0.42, 0.12, 1.15)), 0.44, 0.90);
+    ctx.save();
+    const { padX, topY, bottomY } = traceAnatomicalSwatchClip(
+      ctx,
+      m.shape,
+      m.tipRoundness,
+      bedFraction,
+      undefined,
+      width,
+      height
+    );
+    ctx.clip();
+
+    paintManufacturingLayers(
+      m,
+      ctx,
+      dummyHeight,
+      dummyMetal,
+      dummyRough,
+      width,
+      height,
+      width,
+      height
+    );
+    if (m.accessories3D?.length) {
+      drawSwatchAccessoriesPreview(m.accessories3D, ctx, width, height);
+    }
+    applyStudioSwatchLighting(
+      ctx,
+      width,
+      height,
+      padX,
+      topY,
+      bottomY,
+      m.finishType === 'velvet_matte'
+    );
+    ctx.restore();
+    return canvas;
+  }
+
+  const bp = resolveBlueprint(spec);
+  const bedFraction = clamp(1 / (1 + clamp(bp.geometry.freeEdgeRatio || 0.42, 0.12, 1.15)), 0.44, 0.90);
+
   ctx.save();
-  const { padX, topY, bottomY } = traceAnatomicalSwatchClip(ctx, bp, width, height);
+  const { padX, topY, bottomY } = traceAnatomicalSwatchClip(
+    ctx,
+    bp.geometry.shape,
+    bp.geometry.tipRoundness,
+    bedFraction,
+    bp.geometry.profileHalfWidths,
+    width,
+    height
+  );
   ctx.clip();
 
   paintBlueprintOntoMaps(bp, ctx, dummyHeight, dummyMetal, dummyRough, width, height, width, height);
@@ -1152,3 +2693,4 @@ export function renderProceduralNailSwatchDataUrl(
   const canvas = renderBlueprintNailCanvas(spec, outW, outH);
   return canvas.toDataURL('image/png', 0.92);
 }
+

@@ -1,24 +1,37 @@
-import type {
-  FingerId,
-  MicroGemElement,
-  NailBaseLayer,
-  NailBorderKind,
-  NailBorderLayer,
-  NailCategory,
-  NailDesign,
-  NailDesignBlueprint,
-  NailFingerDesignSpec,
-  NailFingerSpecsMap,
-  NailFinish,
-  NailFinishV10,
-  NailGeometryProfile,
-  NailGradientMode,
-  NailPatternType,
-  NailShape,
-  NailStyleType,
-  OrganicMotifElement,
-  RibbonStrokeElement,
-  VectorArtElement,
+import {
+  attachV11SerializationEnvelope,
+  type FingerId,
+  type HandSide,
+  type MicroGemElement,
+  type Nail3DAccessoryKind,
+  type Nail3DAccessorySpec,
+  type Nail3DBorderType,
+  type Nail3DFinishType,
+  type Nail3DGradientType,
+  type Nail3DManufacturingSpec,
+  type Nail3DMotifKind,
+  type Nail3DMotifSpec,
+  type Nail3DStrokeSpec,
+  type Nail3DSubstrateType,
+  type NailBaseLayer,
+  type NailBorderKind,
+  type NailBorderLayer,
+  type NailCategory,
+  type NailDesign,
+  type NailDesignBlueprint,
+  type NailFingerDesignSpec,
+  type NailFingerSpecsMap,
+  type NailFinish,
+  type NailFinishV10,
+  type NailGeometryProfile,
+  type NailGradientMode,
+  type NailHandSpecsBySide,
+  type NailPatternType,
+  type NailShape,
+  type NailStyleType,
+  type OrganicMotifElement,
+  type RibbonStrokeElement,
+  type VectorArtElement,
 } from '../entities/NailDesign.js';
 
 export const VALID_NAIL_CATEGORIES: readonly NailCategory[] = [
@@ -71,6 +84,8 @@ export const VALID_FINGER_IDS: readonly FingerId[] = [
   'pinky',
 ] as const;
 
+export const VALID_HAND_SIDES: readonly HandSide[] = ['Left', 'Right'] as const;
+
 export const VALID_NAIL_FINISHES_V10: readonly NailFinishV10[] = [
   'glossy_gel',
   'jelly_translucent',
@@ -103,6 +118,62 @@ export const VALID_MICRO_GEM_KINDS: readonly MicroGemElement['kind'][] = [
   'crystal',
 ] as const;
 
+export const VALID_V11_ACCESSORY_KINDS: readonly Nail3DAccessoryKind[] = [
+  'metal_stud_sphere',
+  'metal_stud_flat',
+  'pearl_dome',
+  'rhinestone',
+  'caviar_bead',
+  '3d_drop_clear',
+] as const;
+
+export const VALID_V11_MOTIF_KINDS: readonly Nail3DMotifKind[] = [
+  'flower_5petal',
+  'flower_4petal',
+  'cherry',
+  'heart',
+  'star_4pt',
+  'bow_3d',
+  'marble_veins',
+  'tortoiseshell_spots',
+  'aura_bloom',
+  'abstract_organic',
+] as const;
+
+export const VALID_V11_SUBSTRATE_TYPES: readonly Nail3DSubstrateType[] = [
+  'natural_sheer',
+  'builder_gel_nude',
+  'milky_jelly',
+  'opaque_gel_polish',
+] as const;
+
+export const VALID_V11_FINISH_TYPES: readonly Nail3DFinishType[] = [
+  'mirror_chrome',
+  'glazed_pearl',
+  'solid_gloss_gel',
+  'jelly_translucent',
+  'cat_eye_magnetic',
+  'velvet_matte',
+  'glitter_suspension',
+] as const;
+
+export const VALID_V11_GRADIENT_TYPES: readonly Nail3DGradientType[] = [
+  'none',
+  'vertical_ombre',
+  'radial_aura',
+  'cat_eye_diagonal',
+  'chrome_sheen',
+] as const;
+
+export const VALID_V11_BORDER_TYPES: readonly Nail3DBorderType[] = [
+  'none',
+  'full_perimeter_outline',
+  'cuticle_cuff',
+  'classic_french',
+  'micro_french',
+  'deep_v_french',
+] as const;
+
 export interface NailDesignDTO {
   id: string;
   name: string;
@@ -121,7 +192,9 @@ export interface NailDesignDTO {
   isStudioCatalog: boolean;
   detectedShape: NailShape | null;
   detectedLength: number | null;
+  fidelityScore?: number | null;
   fingerSpecs: NailFingerSpecsMap | null;
+  handSpecsBySide?: NailHandSpecsBySide | null;
   createdAt: string;
 }
 
@@ -143,7 +216,9 @@ export interface CreateNailDesignDTO {
   isStudioCatalog?: boolean;
   detectedShape?: NailShape | null;
   detectedLength?: number | null;
+  fidelityScore?: number | null;
   fingerSpecs?: NailFingerSpecsMap | null;
+  handSpecsBySide?: NailHandSpecsBySide | null;
 }
 
 export interface UpdateNailDesignDTO {
@@ -163,7 +238,9 @@ export interface UpdateNailDesignDTO {
   isStudioCatalog?: boolean;
   detectedShape?: NailShape | null;
   detectedLength?: number | null;
+  fidelityScore?: number | null;
   fingerSpecs?: NailFingerSpecsMap | null;
+  handSpecsBySide?: NailHandSpecsBySide | null;
 }
 
 export type NailDesignValidationResult<T> =
@@ -514,11 +591,553 @@ function validateAndSanitizeBlueprint(
   };
 }
 
+function normalizeHexColor(value: string): string {
+  const trimmed = value.trim();
+  if (/^#[0-9A-Fa-f]{3}$/.test(trimmed)) {
+    const [, r, g, b] = trimmed;
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return trimmed.slice(0, 7).toUpperCase();
+}
+
+function validateAndSanitizeManufacturingSpec(
+  rawSpec: unknown,
+  fingerKey: string,
+  errors: string[]
+): Nail3DManufacturingSpec | undefined {
+  if (rawSpec === undefined) {
+    return undefined;
+  }
+  if (!rawSpec || typeof rawSpec !== 'object' || Array.isArray(rawSpec)) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec deve ser um objeto JSON válido.`);
+    return undefined;
+  }
+
+  const s = rawSpec as Record<string, unknown>;
+
+  const shape: NailShape = isValidNailShape(s.shape) ? s.shape : 'almond';
+  if (s.shape !== undefined && !isValidNailShape(s.shape)) {
+    errors.push(
+      `fingerSpecs.${fingerKey}.manufacturingSpec.shape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+    );
+    return undefined;
+  }
+
+  const finishType: Nail3DFinishType =
+    typeof s.finishType === 'string' &&
+    (VALID_V11_FINISH_TYPES as readonly string[]).includes(s.finishType)
+      ? (s.finishType as Nail3DFinishType)
+      : 'solid_gloss_gel';
+  if (
+    s.finishType !== undefined &&
+    (typeof s.finishType !== 'string' ||
+      !(VALID_V11_FINISH_TYPES as readonly string[]).includes(s.finishType))
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.finishType inválido.`);
+    return undefined;
+  }
+
+  const substrateType: Nail3DSubstrateType =
+    typeof s.substrateType === 'string' &&
+    (VALID_V11_SUBSTRATE_TYPES as readonly string[]).includes(s.substrateType)
+      ? (s.substrateType as Nail3DSubstrateType)
+      : 'opaque_gel_polish';
+  if (
+    s.substrateType !== undefined &&
+    (typeof s.substrateType !== 'string' ||
+      !(VALID_V11_SUBSTRATE_TYPES as readonly string[]).includes(s.substrateType))
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.substrateType inválido.`);
+    return undefined;
+  }
+
+  const gradientType: Nail3DGradientType =
+    typeof s.gradientType === 'string' &&
+    (VALID_V11_GRADIENT_TYPES as readonly string[]).includes(s.gradientType)
+      ? (s.gradientType as Nail3DGradientType)
+      : 'none';
+  if (
+    s.gradientType !== undefined &&
+    (typeof s.gradientType !== 'string' ||
+      !(VALID_V11_GRADIENT_TYPES as readonly string[]).includes(s.gradientType))
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.gradientType inválido.`);
+    return undefined;
+  }
+
+  const borderType: Nail3DBorderType =
+    typeof s.borderType === 'string' &&
+    (VALID_V11_BORDER_TYPES as readonly string[]).includes(s.borderType)
+      ? (s.borderType as Nail3DBorderType)
+      : 'none';
+  if (
+    s.borderType !== undefined &&
+    (typeof s.borderType !== 'string' ||
+      !(VALID_V11_BORDER_TYPES as readonly string[]).includes(s.borderType))
+  ) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.borderType inválido.`);
+    return undefined;
+  }
+
+  const trueBaseColorHex = isValidHexColor(s.trueBaseColorHex)
+    ? normalizeHexColor(s.trueBaseColorHex)
+    : '#D4B483';
+  if (s.trueBaseColorHex !== undefined && !isValidHexColor(s.trueBaseColorHex)) {
+    errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.trueBaseColorHex inválido.`);
+    return undefined;
+  }
+
+  const secondaryColorHex = isValidHexColor(s.secondaryColorHex)
+    ? normalizeHexColor(s.secondaryColorHex)
+    : trueBaseColorHex;
+  const cuticleColorHex = isValidHexColor(s.cuticleColorHex)
+    ? normalizeHexColor(s.cuticleColorHex)
+    : trueBaseColorHex;
+  const tipColorHex = isValidHexColor(s.tipColorHex)
+    ? normalizeHexColor(s.tipColorHex)
+    : secondaryColorHex;
+  const borderColorHex = isValidHexColor(s.borderColorHex)
+    ? normalizeHexColor(s.borderColorHex)
+    : '#FFFFFF';
+
+  const accessories3D: Nail3DAccessorySpec[] = [];
+  if (Array.isArray(s.accessories3D)) {
+    if (s.accessories3D.length > 24) {
+      errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.accessories3D excede limite de 24.`);
+      return undefined;
+    }
+    for (let i = 0; i < s.accessories3D.length; i++) {
+      const a = s.accessories3D[i] as Record<string, unknown> | null;
+      if (!a || typeof a !== 'object' || Array.isArray(a)) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.accessories3D[${i}] inválido.`);
+        return undefined;
+      }
+      if (
+        typeof a.kind !== 'string' ||
+        !(VALID_V11_ACCESSORY_KINDS as readonly string[]).includes(a.kind)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.accessories3D[${i}].kind inválido.`);
+        return undefined;
+      }
+      if (
+        typeof a.u !== 'number' ||
+        !Number.isFinite(a.u) ||
+        typeof a.v !== 'number' ||
+        !Number.isFinite(a.v) ||
+        typeof a.radiusNorm !== 'number' ||
+        !Number.isFinite(a.radiusNorm) ||
+        !isValidHexColor(a.colorHex)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.accessories3D[${i}] inválido.`);
+        return undefined;
+      }
+      accessories3D.push({
+        kind: a.kind as Nail3DAccessoryKind,
+        u: clampNumber(a.u, 0.08, 0.92),
+        v: clampNumber(a.v, 0.08, 0.94),
+        radiusNorm: clampNumber(a.radiusNorm, 0.025, 0.28),
+        heightRatio: clampNumber(
+          typeof a.heightRatio === 'number' && Number.isFinite(a.heightRatio)
+            ? a.heightRatio
+            : 0.6,
+          0.35,
+          0.85
+        ),
+        colorHex: normalizeHexColor(a.colorHex),
+        hasBezelRing: typeof a.hasBezelRing === 'boolean' ? a.hasBezelRing : true,
+      });
+    }
+  }
+
+  const strokes3D: Nail3DStrokeSpec[] = [];
+  if (Array.isArray(s.strokes3D)) {
+    if (s.strokes3D.length > 16) {
+      errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.strokes3D excede limite de 16.`);
+      return undefined;
+    }
+    for (let i = 0; i < s.strokes3D.length; i++) {
+      const st = s.strokes3D[i] as Record<string, unknown> | null;
+      if (!st || typeof st !== 'object' || Array.isArray(st)) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.strokes3D[${i}] inválido.`);
+        return undefined;
+      }
+      const parseTuple = (val: unknown): [number, number] | null => {
+        if (
+          !Array.isArray(val) ||
+          val.length !== 2 ||
+          typeof val[0] !== 'number' ||
+          !Number.isFinite(val[0]) ||
+          typeof val[1] !== 'number' ||
+          !Number.isFinite(val[1])
+        ) {
+          return null;
+        }
+        return [clampNumber(val[0], 0.02, 0.98), clampNumber(val[1], 0.02, 0.98)];
+      };
+      const p0 = parseTuple(st.p0);
+      const c1 = parseTuple(st.c1);
+      const c2 = parseTuple(st.c2);
+      const p1 = parseTuple(st.p1);
+      if (!p0 || !c1 || !c2 || !p1 || !isValidHexColor(st.colorHex)) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.strokes3D[${i}] inválido.`);
+        return undefined;
+      }
+      strokes3D.push({
+        p0,
+        c1,
+        c2,
+        p1,
+        widthNorm: clampNumber(
+          typeof st.widthNorm === 'number' && Number.isFinite(st.widthNorm) ? st.widthNorm : 0.04,
+          0.015,
+          0.14
+        ),
+        colorHex: normalizeHexColor(st.colorHex),
+        isMetallic: typeof st.isMetallic === 'boolean' ? st.isMetallic : false,
+        metalness: clampNumber(
+          typeof st.metalness === 'number' && Number.isFinite(st.metalness) ? st.metalness : 0.1,
+          0,
+          1
+        ),
+        reliefHeight: clampNumber(
+          typeof st.reliefHeight === 'number' && Number.isFinite(st.reliefHeight)
+            ? st.reliefHeight
+            : 0.3,
+          0,
+          1
+        ),
+      });
+    }
+  }
+
+  const motifs: Nail3DMotifSpec[] = [];
+  if (Array.isArray(s.motifs)) {
+    if (s.motifs.length > 12) {
+      errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.motifs excede limite de 12.`);
+      return undefined;
+    }
+    for (let i = 0; i < s.motifs.length; i++) {
+      const m = s.motifs[i] as Record<string, unknown> | null;
+      if (!m || typeof m !== 'object' || Array.isArray(m)) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.motifs[${i}] inválido.`);
+        return undefined;
+      }
+      if (
+        typeof m.kind !== 'string' ||
+        !(VALID_V11_MOTIF_KINDS as readonly string[]).includes(m.kind) ||
+        !Array.isArray(m.center) ||
+        m.center.length !== 2 ||
+        typeof m.center[0] !== 'number' ||
+        !Number.isFinite(m.center[0]) ||
+        typeof m.center[1] !== 'number' ||
+        !Number.isFinite(m.center[1]) ||
+        !isValidHexColor(m.primaryColorHex) ||
+        !isValidHexColor(m.secondaryColorHex)
+      ) {
+        errors.push(`fingerSpecs.${fingerKey}.manufacturingSpec.motifs[${i}] inválido.`);
+        return undefined;
+      }
+      motifs.push({
+        kind: m.kind as Nail3DMotifKind,
+        center: [
+          clampNumber(m.center[0], 0.1, 0.9),
+          clampNumber(m.center[1], 0.1, 0.92),
+        ],
+        scale: clampNumber(
+          typeof m.scale === 'number' && Number.isFinite(m.scale) ? m.scale : 0.22,
+          0.08,
+          0.55
+        ),
+        rotationDeg: clampNumber(
+          typeof m.rotationDeg === 'number' && Number.isFinite(m.rotationDeg)
+            ? m.rotationDeg
+            : 0,
+          -180,
+          180
+        ),
+        primaryColorHex: normalizeHexColor(m.primaryColorHex),
+        secondaryColorHex: normalizeHexColor(m.secondaryColorHex),
+        ...(isValidHexColor(m.centerDotColorHex)
+          ? { centerDotColorHex: normalizeHexColor(m.centerDotColorHex) }
+          : {}),
+        is3DRaised: typeof m.is3DRaised === 'boolean' ? m.is3DRaised : false,
+        opacity: clampNumber(
+          typeof m.opacity === 'number' && Number.isFinite(m.opacity) ? m.opacity : 0.95,
+          0.05,
+          1
+        ),
+      });
+    }
+  }
+
+  const isChrome = finishType === 'mirror_chrome';
+  const rawMetalness =
+    typeof s.metalness === 'number' && Number.isFinite(s.metalness)
+      ? s.metalness
+      : isChrome
+        ? 0.95
+        : 0.05;
+  const rawRoughness =
+    typeof s.roughness === 'number' && Number.isFinite(s.roughness)
+      ? s.roughness
+      : isChrome
+        ? 0.06
+        : 0.12;
+
+  const handSide =
+    typeof s.handSide === 'string' &&
+    (VALID_HAND_SIDES as readonly string[]).includes(s.handSide)
+      ? (s.handSide as HandSide)
+      : undefined;
+
+  const result: Nail3DManufacturingSpec = {
+    fingerId: (typeof s.fingerId === 'string' &&
+    (VALID_FINGER_IDS as readonly string[]).includes(s.fingerId)
+      ? s.fingerId
+      : fingerKey.split('.').pop() ?? 'middle') as FingerId,
+    ...(handSide ? { handSide } : {}),
+    shape,
+    freeEdgeRatio: clampNumber(
+      typeof s.freeEdgeRatio === 'number' && Number.isFinite(s.freeEdgeRatio)
+        ? s.freeEdgeRatio
+        : 0.45,
+      0.12,
+      1.15
+    ),
+    tipRoundness: clampNumber(
+      typeof s.tipRoundness === 'number' && Number.isFinite(s.tipRoundness)
+        ? s.tipRoundness
+        : 0.65,
+      0,
+      1
+    ),
+    cCurveDepth: clampNumber(
+      typeof s.cCurveDepth === 'number' && Number.isFinite(s.cCurveDepth)
+        ? s.cCurveDepth
+        : 0.22,
+      0.16,
+      0.28
+    ),
+    apexHeight: clampNumber(
+      typeof s.apexHeight === 'number' && Number.isFinite(s.apexHeight) ? s.apexHeight : 0.08,
+      0.06,
+      0.11
+    ),
+    substrateType,
+    finishType,
+    trueBaseColorHex,
+    secondaryColorHex,
+    cuticleColorHex,
+    tipColorHex,
+    gradientType,
+    metalness: isChrome ? clampNumber(Math.max(0.92, rawMetalness), 0.92, 1) : clampNumber(rawMetalness, 0, 1),
+    roughness: isChrome
+      ? clampNumber(Math.min(0.08, rawRoughness), 0.04, 0.08)
+      : clampNumber(rawRoughness, 0.04, 0.55),
+    clearcoat: clampNumber(
+      typeof s.clearcoat === 'number' && Number.isFinite(s.clearcoat) ? s.clearcoat : 0.95,
+      0,
+      1
+    ),
+    translucency: clampNumber(
+      typeof s.translucency === 'number' && Number.isFinite(s.translucency)
+        ? s.translucency
+        : 0.08,
+      0,
+      1
+    ),
+    borderType,
+    borderColorHex,
+    borderWidthNorm: clampNumber(
+      typeof s.borderWidthNorm === 'number' && Number.isFinite(s.borderWidthNorm)
+        ? s.borderWidthNorm
+        : 0,
+      0,
+      0.35
+    ),
+    borderIsMetallic: typeof s.borderIsMetallic === 'boolean' ? s.borderIsMetallic : false,
+    borderIs3DRaised: typeof s.borderIs3DRaised === 'boolean' ? s.borderIs3DRaised : false,
+    strokes3D,
+    motifs,
+    accessories3D,
+    designNotesPt:
+      typeof s.designNotesPt === 'string' && s.designNotesPt.trim().length > 0
+        ? s.designNotesPt.trim().slice(0, 320)
+        : 'Especificação 3D validada.',
+  };
+
+  if (typeof s.fidelityScore === 'number' && Number.isFinite(s.fidelityScore)) {
+    result.fidelityScore = Math.round(clampNumber(s.fidelityScore, 0, 100));
+  }
+  if (typeof s.refinementRounds === 'number' && Number.isFinite(s.refinementRounds)) {
+    result.refinementRounds = Math.round(clampNumber(s.refinementRounds, 0, 10));
+  }
+
+  return result;
+}
+
+function sanitizePreview3DDataUrl(
+  value: unknown,
+  fingerPath: string,
+  errors: string[]
+): string | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    errors.push(`${fingerPath}.preview3DDataUrl deve ser uma string data:image/* válida.`);
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (
+    !trimmed.startsWith('data:image/') &&
+    !trimmed.startsWith('http://') &&
+    !trimmed.startsWith('https://') &&
+    !trimmed.startsWith('/')
+  ) {
+    errors.push(`${fingerPath}.preview3DDataUrl deve começar com data:image/ ou URL válida.`);
+    return undefined;
+  }
+  if (trimmed.length > 350000) {
+    errors.push(`${fingerPath}.preview3DDataUrl excede tamanho máximo permitido.`);
+    return undefined;
+  }
+  return trimmed;
+}
+
+function validateAndSanitizeFingerMapRecord(
+  record: Record<string, unknown>,
+  pathPrefix: string,
+  errors: string[]
+): NailFingerSpecsMap | null {
+  const keys = Object.keys(record);
+  if (keys.length === 0) {
+    errors.push(`${pathPrefix} não pode ser um objeto vazio.`);
+    return null;
+  }
+
+  const sanitizedMap: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
+  for (const key of keys) {
+    if (!(VALID_FINGER_IDS as readonly string[]).includes(key)) {
+      errors.push(
+        `Chave inválida "${key}" em ${pathPrefix}. Dedos aceitos: ${VALID_FINGER_IDS.join(', ')}.`
+      );
+      continue;
+    }
+    const spec = record[key];
+    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+      errors.push(`${pathPrefix}.${key} deve ser um objeto válido.`);
+      continue;
+    }
+    const specObj = spec as Record<string, unknown>;
+    if (specObj.shape !== undefined && !isValidNailShape(specObj.shape)) {
+      errors.push(
+        `${pathPrefix}.${key}.shape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
+      );
+      continue;
+    }
+
+    if (
+      specObj.freeEdgeRatio !== undefined &&
+      !isFiniteNumberInRange(specObj.freeEdgeRatio, 0.0, 2.0)
+    ) {
+      errors.push(`${pathPrefix}.${key}.freeEdgeRatio deve ser um número entre 0 e 2.`);
+      continue;
+    }
+
+    if (
+      specObj.finishStyle !== undefined &&
+      (typeof specObj.finishStyle !== 'string' ||
+        !(VALID_NAIL_FINISHES_V10 as readonly string[]).includes(specObj.finishStyle))
+    ) {
+      errors.push(
+        `${pathPrefix}.${key}.finishStyle inválido. Valores aceitos: ${VALID_NAIL_FINISHES_V10.join(', ')}.`
+      );
+      continue;
+    }
+
+    if (
+      specObj.handSide !== undefined &&
+      (typeof specObj.handSide !== 'string' ||
+        !(VALID_HAND_SIDES as readonly string[]).includes(specObj.handSide))
+    ) {
+      errors.push(`${pathPrefix}.${key}.handSide inválido. Valores aceitos: Left, Right.`);
+      continue;
+    }
+
+    if (
+      specObj.fidelityScore !== undefined &&
+      !isFiniteNumberInRange(specObj.fidelityScore, 0, 100)
+    ) {
+      errors.push(`${pathPrefix}.${key}.fidelityScore deve estar entre 0 e 100.`);
+      continue;
+    }
+
+    const validatedBlueprint = validateAndSanitizeBlueprint(
+      specObj.blueprint,
+      `${pathPrefix}.${key}`,
+      errors
+    );
+    const validatedManufacturingSpec = validateAndSanitizeManufacturingSpec(
+      specObj.manufacturingSpec,
+      `${pathPrefix}.${key}`,
+      errors
+    );
+    const sanitizedPreview3DDataUrl = sanitizePreview3DDataUrl(
+      specObj.preview3DDataUrl,
+      `${pathPrefix}.${key}`,
+      errors
+    );
+
+    // Strip legacy raster map DataURLs and transient raw inspection crops so finger_specs_json stays compact
+    const {
+      uvPatchDataUrl: _uv,
+      normalMapDataUrl: _norm,
+      displacementMapDataUrl: _disp,
+      metalnessMapDataUrl: _met,
+      roughnessMapDataUrl: _rough,
+      referenceZoomDataUrl: _refZoom,
+      preview3DDataUrl: _rawPreview,
+      ...cleanSpecFields
+    } = specObj;
+
+    const resolvedFidelity =
+      specObj.fidelityScore !== undefined
+        ? Math.round(clampNumber(specObj.fidelityScore as number, 0, 100))
+        : validatedManufacturingSpec?.fidelityScore;
+
+    const sanitizedSpec: NailFingerDesignSpec = {
+      ...(cleanSpecFields as unknown as NailFingerDesignSpec),
+      fingerId: key as FingerId,
+      ...(specObj.freeEdgeRatio !== undefined
+        ? { freeEdgeRatio: clampNumber(specObj.freeEdgeRatio as number, 0.12, 1.15) }
+        : {}),
+      ...(validatedBlueprint !== undefined ? { blueprint: validatedBlueprint } : {}),
+      ...(validatedManufacturingSpec !== undefined
+        ? { manufacturingSpec: validatedManufacturingSpec }
+        : {}),
+      ...(sanitizedPreview3DDataUrl !== undefined
+        ? { preview3DDataUrl: sanitizedPreview3DDataUrl }
+        : {}),
+      ...(resolvedFidelity !== undefined ? { fidelityScore: resolvedFidelity } : {}),
+    };
+
+    sanitizedMap[key as FingerId] = sanitizedSpec;
+  }
+
+  return sanitizedMap as NailFingerSpecsMap;
+}
+
 function parseAndValidateFingerSpecsInput(
   rawFingerSpecs: unknown,
   rawFingerSpecsJson: unknown,
   errors: string[]
-): { provided: boolean; value: NailFingerSpecsMap | null } {
+): {
+  provided: boolean;
+  value: NailFingerSpecsMap | null;
+  envelopeHandSpecsBySide?: NailHandSpecsBySide | null;
+  envelopeFidelityScore?: number | null;
+} {
   if (rawFingerSpecs === undefined && rawFingerSpecsJson === undefined) {
     return { provided: false, value: null };
   }
@@ -568,83 +1187,97 @@ function parseAndValidateFingerSpecsInput(
   }
 
   const record = candidate as Record<string, unknown>;
-  const keys = Object.keys(record);
-  if (keys.length === 0) {
-    errors.push('fingerSpecs não pode ser um objeto vazio.');
-    return { provided: true, value: null };
-  }
 
-  const sanitizedMap: Partial<Record<FingerId, NailFingerDesignSpec>> = {};
-  for (const key of keys) {
-    if (!(VALID_FINGER_IDS as readonly string[]).includes(key)) {
-      errors.push(
-        `Chave inválida "${key}" em fingerSpecs. Dedos aceitos: ${VALID_FINGER_IDS.join(', ')}.`
-      );
-      continue;
-    }
-    const spec = record[key];
-    if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
-      errors.push(`fingerSpecs.${key} deve ser um objeto válido.`);
-      continue;
-    }
-    const specObj = spec as Record<string, unknown>;
-    if (specObj.shape !== undefined && !isValidNailShape(specObj.shape)) {
-      errors.push(
-        `fingerSpecs.${key}.shape inválido. Valores aceitos: ${VALID_NAIL_SHAPES.join(', ')}.`
-      );
-      continue;
-    }
+  // Support V11 envelope directly in fingerSpecsJson if sent by a client
+  if (record.__v11Envelope === true || 'fingerSpecs' in record || 'handSpecsBySide' in record) {
+    const innerFingerSpecs =
+      record.fingerSpecs && typeof record.fingerSpecs === 'object' && !Array.isArray(record.fingerSpecs)
+        ? validateAndSanitizeFingerMapRecord(
+            record.fingerSpecs as Record<string, unknown>,
+            'fingerSpecs',
+            errors
+          )
+        : null;
 
-    if (
-      specObj.freeEdgeRatio !== undefined &&
-      !isFiniteNumberInRange(specObj.freeEdgeRatio, 0.0, 2.0)
-    ) {
-      errors.push(`fingerSpecs.${key}.freeEdgeRatio deve ser um número entre 0 e 2.`);
-      continue;
-    }
+    const envelopeHandSpecs =
+      record.handSpecsBySide !== undefined
+        ? parseAndValidateHandSpecsBySideInput(record.handSpecsBySide, errors).value
+        : undefined;
 
-    if (
-      specObj.finishStyle !== undefined &&
-      (typeof specObj.finishStyle !== 'string' ||
-        !(VALID_NAIL_FINISHES_V10 as readonly string[]).includes(specObj.finishStyle))
-    ) {
-      errors.push(
-        `fingerSpecs.${key}.finishStyle inválido. Valores aceitos: ${VALID_NAIL_FINISHES_V10.join(', ')}.`
-      );
-      continue;
-    }
+    const envelopeScore =
+      typeof record.fidelityScore === 'number' && Number.isFinite(record.fidelityScore)
+        ? Math.round(clampNumber(record.fidelityScore, 0, 100))
+        : undefined;
 
-    const validatedBlueprint = validateAndSanitizeBlueprint(specObj.blueprint, key, errors);
-
-    // Strip legacy raster map DataURLs so finger_specs_json stays compact (~2-6 KB)
-    const {
-      uvPatchDataUrl: _uv,
-      normalMapDataUrl: _norm,
-      displacementMapDataUrl: _disp,
-      metalnessMapDataUrl: _met,
-      roughnessMapDataUrl: _rough,
-      ...cleanSpecFields
-    } = specObj;
-
-    const sanitizedSpec: NailFingerDesignSpec = {
-      ...(cleanSpecFields as unknown as NailFingerDesignSpec),
-      fingerId: key as FingerId,
-      ...(specObj.freeEdgeRatio !== undefined
-        ? { freeEdgeRatio: clampNumber(specObj.freeEdgeRatio as number, 0.12, 1.15) }
-        : {}),
-      ...(validatedBlueprint !== undefined ? { blueprint: validatedBlueprint } : {}),
+    return {
+      provided: true,
+      value: innerFingerSpecs,
+      ...(envelopeHandSpecs !== undefined ? { envelopeHandSpecsBySide: envelopeHandSpecs } : {}),
+      ...(envelopeScore !== undefined ? { envelopeFidelityScore: envelopeScore } : {}),
     };
-
-    sanitizedMap[key as FingerId] = sanitizedSpec;
   }
 
+  const validated = validateAndSanitizeFingerMapRecord(record, 'fingerSpecs', errors);
   return {
     provided: true,
-    value: sanitizedMap as NailFingerSpecsMap,
+    value: validated,
   };
 }
 
+function parseAndValidateHandSpecsBySideInput(
+  rawHandSpecsBySide: unknown,
+  errors: string[]
+): { provided: boolean; value: NailHandSpecsBySide | null } {
+  if (rawHandSpecsBySide === undefined) {
+    return { provided: false, value: null };
+  }
+  if (rawHandSpecsBySide === null) {
+    return { provided: true, value: null };
+  }
+  if (typeof rawHandSpecsBySide !== 'object' || Array.isArray(rawHandSpecsBySide)) {
+    errors.push('handSpecsBySide deve ser um objeto com chaves opcionais Left e Right.');
+    return { provided: true, value: null };
+  }
+
+  const obj = rawHandSpecsBySide as Record<string, unknown>;
+  const out: NailHandSpecsBySide = {};
+
+  for (const key of Object.keys(obj)) {
+    if (key !== 'Left' && key !== 'Right') {
+      errors.push(`Chave inválida "${key}" em handSpecsBySide. Chaves aceitas: Left, Right.`);
+      continue;
+    }
+    const sideRaw = obj[key];
+    if (sideRaw === undefined || sideRaw === null) {
+      continue;
+    }
+    if (typeof sideRaw !== 'object' || Array.isArray(sideRaw)) {
+      errors.push(`handSpecsBySide.${key} deve ser um objeto indexado pelos dedos.`);
+      continue;
+    }
+    const sanitizedSide = validateAndSanitizeFingerMapRecord(
+      sideRaw as Record<string, unknown>,
+      `handSpecsBySide.${key}`,
+      errors
+    );
+    if (sanitizedSide) {
+      out[key] = sanitizedSide;
+    }
+  }
+
+  if (!out.Left && !out.Right) {
+    return { provided: true, value: null };
+  }
+
+  return { provided: true, value: out };
+}
+
 export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
+  const cleanFingerSpecs =
+    entity.fingerSpecs && Object.prototype.hasOwnProperty.call(entity.fingerSpecs, 'toJSON')
+      ? ({ ...entity.fingerSpecs } as NailFingerSpecsMap)
+      : entity.fingerSpecs;
+
   return {
     id: entity.id,
     name: entity.name,
@@ -663,7 +1296,11 @@ export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
     isStudioCatalog: entity.isStudioCatalog,
     detectedShape: entity.detectedShape,
     detectedLength: entity.detectedLength,
-    fingerSpecs: entity.fingerSpecs,
+    ...(entity.fidelityScore !== undefined && entity.fidelityScore !== null
+      ? { fidelityScore: entity.fidelityScore }
+      : {}),
+    fingerSpecs: cleanFingerSpecs,
+    ...(entity.handSpecsBySide ? { handSpecsBySide: entity.handSpecsBySide } : {}),
     createdAt: entity.createdAt,
   };
 }
@@ -838,15 +1475,42 @@ export function validateCreateNailDesignDTO(
     }
   }
 
+  let fidelityScore: number | null = null;
+  if (input.fidelityScore !== undefined && input.fidelityScore !== null) {
+    if (!isFiniteNumberInRange(input.fidelityScore, 0, 100)) {
+      errors.push('fidelityScore deve ser um número finito entre 0 e 100.');
+    } else {
+      fidelityScore = Math.round(input.fidelityScore);
+    }
+  }
+
   const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
     input.fingerSpecs,
     input.fingerSpecsJson,
     errors
   );
 
+  const parsedHandSpecsBySide = parseAndValidateHandSpecsBySideInput(
+    input.handSpecsBySide,
+    errors
+  );
+
   if (errors.length > 0) {
     return { valid: false, errors };
   }
+
+  const resolvedHandSpecsBySide = parsedHandSpecsBySide.provided
+    ? parsedHandSpecsBySide.value
+    : parsedFingerSpecs.envelopeHandSpecsBySide ?? null;
+
+  const resolvedFidelityScore =
+    fidelityScore ?? parsedFingerSpecs.envelopeFidelityScore ?? null;
+
+  const resolvedFingerSpecs = attachV11SerializationEnvelope(
+    parsedFingerSpecs.provided ? parsedFingerSpecs.value : null,
+    resolvedHandSpecsBySide,
+    resolvedFidelityScore
+  );
 
   const resolvedIsCustom =
     input.isCustomReference !== undefined
@@ -876,7 +1540,9 @@ export function validateCreateNailDesignDTO(
     isStudioCatalog: resolvedIsStudioCatalog,
     detectedShape,
     detectedLength,
-    fingerSpecs: parsedFingerSpecs.provided ? parsedFingerSpecs.value : null,
+    ...(resolvedFidelityScore !== null ? { fidelityScore: resolvedFidelityScore } : {}),
+    fingerSpecs: resolvedFingerSpecs,
+    ...(resolvedHandSpecsBySide ? { handSpecsBySide: resolvedHandSpecsBySide } : {}),
   };
 
   return { valid: true, data: result };
@@ -1055,13 +1721,46 @@ export function validateUpdateNailDesignDTO(
     }
   }
 
+  if (input.fidelityScore !== undefined) {
+    if (input.fidelityScore === null) {
+      sanitized.fidelityScore = null;
+    } else if (!isFiniteNumberInRange(input.fidelityScore, 0, 100)) {
+      errors.push('fidelityScore deve ser um número finito entre 0 e 100.');
+    } else {
+      sanitized.fidelityScore = Math.round(input.fidelityScore);
+    }
+  }
+
   const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
     input.fingerSpecs,
     input.fingerSpecsJson,
     errors
   );
-  if (parsedFingerSpecs.provided) {
-    sanitized.fingerSpecs = parsedFingerSpecs.value;
+
+  const parsedHandSpecsBySide = parseAndValidateHandSpecsBySideInput(
+    input.handSpecsBySide,
+    errors
+  );
+
+  const resolvedHandSpecsBySide = parsedHandSpecsBySide.provided
+    ? parsedHandSpecsBySide.value
+    : parsedFingerSpecs.envelopeHandSpecsBySide;
+
+  const resolvedFidelityScore =
+    sanitized.fidelityScore !== undefined
+      ? sanitized.fidelityScore
+      : parsedFingerSpecs.envelopeFidelityScore;
+
+  if (parsedFingerSpecs.provided || parsedHandSpecsBySide.provided) {
+    const baseFingerSpecs = parsedFingerSpecs.provided ? parsedFingerSpecs.value : null;
+    sanitized.fingerSpecs = attachV11SerializationEnvelope(
+      baseFingerSpecs,
+      resolvedHandSpecsBySide,
+      resolvedFidelityScore
+    );
+  }
+  if (resolvedHandSpecsBySide !== undefined) {
+    sanitized.handSpecsBySide = resolvedHandSpecsBySide;
   }
 
   if (errors.length > 0) {
