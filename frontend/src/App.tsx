@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion';
 import {
   Camera,
+  Download,
   Eye,
   EyeOff,
   Hand,
@@ -27,6 +28,11 @@ import {
 } from './lib/offlineStore';
 import { getStudioMonogram } from './lib/swatchPreview';
 import type { ARViewMode, NailAdjustment, NailDesign, StudioConfig } from './types/nail';
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
 
 const DEFAULT_ADJUSTMENT: NailAdjustment = {
   scale: 1,
@@ -85,6 +91,33 @@ export function App(): React.ReactElement {
   const [whiteLabelOpen, setWhiteLabelOpen] = useState<boolean>(false);
   const [importOpen, setImportOpen] = useState<boolean>(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [cameraNotice, setCameraNotice] = useState<string | null>(null);
+  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+
+  // Capture Android/Chrome native PWA install prompt
+  useEffect(() => {
+    const handleBeforeInstall = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as BeforeInstallPromptEvent);
+    };
+    const handleInstalled = () => {
+      setInstallPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    window.addEventListener('appinstalled', handleInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+      window.removeEventListener('appinstalled', handleInstalled);
+    };
+  }, []);
+
+  // Auto-dismiss transient camera notice
+  useEffect(() => {
+    if (!cameraNotice) return;
+    const timer = window.setTimeout(() => setCameraNotice(null), 5500);
+    return () => window.clearTimeout(timer);
+  }, [cameraNotice]);
 
   // Hydrate studio config and catalog with backend -> IndexedDB offline fallback
   useEffect(() => {
@@ -151,8 +184,18 @@ export function App(): React.ReactElement {
   }, [config.studioName, config.logoDataUrl]);
 
   const toggleMode = useCallback(() => {
+    setCameraNotice(null);
     setMode((prev) => (prev === 'studio-demo' ? 'camera' : 'studio-demo'));
   }, []);
+
+  const handleInstallPwa = useCallback(async () => {
+    if (!installPrompt) return;
+    await installPrompt.prompt();
+    const choice = await installPrompt.userChoice;
+    if (choice.outcome === 'accepted') {
+      setInstallPrompt(null);
+    }
+  }, [installPrompt]);
 
   return (
     <main className="studio-shell">
@@ -166,6 +209,7 @@ export function App(): React.ReactElement {
         adjustment={adjustment}
         compareClean={compareClean}
         onTrackingChange={setHandDetected}
+        onCameraNotice={setCameraNotice}
       />
 
       {/* Top Floating White-Label Brand Header */}
@@ -191,6 +235,19 @@ export function App(): React.ReactElement {
         </div>
 
         <div className="top-actions">
+          {installPrompt && (
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.94 }}
+              onClick={handleInstallPwa}
+              className="mode-toggle-btn glass-panel"
+              title="Instalar App no Android (PWA)"
+            >
+              <Download size={14} />
+              <span>Instalar</span>
+            </motion.button>
+          )}
+
           <motion.button
             type="button"
             whileTap={{ scale: 0.94 }}
@@ -220,10 +277,17 @@ export function App(): React.ReactElement {
       </header>
 
       {/* Subtle Contextual AR Hint when Camera is active and waiting for hand */}
-      {mode === 'camera' && !handDetected && (
-        <div className="hand-guide-pill glass-panel">
-          <span>Posicione a mão aberta diante da câmera</span>
+      {cameraNotice ? (
+        <div className="hand-guide-pill glass-panel" role="status">
+          <span>{cameraNotice}</span>
         </div>
+      ) : (
+        mode === 'camera' &&
+        !handDetected && (
+          <div className="hand-guide-pill glass-panel">
+            <span>Posicione a mão aberta diante da câmera</span>
+          </div>
+        )
       )}
 
       {/* Right Floating Quick Utility Rail */}

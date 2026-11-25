@@ -20,6 +20,7 @@ interface ARCameraCanvasProps {
   adjustment: NailAdjustment;
   compareClean: boolean;
   onTrackingChange?: (detected: boolean) => void;
+  onCameraNotice?: (message: string | null) => void;
 }
 
 const SMOOTHING_ALPHA = 0.42;
@@ -34,6 +35,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       adjustment,
       compareClean,
       onTrackingChange,
+      onCameraNotice,
     },
     ref
   ) {
@@ -130,16 +132,9 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       let activeStream: MediaStream | null = null;
       setCameraState('starting');
 
-      async function startCamera() {
-        if (!navigator.mediaDevices?.getUserMedia) {
-          if (active) {
-            setCameraState('unavailable');
-            onModeChange('studio-demo');
-          }
-          return;
-        }
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
+      async function openCameraStream(): Promise<MediaStream> {
+        const attempts: MediaStreamConstraints[] = [
+          {
             audio: false,
             video: {
               facingMode: { ideal: facingMode },
@@ -147,7 +142,59 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
               height: { ideal: 1920 },
               frameRate: { ideal: 60, max: 60 },
             },
-          });
+          },
+          {
+            audio: false,
+            video: {
+              facingMode: { ideal: facingMode },
+            },
+          },
+          {
+            audio: false,
+            video: true,
+          },
+        ];
+
+        let lastErr: unknown;
+        for (const constraints of attempts) {
+          try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (err) {
+            lastErr = err;
+            if (err instanceof DOMException && err.name === 'NotAllowedError') {
+              throw err;
+            }
+          }
+        }
+        throw lastErr;
+      }
+
+      async function startCamera() {
+        if (!window.isSecureContext) {
+          if (active) {
+            setCameraState('unavailable');
+            onCameraNotice?.(
+              'Câmera AR exige contexto seguro HTTPS (ou localhost). Mantendo Mão Modelo calibrada.'
+            );
+            onModeChange('studio-demo');
+          }
+          return;
+        }
+
+        if (!navigator.mediaDevices?.getUserMedia) {
+          if (active) {
+            setCameraState('unavailable');
+            onCameraNotice?.(
+              'Navegador sem suporte a getUserMedia. Usando Mão Modelo em modo estúdio.'
+            );
+            onModeChange('studio-demo');
+          }
+          return;
+        }
+
+        try {
+          onCameraNotice?.(null);
+          const stream = await openCameraStream();
           if (!active) {
             stream.getTracks().forEach((t) => t.stop());
             return;
@@ -159,9 +206,17 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             await video.play();
             if (active) setCameraState('ready');
           }
-        } catch {
+        } catch (err) {
           if (active) {
             setCameraState('unavailable');
+            const isDenied =
+              err instanceof DOMException &&
+              (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError');
+            onCameraNotice?.(
+              isDenied
+                ? 'Permissão de câmera negada. Libere a câmera nas configurações do navegador ou app.'
+                : 'Nenhuma câmera disponível neste dispositivo. Usando Mão Modelo calibrada.'
+            );
             onModeChange('studio-demo');
           }
         }
@@ -175,7 +230,7 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           activeStream.getTracks().forEach((t) => t.stop());
         }
       };
-    }, [mode, facingMode, onModeChange]);
+    }, [mode, facingMode, onModeChange, onCameraNotice]);
 
     // Main 60fps render + tracking loop
     useEffect(() => {

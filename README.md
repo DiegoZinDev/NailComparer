@@ -106,11 +106,22 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
 
 ---
 
-## 7. Resiliência Offline (`IndexedDB` + Service Worker PWA)
+## 7. PWA Instalável no Android, Empacotamento `.apk` & Resiliência Offline
 
-- **Service Worker (`frontend/public/sw.js`)**: Registra cache `nail-ar-studio-v1` com pré-cache dos assets críticos (`/`, `/index.html`, `/manifest.webmanifest`, `/icon.svg`, `/hand-demo.png`), estratégia *stale-while-revalidate* para estáticos e bypass limpo para `/api/*`.
-- **Web App Manifest (`frontend/public/manifest.webmanifest`)**: Configurado com `display: "standalone"`, `orientation: "portrait"`, `lang: "pt-BR"` e ícone vetorial mascarável (`/icon.svg`).
-- **Persistência Dupla (`frontend/src/lib/offlineStore.ts`)**: Todas as leituras e gravações (`loadStudioConfig`, `saveStudioConfig`, `loadNailDesigns`, `createNailDesign`, `deleteCustomDesign`) sincronizam com a API REST (timeout de 1.8s–2.6s) e mantêm cópia sincronizada em **IndexedDB (`nail-ar-studio-db`)** com redundância em `localStorage`, exibindo um indicador discreto de status (`synced` / `offline`) no HUD.
+- **Configuração `vite-plugin-pwa` + Workbox (`frontend/vite.config.ts`)**: Gera automaticamente o manifesto oficial (`manifest.webmanifest`) e o Service Worker Workbox (`sw.js`) com registro `autoUpdate` via `virtual:pwa-register`, pré-cache dos assets estáticos e runtime caching dedicado para módulos WASM/modelo do MediaPipe Hands (`CacheFirst`), Google Fonts (`CacheFirst`) e API `/api/*` (`NetworkFirst`).
+- **Web App Manifest & Ícones Oficiais (`frontend/public/icons/`)**: Configurado com `display: "standalone"`, `display_override: ["standalone", "fullscreen"]`, `orientation: "portrait"`, `start_url: "/"`, `lang: "pt-BR"` e conjunto completo de ícones PNG validados para instalação Android e empacotamento em APK:
+  - `icon-192x192.png` (`192×192`, `purpose: "any"`)
+  - `icon-512x512.png` (`512×512`, `purpose: "any"`)
+  - `icon-maskable-192x192.png` (`192×192`, `purpose: "maskable"`)
+  - `icon-maskable-512x512.png` (`512×512`, `purpose: "maskable"`)
+  - `apple-touch-icon.png` (`180×180`, iOS Home Screen)
+- **Instalação em 1 Toque no Android & Câmera HTTPS (`getUserMedia`)**:
+  - Captura o evento nativo `beforeinstallprompt` exibindo o botão discreto **Instalar** no HUD superior para adicionar o app direto à tela inicial do Android em modo tela cheia (`standalone`).
+  - Validação explícita de contexto seguro (`window.isSecureContext`) em `ARCameraCanvas.tsx`, fallback progressivo de constraints em `navigator.mediaDevices.getUserMedia` (câmera traseira `environment` / frontal `user` até 60fps) e cabeçalho HTTP `Permissions-Policy: camera=(self)` no backend Express para compatibilidade total com Chrome Android, TWA (PWABuilder) e WebView do Capacitor.
+- **Empacotamento em `.apk` (PWABuilder ou Capacitor)**:
+  - **Via PWABuilder (mais rápido):** publique `frontend/` em HTTPS (Vercel/Netlify), cole a URL em [pwabuilder.com](https://www.pwabuilder.com) e gere o pacote Android TWA (`.apk` / `.aab`) usando o manifesto e ícones 192×192 / 512×512 já configurados.
+  - **Via Capacitor:** inicialize `@capacitor/android` apontando `webDir` para `frontend/dist`, adicione `<uses-permission android:name="android.permission.CAMERA" />` no `AndroidManifest.xml` e gere o `.apk` no Android Studio.
+- **Persistência Dupla (`frontend/src/lib/offlineStore.ts`)**: Todas as leituras e gravações (`loadStudioConfig`, `saveStudioConfig`, `loadNailDesigns`, `createNailDesign`, `deleteCustomDesign`) sincronizam com a API REST e mantêm cópia local em **IndexedDB (`nail-ar-studio-db`)** com redundância em `localStorage`.
 
 ---
 
