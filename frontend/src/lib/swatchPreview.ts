@@ -8,6 +8,7 @@ import {
 
 const PRIORITY_FINGERS: FingerId[] = ['ring', 'middle', 'index', 'thumb', 'pinky'];
 const swatchBgCache = new Map<string, string>();
+const trueUvSwatchCache = new Map<string, string>();
 
 function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
   const handSets: Array<Partial<Record<FingerId, NailFingerDesignSpec>> | undefined> = [
@@ -16,21 +17,12 @@ function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
     design.handSpecsBySide?.Left,
   ];
 
-  // 1. Prioritize any finger carrying a rendered 3D preview + rich 3D/artistic detail
+  // 1. V12 Absolute Priority: any finger carrying a photorealistic True UV texture (`trueUvDataUrl`)
   for (const fingerMap of handSets) {
     if (!fingerMap) continue;
     for (const fid of PRIORITY_FINGERS) {
       const spec = fingerMap[fid];
-      if (
-        spec?.preview3DDataUrl &&
-        ((spec.manufacturingSpec &&
-          (spec.manufacturingSpec.accessories3D.length > 0 ||
-            spec.manufacturingSpec.strokes3D.length > 0 ||
-            spec.manufacturingSpec.motifs.length > 0)) ||
-          (spec.blueprint && spec.blueprint.artElements.length > 0))
-      ) {
-        return spec;
-      }
+      if (spec?.trueUvDataUrl) return spec;
     }
   }
 
@@ -70,9 +62,80 @@ function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
 }
 
 /**
+ * Builds an anatomical salon nail silhouette SVG wrapping the real 512x512 True UV texture
+ * with subtle C-curve cylindrical shading and liquid UV-gel specular gloss.
+ */
+function buildTrueUvNailSvgDataUrl(
+  trueUvDataUrl: string,
+  shape: NailFingerDesignSpec['shape'],
+  width = 180,
+  height = 260
+): string {
+  const key = `${shape}|${width}x${height}|${trueUvDataUrl.length}|${trueUvDataUrl.slice(-24)}`;
+  const cached = trueUvSwatchCache.get(key);
+  if (cached) return cached;
+
+  const escapedHref = trueUvDataUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  const padX = width * 0.14;
+  const padY = height * 0.06;
+  const w = width - padX * 2;
+  const h = height - padY * 2;
+  const x0 = padX;
+  const x1 = padX + w;
+  const cx = width * 0.5;
+  const yTop = padY;
+  const yBot = padY + h;
+
+  let pathD: string;
+  if (shape === 'square') {
+    pathD = `M ${x0 + w * 0.08} ${yTop} Q ${cx} ${yTop - h * 0.01} ${x1 - w * 0.08} ${yTop} Q ${x1} ${yTop} ${x1} ${yTop + h * 0.07} L ${x1} ${yBot - h * 0.16} Q ${x1} ${yBot} ${cx} ${yBot} Q ${x0} ${yBot} ${x0} ${yBot - h * 0.16} L ${x0} ${yTop + h * 0.07} Q ${x0} ${yTop} ${x0 + w * 0.08} ${yTop} Z`;
+  } else if (shape === 'coffin') {
+    pathD = `M ${x0 + w * 0.22} ${yTop} L ${x1 - w * 0.22} ${yTop} Q ${x1 - w * 0.14} ${yTop} ${x1} ${yTop + h * 0.42} L ${x1} ${yBot - h * 0.16} Q ${x1} ${yBot} ${cx} ${yBot} Q ${x0} ${yBot} ${x0} ${yBot - h * 0.16} L ${x0} ${yTop + h * 0.42} Q ${x0 + w * 0.14} ${yTop} ${x0 + w * 0.22} ${yTop} Z`;
+  } else if (shape === 'stiletto') {
+    pathD = `M ${cx} ${yTop} Q ${x1} ${yTop + h * 0.34} ${x1} ${yBot - h * 0.18} Q ${x1} ${yBot} ${cx} ${yBot} Q ${x0} ${yBot} ${x0} ${yBot - h * 0.18} Q ${x0} ${yTop + h * 0.34} ${cx} ${yTop} Z`;
+  } else {
+    // almond / oval / natural
+    pathD = `M ${cx} ${yTop} C ${x1 - w * 0.08} ${yTop} ${x1} ${yTop + h * 0.24} ${x1} ${yBot - h * 0.16} Q ${x1} ${yBot} ${cx} ${yBot} Q ${x0} ${yBot} ${x0} ${yBot - h * 0.16} C ${x0} ${yTop + h * 0.24} ${x0 + w * 0.08} ${yTop} ${cx} ${yTop} Z`;
+  }
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <defs>
+    <clipPath id="nc"><path d="${pathD}"/></clipPath>
+    <linearGradient id="cc" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#000" stop-opacity="0.30"/>
+      <stop offset="18%" stop-color="#000" stop-opacity="0.06"/>
+      <stop offset="46%" stop-color="#fff" stop-opacity="0.14"/>
+      <stop offset="78%" stop-color="#000" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#000" stop-opacity="0.32"/>
+    </linearGradient>
+    <linearGradient id="gl" x1="0.18" y1="0.05" x2="0.82" y2="0.65">
+      <stop offset="0%" stop-color="#fff" stop-opacity="0.44"/>
+      <stop offset="28%" stop-color="#fff" stop-opacity="0.08"/>
+      <stop offset="55%" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#nc)">
+    <image href="${escapedHref}" x="${x0}" y="${yTop}" width="${w}" height="${h}" preserveAspectRatio="none"/>
+    <rect x="${x0}" y="${yTop}" width="${w}" height="${h}" fill="url(#cc)"/>
+    <rect x="${x0}" y="${yTop}" width="${w}" height="${h}" fill="url(#gl)"/>
+  </g>
+  <path d="${pathD}" fill="none" stroke="rgba(255,255,255,0.28)" stroke-width="1.4"/>
+</svg>`;
+
+  const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  if (trueUvSwatchCache.size > 48) {
+    const first = trueUvSwatchCache.keys().next().value;
+    if (first) trueUvSwatchCache.delete(first);
+  }
+  trueUvSwatchCache.set(key, url);
+  return url;
+}
+
+/**
  * Generates a crisp circular thumbnail preview (`background`):
- * - Prioritizes `spec.preview3DDataUrl` (real Three.js offscreen studio 3D snapshot — NEVER a raw photo crop!)
- * - Falls back cleanly to the V11/V10 vector PBR compiler (`renderBlueprintNailCanvas`).
+ * - V12 Priority: renders real photorealistic `trueUvDataUrl` inside an anatomical nail silhouette
+ *   with subtle C-curve cylindrical shading and UV-gel gloss!
+ * - Falls back cleanly to `preview3DDataUrl` or the vector PBR compiler.
  */
 export function getSwatchBackground(design: NailDesign): string {
   const spec = pickPrimaryFingerSpec(design);
@@ -82,8 +145,17 @@ export function getSwatchBackground(design: NailDesign): string {
     spec.baseColor ||
     '#D4A383';
 
+  if (spec.trueUvDataUrl) {
+    const svgUrl = buildTrueUvNailSvgDataUrl(spec.trueUvDataUrl, spec.shape, 96, 132);
+    return `url("${svgUrl}") center/contain no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
+  }
+
   if (spec.preview3DDataUrl) {
     return `url("${spec.preview3DDataUrl}") center/cover no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
+  }
+
+  if (design.imageDataUrl && design.imageDataUrl.startsWith('data:image/')) {
+    return `url("${design.imageDataUrl}") center/contain no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
   }
 
   const cacheKey = `${design.id}|${hashFingerSpec(spec)}`;
@@ -132,35 +204,30 @@ export function getSwatchBackground(design: NailDesign): string {
   }
 }
 
-/**
- * Generates a high-fidelity nail silhouette swatch DataURL directly from a `NailDesign`
- * or `NailFingerDesignSpec`:
- * - Prioritizes `spec.preview3DDataUrl` (snapshot rendered by Three.js `OffscreenNailRenderSession` —
- *   NEVER a raw photo crop!) when available on `spec` or `design.fingerSpecs`.
- * - Falls back to `renderProceduralNailSwatchDataUrl` (V11 `manufacturingSpec` + V10 `blueprint`).
- */
 export function generateNailSwatchDataUrl(
   input: NailDesign | NailFingerDesignSpec,
   width = 180,
   height = 260
 ): string {
   if ('fingerId' in input) {
+    if (input.trueUvDataUrl) {
+      return buildTrueUvNailSvgDataUrl(input.trueUvDataUrl, input.shape, width, height);
+    }
     if (input.preview3DDataUrl) {
       return input.preview3DDataUrl;
     }
     return renderProceduralNailSwatchDataUrl(input, width, height);
   }
   const primarySpec = pickPrimaryFingerSpec(input);
+  if (primarySpec.trueUvDataUrl) {
+    return buildTrueUvNailSvgDataUrl(primarySpec.trueUvDataUrl, primarySpec.shape, width, height);
+  }
   if (primarySpec.preview3DDataUrl) {
     return primarySpec.preview3DDataUrl;
   }
   return renderProceduralNailSwatchDataUrl(primarySpec, width, height);
 }
 
-/**
- * Asynchronous rasterized PNG/JPEG swatch renderer prioritizing `preview3DDataUrl`
- * and backed by `renderProceduralNailSwatchDataUrl`.
- */
 export async function renderAsyncNailSwatchPng(
   input: NailDesign | NailFingerDesignSpec,
   width = 180,
@@ -173,9 +240,8 @@ export function getStudioMonogram(studioName: string): string {
   const words = studioName
     .trim()
     .split(/\s+/)
-    .filter((w) => w.length > 0);
+    .filter((w) => w.length > 0 && !['de', 'da', 'do', 'das', 'dos', 'e', '&'].includes(w.toLowerCase()));
   if (words.length === 0) return 'NA';
   if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
   return `${words[0][0]}${words[1][0]}`.toUpperCase();
 }
-

@@ -309,6 +309,15 @@ export interface NailDesignBlueprint {
   artElements: VectorArtElement[];
 }
 
+export interface NailUvPinTarget {
+  cxNorm: number; // 0..1 normalized X center on reference image
+  cyNorm: number; // 0..1 normalized Y center on reference image
+  widthNorm: number; // normalized plate width relative to image width
+  heightNorm: number; // normalized plate height relative to image height
+  angleRad: number; // orientation angle of DIP->TIP in image space
+  detectedFromPhoto: boolean;
+}
+
 export interface NailFingerDesignSpec {
   fingerId: FingerId;
   handSide?: 'Left' | 'Right';
@@ -323,6 +332,9 @@ export interface NailFingerDesignSpec {
   strokeAnchors: StrokeAnchor[];
   metallicIntensity: number;
   glossIntensity: number;
+  // V12 Photorealistic True UV Texture Transfer (512x512 WebP/PNG + interactive 4x loupe target)
+  trueUvDataUrl?: string;
+  uvExtractionTarget?: NailUvPinTarget;
   // V11 Primary 3D Manufacturing Spec + Real 3D Offscreen Render Preview
   manufacturingSpec?: Nail3DManufacturingSpec;
   preview3DDataUrl?: string; // Snapshot rendered by Three.js offscreenNailRenderer (NOT a raw photo crop!)

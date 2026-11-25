@@ -191,15 +191,16 @@ export function createDorsalNailMaterial(
     roughness: 1.0,
     metalness: 1.0,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.04,
+    clearcoatRoughness: 0.03,
     ior: 1.52,
     specularIntensity: 1.0,
     envMap,
-    envMapIntensity: 1.4,
+    envMapIntensity: 1.65,
     normalScale: new THREE.Vector2(1.15, 1.15),
-    transparent: false,
+    transparent: true,
     opacity: 1.0,
-    alphaTest: 0.02,
+    alphaTest: 0,
+    premultipliedAlpha: false,
     depthWrite: true,
     depthTest: true,
     side: THREE.FrontSide,
@@ -390,10 +391,14 @@ export function applyDorsalMaterialOpacity(
   opacity: number
 ): void {
   const clamped = clamp01(opacity);
-  const needsAlpha = clamped < 0.99;
-  if (material.transparent !== needsAlpha) {
+  const hasFeatheredAlphaMap = Boolean(material.alphaMap);
+  const needsAlpha = hasFeatheredAlphaMap || clamped < 0.99;
+  const shouldWriteDepth = clamped >= 0.95;
+  if (material.transparent !== needsAlpha || material.depthWrite !== shouldWriteDepth) {
     material.transparent = needsAlpha;
-    material.depthWrite = !needsAlpha;
+    material.depthWrite = shouldWriteDepth;
+    material.alphaTest = 0;
+    material.premultipliedAlpha = false;
     material.needsUpdate = true;
   }
   material.opacity = clamped;

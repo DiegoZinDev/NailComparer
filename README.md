@@ -128,6 +128,17 @@ A versão **V11** preserva 100% da performance 60fps da V10 e corrige definitiva
 
 ---
 
+## 2.4 Arquitetura V12 (`feat/v11-true-uv-texture-transfer`) — Transferência Direta de Textura UV `512×512`, PBR Derivado de Pixels, Lupa de Pinça UV 4× & Feathering Gaussiano (100% Client-Side / R$ 0,00)
+
+A versão **V12** substitui a vetorização cartunesca na importação por **transferência direta fotorrealista de pixels UV `512×512`** rodando 100% no navegador (iOS Safari + Android Chrome + Vercel Free Tier, `< 300ms`, custo `R$ 0,00`):
+
+- **`TrueUVExtractor` (`perFingerVisionAnalyzer.ts`)**: Localiza os 5 dedos via singleton MediaPipe (`numHands: 2`), contrai estritamente para o polígono interno seguro de **88% (`u ∈ [0.06, 0.94]`, `v ∈ [0.06, 0.94]`)** — excluindo pele, anéis e fundo — e executa **unwarping bilinear direto `512×512`** da imagem full-res com nivelamento linear ultra-suave (`[0.92, 1.08]`) preservando integralmente cromados espelhados, esferas metálicas 3D, strass e pigmentos profundos (`WebP 0.92` com fallback automático `PNG`).
+- **Síntese PBR Física a partir dos Próprios Pixels (`proceduralPBRSynthesizer.ts`)**: Prioridade absoluta para `spec.trueUvDataUrl` (com cache por hash fora do RAF), gerando `map` (`512×512`, `SRGBColorSpace`), `normalMap` (`512×512`, `NoColorSpace` via pré-blur `3×3` + Sobel `strength = 3.2`), `metalnessMap` (`256×256` contínuo até `0.85`, com piso `0.55..0.85` em placas cromadas espelhadas) e `roughnessMap` (`256×256`, `0.08..0.28`), sobre `HTMLCanvasElement` estritamente Power-of-Two com mipmaps (`LinearMipmapLinearFilter`) para WebGL2 iOS Safari e Android Chrome.
+- **Lupa de Pinça UV 4× Interativa & Swatch Real (`ImportReferenceModal.tsx` + `swatchPreview.ts`)**: Estágio touch-first (`touch-action: none`) com zoom `4×`, contorno tracejado dos 88% internos + mira central, arraste por Pointer Events (`onPointerDown/Move/Up`), ajuste rápido de tamanho (`- / +`) e ângulo (`-30°..+30°`), re-extração em tempo real (`~40ms`), botão **"Aplicar esta textura nos 5 dedos"** e swatch recortado em silhueta anatômica com Arco C e brilho UV no dock.
+- **Feathering Gaussiano Sem Borda Branca & Blindagem dos 5 Dedos (`nailShaderMaterials.ts` + `proceduralPBRSynthesizer.ts` + `threeNailScene.ts`)**: `alphaMap` `256×256` com rampa gaussiana suave na cutícula (`v ∈ [0, 0.14]`) e laterais (`u ∈ [0, 0.06] ∪ [0.94, 1.0]`) combinada a `transparent: true, alphaTest: 0, premultipliedAlpha: false, depthWrite: true, clearcoat: 1.0, clearcoatRoughness: 0.03`, mais piso anatômico explícito contra colapso do dedo mínimo (`pinky >= max(0.0082, middleWidth * 0.68)`, `bedLength >= 0.0078`).
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:

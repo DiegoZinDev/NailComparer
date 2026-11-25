@@ -37,16 +37,16 @@ type CanvasSurface = OffscreenCanvas | HTMLCanvasElement;
 type CanvasCtx2D = OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D;
 
 function makeSurface(w: number, h: number): { canvas: CanvasSurface; ctx: CanvasCtx2D } {
-  if (typeof OffscreenCanvas !== 'undefined') {
-    const off = new OffscreenCanvas(w, h);
-    const ctx = off.getContext('2d', { willReadFrequently: true });
-    if (ctx) return { canvas: off, ctx };
+  if (typeof document !== 'undefined') {
+    const el = document.createElement('canvas');
+    el.width = w;
+    el.height = h;
+    const ctx = el.getContext('2d', { willReadFrequently: true })!;
+    return { canvas: el, ctx };
   }
-  const el = document.createElement('canvas');
-  el.width = w;
-  el.height = h;
-  const ctx = el.getContext('2d', { willReadFrequently: true })!;
-  return { canvas: el, ctx };
+  const off = new OffscreenCanvas(w, h);
+  const ctx = off.getContext('2d', { willReadFrequently: true })!;
+  return { canvas: off, ctx };
 }
 
 function makeTextureSurface(w: number, h: number): {
@@ -185,7 +185,21 @@ function hashManufacturingSpec(m: Nail3DManufacturingSpec): string {
   ].join('|');
 }
 
+function hashShortString(str: string): string {
+  let h = 2166136261;
+  const step = Math.max(1, Math.floor(str.length / 96));
+  for (let i = 0; i < str.length; i += step) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${str.length}:${(h >>> 0).toString(36)}`;
+}
+
 export function hashFingerSpec(spec: NailFingerDesignSpec): string {
+  if (spec.trueUvDataUrl) {
+    return `v12-trueuv|${spec.shape}|${hashShortString(spec.trueUvDataUrl)}`;
+  }
+
   if (spec.manufacturingSpec) {
     return hashManufacturingSpec(spec.manufacturingSpec);
   }
@@ -2347,12 +2361,242 @@ function buildFastSobelNormalMap(
 }
 
 /**
- * V11 Lean Clean Vector PBR Compiler (`< 15ms/finger`, ~12 MB total VRAM across all 5 fingers):
- * - Compiles directly from `spec.manufacturingSpec` (V11) or falls back cleanly to `spec.blueprint` (V10).
- * - ZERO raw photo pixels, ZERO `displacementMap`, ZERO `bumpMap`.
- * - `map` (`512×512`) & Sobel `normalMap` (`512×512`) for razor-sharp 3D curves & relief.
- * - `roughnessMap` (`256×256`), `metalnessMap` (`256×256`), and `alphaMap` (`256×256` pure opaque on 96%,
- *   soft cuticle feathering strictly on `v ∈ [0, 0.04]`).
+ * V12 Gaussian Feathered AlphaMap (`256×256` POT, iOS Safari + Android Chrome WebGL2 safe):
+ * - Cuticle (`v ∈ [0, 0.14]`): Gaussian ramp `f(t) = 1 - exp(-(t / sigma)^2)` from 0 at `v=0` to 255 at `v=0.14`.
+ * - Lateral margins (`u ∈ [0, 0.06]` & `[0.94, 1.0]`): Gaussian ramp from 0 at edges to 255 inside,
+ *   eliminating 100% of jagged white borders.
+ * - Free edge (`v ∈ [0.14, 1.0]`, interior): 100% crisp opaque (255) with 1.5% tip micro-AA.
+ */
+function buildGaussianFeatheredAlphaCanvas(size: number): HTMLCanvasElement {
+  const { canvas, ctx } = makeTextureSurface(size, size);
+  const imgData = ctx.createImageData(size, size);
+  const d = imgData.data;
+
+  const gaussianRamp = (tNorm: number, sigma = 0.42): number => {
+    if (tNorm <= 0) return 0;
+    if (tNorm >= 1) return 1;
+    // Normalized so f(0)=0 and f(1)=1 smoothly
+    const raw = 1 - Math.exp(-(tNorm * tNorm) / (sigma * sigma));
+    const norm = 1 - Math.exp(-1 / (sigma * sigma));
+    return clamp01(raw / norm);
+  };
+
+  for (let y = 0; y < size; y++) {
+    // Three.js UV convention: y = 0 is tip (v = 1), y = size - 1 is cuticle (v = 0)
+    const v = 1 - y / Math.max(1, size - 1);
+    const cuticleFactor = v < 0.14 ? gaussianRamp(v / 0.14, 0.44) : 1.0;
+    const tipFactor = v > 0.985 ? gaussianRamp((1 - v) / 0.015, 0.46) : 1.0;
+
+    for (let x = 0; x < size; x++) {
+      const u = x / Math.max(1, size - 1);
+      const leftFactor = u < 0.06 ? gaussianRamp(u / 0.06, 0.42) : 1.0;
+      const rightFactor = u > 0.94 ? gaussianRamp((1 - u) / 0.06, 0.42) : 1.0;
+
+      const alphaByte = clampByte(cuticleFactor * tipFactor * leftFactor * rightFactor * 255);
+      const idx = (y * size + x) * 4;
+      d[idx] = alphaByte;
+      d[idx + 1] = alphaByte;
+      d[idx + 2] = alphaByte;
+      d[idx + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+
+/**
+ * V12 Pixel-Derived Physical PBR Synthesis from Photorealistic `512×512` True UV Texture:
+ * - `normalMap` (`512×512`, `NoColorSpace`): luminance `L = 0.299R + 0.587G + 0.114B` ->
+ *   3×3 Gaussian pre-blur `[1,2,1; 2,4,2; 1,2,1]/16` -> Sobel 3×3 (`strength = 3.2`) -> tangent-space normals.
+ * - `metalnessMap` (`256×256`) & `roughnessMap` (`256×256`): detects chrome/gold/champagne/silver/gem
+ *   specular contrast & metallic chromatic signature, outputting continuous metalness up to `0.85`
+ *   (lifting floor to `0.55..0.85` on full-plate chrome) and roughness `0.08..0.16` (gloss/chrome) or `0.18..0.28` (matte).
+ */
+function deriveTrueUvPBRMapsFromImage(
+  img: HTMLImageElement,
+  albedoCtx: CanvasRenderingContext2D,
+  normalCtx: CanvasRenderingContext2D,
+  metalCtx: CanvasRenderingContext2D,
+  roughCtx: CanvasRenderingContext2D,
+  albedoSize: number,
+  auxSize: number
+): void {
+  // 1. Draw real 512x512 True UV texture cleanly into albedo canvas
+  albedoCtx.clearRect(0, 0, albedoSize, albedoSize);
+  albedoCtx.drawImage(img, 0, 0, albedoSize, albedoSize);
+  const srcRgba = albedoCtx.getImageData(0, 0, albedoSize, albedoSize).data;
+
+  // 2. Luminance field + 3x3 [1,2,1; 2,4,2; 1,2,1]/16 pre-blur to kill JPEG compression noise
+  const nPx = albedoSize * albedoSize;
+  const luma = new Float32Array(nPx);
+  for (let i = 0; i < nPx; i++) {
+    const p = i * 4;
+    luma[i] = (0.299 * srcRgba[p] + 0.587 * srcRgba[p + 1] + 0.114 * srcRgba[p + 2]) / 255;
+  }
+
+  const blurred = new Float32Array(nPx);
+  for (let y = 0; y < albedoSize; y++) {
+    const ym = y > 0 ? y - 1 : 0;
+    const yp = y < albedoSize - 1 ? y + 1 : albedoSize - 1;
+    for (let x = 0; x < albedoSize; x++) {
+      const xm = x > 0 ? x - 1 : 0;
+      const xp = x < albedoSize - 1 ? x + 1 : albedoSize - 1;
+      const sum =
+        luma[ym * albedoSize + xm] +
+        2 * luma[ym * albedoSize + x] +
+        luma[ym * albedoSize + xp] +
+        2 * luma[y * albedoSize + xm] +
+        4 * luma[y * albedoSize + x] +
+        2 * luma[y * albedoSize + xp] +
+        luma[yp * albedoSize + xm] +
+        2 * luma[yp * albedoSize + x] +
+        luma[yp * albedoSize + xp];
+      blurred[y * albedoSize + x] = sum * 0.0625;
+    }
+  }
+
+  // 3. Sobel 3x3 tangent-space normalMap (strength ~ 3.2) giving real 3D relief to metal beads, gems & gel waves
+  const normalData = normalCtx.createImageData(albedoSize, albedoSize);
+  const nd = normalData.data;
+  const sobelStrength = 3.2;
+
+  for (let y = 0; y < albedoSize; y++) {
+    const ym = y > 0 ? y - 1 : 0;
+    const yp = y < albedoSize - 1 ? y + 1 : albedoSize - 1;
+    for (let x = 0; x < albedoSize; x++) {
+      const xm = x > 0 ? x - 1 : 0;
+      const xp = x < albedoSize - 1 ? x + 1 : albedoSize - 1;
+
+      const tl = blurred[ym * albedoSize + xm];
+      const tc = blurred[ym * albedoSize + x];
+      const tr = blurred[ym * albedoSize + xp];
+      const ml = blurred[y * albedoSize + xm];
+      const mr = blurred[y * albedoSize + xp];
+      const bl = blurred[yp * albedoSize + xm];
+      const bc = blurred[yp * albedoSize + x];
+      const br = blurred[yp * albedoSize + xp];
+
+      const gx = (tr + 2 * mr + br - (tl + 2 * ml + bl)) * sobelStrength;
+      const gy = (bl + 2 * bc + br - (tl + 2 * tc + tr)) * sobelStrength;
+      const nx = -gx;
+      const ny = gy;
+      const nz = 1.0;
+      const invLen = 1 / Math.hypot(nx, ny, nz);
+
+      const idx = (y * albedoSize + x) * 4;
+      nd[idx] = clampByte((nx * invLen * 0.5 + 0.5) * 255);
+      nd[idx + 1] = clampByte((ny * invLen * 0.5 + 0.5) * 255);
+      nd[idx + 2] = clampByte((nz * invLen * 0.5 + 0.5) * 255);
+      nd[idx + 3] = 255;
+    }
+  }
+  normalCtx.putImageData(normalData, 0, 0);
+
+  // 4. Downsample to 256x256 to derive continuous metalnessMap (0..0.85) & roughnessMap (0.08..0.28)
+  const { ctx: auxSampleCtx } = makeSurface(auxSize, auxSize);
+  auxSampleCtx.drawImage(img, 0, 0, auxSize, auxSize);
+  const auxRgba = auxSampleCtx.getImageData(0, 0, auxSize, auxSize).data;
+
+  const auxCount = auxSize * auxSize;
+  const auxLuma = new Float32Array(auxCount);
+  const auxMetallicHint = new Float32Array(auxCount);
+  let lumaSum = 0;
+  let metallicPlateAccumulator = 0;
+  let highContrastCount = 0;
+
+  for (let i = 0; i < auxCount; i++) {
+    const p = i * 4;
+    const r = auxRgba[p] / 255;
+    const g = auxRgba[p + 1] / 255;
+    const b = auxRgba[p + 2] / 255;
+    const mx = Math.max(r, g, b);
+    const mn = Math.min(r, g, b);
+    const sat = mx > 0.001 ? (mx - mn) / mx : 0;
+    const l = 0.299 * r + 0.587 * g + 0.114 * b;
+    auxLuma[i] = l;
+    lumaSum += l;
+
+    // Gold / champagne / silver / pearl-chrome chromatic signature
+    const isWarmGold = r > 0.42 && g > 0.32 && r >= g * 0.96 && g >= b * 1.04 && sat >= 0.14 && sat <= 0.68;
+    const isCoolSilver = l > 0.48 && sat < 0.16;
+    const hint = isWarmGold ? 0.72 : isCoolSilver ? 0.58 : 0.0;
+    auxMetallicHint[i] = hint;
+    metallicPlateAccumulator += hint;
+  }
+
+  const meanLuma = lumaSum / Math.max(1, auxCount);
+  let lumaVarSum = 0;
+  for (let i = 0; i < auxCount; i++) {
+    const dl = auxLuma[i] - meanLuma;
+    lumaVarSum += dl * dl;
+    if (Math.abs(dl) > 0.20) highContrastCount++;
+  }
+  const lumaStd = Math.sqrt(lumaVarSum / Math.max(1, auxCount));
+  const avgPlateMetallicHint = metallicPlateAccumulator / Math.max(1, auxCount);
+  const isFullPlateChrome =
+    avgPlateMetallicHint > 0.34 && (lumaStd > 0.13 || highContrastCount / auxCount > 0.16);
+
+  const metalData = metalCtx.createImageData(auxSize, auxSize);
+  const roughData = roughCtx.createImageData(auxSize, auxSize);
+  const md = metalData.data;
+  const rd = roughData.data;
+
+  for (let y = 0; y < auxSize; y++) {
+    const ym = y > 0 ? y - 1 : 0;
+    const yp = y < auxSize - 1 ? y + 1 : auxSize - 1;
+    for (let x = 0; x < auxSize; x++) {
+      const xm = x > 0 ? x - 1 : 0;
+      const xp = x < auxSize - 1 ? x + 1 : auxSize - 1;
+      const i = y * auxSize + x;
+
+      const l = auxLuma[i];
+      const grad =
+        Math.abs(auxLuma[y * auxSize + xp] - auxLuma[y * auxSize + xm]) +
+        Math.abs(auxLuma[yp * auxSize + x] - auxLuma[ym * auxSize + x]);
+      const specularContrast = clamp01((l - meanLuma - 0.06) * 2.4 + grad * 1.8);
+      const localHint = auxMetallicHint[i];
+
+      let metalVal: number;
+      if (isFullPlateChrome) {
+        // Full-plate mirror chrome (e.g. gold champagne / silver): lift floor to 0.55..0.85
+        metalVal = clamp(0.55 + specularContrast * 0.22 + localHint * 0.14, 0.55, 0.85);
+      } else {
+        // Selective metallic studs, gold waves, gems & chrome accents: 0.04..0.85
+        const gemBoost = specularContrast > 0.45 && localHint > 0.3 ? 0.52 : 0;
+        metalVal = clamp(0.04 + localHint * 0.38 + specularContrast * 0.28 + gemBoost, 0.04, 0.85);
+      }
+
+      const roughVal = isFullPlateChrome
+        ? clamp(0.14 - specularContrast * 0.06, 0.08, 0.15)
+        : clamp(0.24 - metalVal * 0.14 - specularContrast * 0.05, 0.08, 0.26);
+
+      const mByte = clampByte(metalVal * 255);
+      const rByte = clampByte(roughVal * 255);
+      const p = i * 4;
+      md[p] = mByte;
+      md[p + 1] = mByte;
+      md[p + 2] = mByte;
+      md[p + 3] = 255;
+
+      rd[p] = rByte;
+      rd[p + 1] = rByte;
+      rd[p + 2] = rByte;
+      rd[p + 3] = 255;
+    }
+  }
+
+  metalCtx.putImageData(metalData, 0, 0);
+  roughCtx.putImageData(roughData, 0, 0);
+}
+
+/**
+ * V12 PBR Synthesizer:
+ * - ABSOLUTE PRIORITY: When `spec.trueUvDataUrl` is present, directly transfers the real `512×512`
+ *   photorealistic UV texture (`SRGBColorSpace`) and derives physical `normalMap` (`512×512` 3×3 blur + Sobel),
+ *   `metalnessMap` (`256×256`, up to `0.85`), `roughnessMap` (`256×256`), and Gaussian feathered `alphaMap` (`256×256`).
+ * - Falls back cleanly to V11 `manufacturingSpec` or V10 `blueprint` for non-UV studio designs.
+ * - Strictly POT canvases (`HTMLCanvasElement`) with mipmaps enabled for iOS Safari + Android Chrome WebGL2.
  */
 export function synthesizeCleanPBRBundle(
   spec: NailFingerDesignSpec
@@ -2362,71 +2606,113 @@ export function synthesizeCleanPBRBundle(
   if (cached) return cached;
 
   const { canvas: albedoCanvas, ctx: albedoCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
-  const { ctx: heightCtx } = makeSurface(ALBEDO_SIZE, ALBEDO_SIZE);
+  const { canvas: normalCanvas, ctx: normalCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
   const { canvas: metalCanvas, ctx: metalCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
   const { canvas: roughCanvas, ctx: roughCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
 
-  const hasRaisedRelief = spec.manufacturingSpec
-    ? paintManufacturingLayers(
-        spec.manufacturingSpec,
-        albedoCtx,
-        heightCtx,
-        metalCtx,
-        roughCtx,
-        ALBEDO_SIZE,
-        ALBEDO_SIZE,
-        AUX_SIZE,
-        AUX_SIZE
-      )
-    : paintBlueprintOntoMaps(
-        resolveBlueprint(spec),
-        albedoCtx,
-        heightCtx,
-        metalCtx,
-        roughCtx,
-        ALBEDO_SIZE,
-        ALBEDO_SIZE,
-        AUX_SIZE,
-        AUX_SIZE
-      );
+  // Instant clean frame-0 base fill (zero black flash while Image decodes asynchronously)
+  albedoCtx.fillStyle = spec.baseColor || '#D4B483';
+  albedoCtx.fillRect(0, 0, ALBEDO_SIZE, ALBEDO_SIZE);
+  normalCtx.fillStyle = 'rgb(128,128,255)';
+  normalCtx.fillRect(0, 0, ALBEDO_SIZE, ALBEDO_SIZE);
+  metalCtx.fillStyle = 'rgb(140,140,140)';
+  metalCtx.fillRect(0, 0, AUX_SIZE, AUX_SIZE);
+  roughCtx.fillStyle = 'rgb(36,36,36)';
+  roughCtx.fillRect(0, 0, AUX_SIZE, AUX_SIZE);
 
-  const heightPixels = heightCtx.getImageData(0, 0, ALBEDO_SIZE, ALBEDO_SIZE).data;
-  const { canvas: normalCanvas, ctx: normalCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
-  const normalData = normalCtx.createImageData(ALBEDO_SIZE, ALBEDO_SIZE);
+  if (!spec.trueUvDataUrl) {
+    const { ctx: heightCtx } = makeSurface(ALBEDO_SIZE, ALBEDO_SIZE);
+    const hasRaisedRelief = spec.manufacturingSpec
+      ? paintManufacturingLayers(
+          spec.manufacturingSpec,
+          albedoCtx,
+          heightCtx,
+          metalCtx,
+          roughCtx,
+          ALBEDO_SIZE,
+          ALBEDO_SIZE,
+          AUX_SIZE,
+          AUX_SIZE
+        )
+      : paintBlueprintOntoMaps(
+          resolveBlueprint(spec),
+          albedoCtx,
+          heightCtx,
+          metalCtx,
+          roughCtx,
+          ALBEDO_SIZE,
+          ALBEDO_SIZE,
+          AUX_SIZE,
+          AUX_SIZE
+        );
 
-  const normalStrength = hasRaisedRelief ? 4.4 : 2.0;
-  buildFastSobelNormalMap(heightPixels, ALBEDO_SIZE, ALBEDO_SIZE, normalStrength, normalData);
-  normalCtx.putImageData(normalData, 0, 0);
+    const heightPixels = heightCtx.getImageData(0, 0, ALBEDO_SIZE, ALBEDO_SIZE).data;
+    const normalData = normalCtx.createImageData(ALBEDO_SIZE, ALBEDO_SIZE);
+    const normalStrength = hasRaisedRelief ? 4.4 : 2.0;
+    buildFastSobelNormalMap(heightPixels, ALBEDO_SIZE, ALBEDO_SIZE, normalStrength, normalData);
+    normalCtx.putImageData(normalData, 0, 0);
+  }
 
-  // 256×256 AlphaMap: 100% pure white (255) on 96% of plate; soft cuticle feathering ONLY on v ∈ [0, 0.04]
-  const { canvas: alphaCanvas, ctx: alphaCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
-  alphaCtx.fillStyle = 'rgb(255,255,255)';
-  alphaCtx.fillRect(0, 0, AUX_SIZE, AUX_SIZE);
-  const cuticleTopY = Math.round(AUX_SIZE * 0.96);
-  const alphaGrad = alphaCtx.createLinearGradient(0, cuticleTopY, 0, AUX_SIZE);
-  alphaGrad.addColorStop(0.0, 'rgb(255,255,255)');
-  alphaGrad.addColorStop(0.55, 'rgb(192,192,192)');
-  alphaGrad.addColorStop(1.0, 'rgb(24,24,24)');
-  alphaCtx.fillStyle = alphaGrad;
-  alphaCtx.fillRect(0, cuticleTopY, AUX_SIZE, AUX_SIZE - cuticleTopY);
+  // V12 256×256 Gaussian Feathered AlphaMap (cuticle v∈[0,0.14] + lateral edges u∈[0,0.06]∪[0.94,1])
+  const alphaCanvas = buildGaussianFeatheredAlphaCanvas(AUX_SIZE);
 
   const map = new THREE.CanvasTexture(albedoCanvas);
   map.colorSpace = THREE.SRGBColorSpace;
+  map.generateMipmaps = true;
+  map.minFilter = THREE.LinearMipmapLinearFilter;
+  map.magFilter = THREE.LinearFilter;
   map.anisotropy = 4;
   map.needsUpdate = true;
 
   const normalMap = new THREE.CanvasTexture(normalCanvas);
+  normalMap.colorSpace = THREE.NoColorSpace;
+  normalMap.generateMipmaps = true;
+  normalMap.minFilter = THREE.LinearMipmapLinearFilter;
+  normalMap.magFilter = THREE.LinearFilter;
   normalMap.anisotropy = 4;
   normalMap.needsUpdate = true;
 
   const roughnessMap = new THREE.CanvasTexture(roughCanvas);
+  roughnessMap.colorSpace = THREE.NoColorSpace;
+  roughnessMap.generateMipmaps = true;
+  roughnessMap.minFilter = THREE.LinearMipmapLinearFilter;
   roughnessMap.needsUpdate = true;
 
   const metalnessMap = new THREE.CanvasTexture(metalCanvas);
+  metalnessMap.colorSpace = THREE.NoColorSpace;
+  metalnessMap.generateMipmaps = true;
+  metalnessMap.minFilter = THREE.LinearMipmapLinearFilter;
   metalnessMap.needsUpdate = true;
 
   const alphaMap = new THREE.CanvasTexture(alphaCanvas);
+  alphaMap.colorSpace = THREE.NoColorSpace;
+  alphaMap.generateMipmaps = true;
+  alphaMap.minFilter = THREE.LinearMipmapLinearFilter;
   alphaMap.needsUpdate = true;
+
+  let disposed = false;
+
+  if (spec.trueUvDataUrl && typeof Image !== 'undefined') {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (disposed) return;
+      deriveTrueUvPBRMapsFromImage(
+        img,
+        albedoCtx,
+        normalCtx,
+        metalCtx,
+        roughCtx,
+        ALBEDO_SIZE,
+        AUX_SIZE
+      );
+      map.needsUpdate = true;
+      normalMap.needsUpdate = true;
+      metalnessMap.needsUpdate = true;
+      roughnessMap.needsUpdate = true;
+    };
+    img.src = spec.trueUvDataUrl;
+  }
 
   const bundle: ProceduralPBRBundle = {
     specHash,
@@ -2436,6 +2722,7 @@ export function synthesizeCleanPBRBundle(
     metalnessMap,
     alphaMap,
     dispose: () => {
+      disposed = true;
       map.dispose();
       normalMap.dispose();
       roughnessMap.dispose();
