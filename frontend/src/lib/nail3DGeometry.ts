@@ -123,27 +123,37 @@ export function createVolumetricNailGeometry(
     const hollowProgress =
       v <= 0.42 ? 0 : Math.sin(Math.min(1, (v - 0.42) / 0.58) * (Math.PI / 2));
 
+    // Clean longitudinal UV for Group 1 underside: v ∈ [0, 1] from hyponychium base to free-edge tip
+    const vUnderside =
+      r <= hollowStartRow ? 0 : (r - hollowStartRow) / Math.max(1, rows - hollowStartRow);
+
     for (let c = 0; c <= cols; c++) {
-      const s = (c / cols) * 2 - 1; // -1 .. +1
+      const uParam = c / cols; // 0 (left lateral edge) .. 1 (right lateral edge)
+      const s = uParam * 2 - 1; // -1 .. +1
       const x = s * halfW;
       const y = v * lengthRatio;
+
+      // Smooth lateral thickness taper to exactly 0 at u = 0 and u = 1 so dorsal & ventral shells fuse cleanly
+      const lateralTaper =
+        c === 0 || c === cols ? 0 : Math.pow(Math.max(0, Math.sin(Math.PI * uParam)), 0.55);
 
       // Transverse C-Curve (Arco C)
       const zCCurve = -cCurveDepth * (1 - Math.cos(s * Math.PI * 0.48));
       const zTop = zCCurve + apexZ;
 
       // Ventral concave hollow: center thins slightly more than lateral sidewalls for real C-tunnel depth
-      const centerConcavity = (1 - s * s) * 0.014 * hollowProgress;
-      const zBot = zTop - thickness + centerConcavity;
+      const centerConcavity = (1 - s * s) * 0.014 * hollowProgress * lateralTaper;
+      const zBot = zTop - thickness * lateralTaper + centerConcavity;
 
-      const uTex = Math.max(0.01, Math.min(0.99, 0.5 + x * 0.96));
-      const vTex = v;
+      const uTop = Math.max(0.01, Math.min(0.99, 0.5 + x * 0.96));
+      const vTop = v;
 
       topPositions.push(x, y, zTop);
-      topUVs.push(uTex, vTex);
+      topUVs.push(uTop, vTop);
 
       botPositions.push(x, y, zBot);
-      botUVs.push(uTex, vTex);
+      // Group 1 underside UVs cover clean u ∈ [0, 1] (left->right) and v ∈ [0, 1] (hyponychium->free tip)
+      botUVs.push(uParam, vUnderside);
     }
   }
 
@@ -180,7 +190,8 @@ export function createVolumetricNailGeometry(
     }
   }
 
-  // Dedicated duplicated vertices for crisp lateral & free-edge thickness wall normals (Group 0)
+  // Dedicated duplicated vertices for crisp free-edge & proximal thickness wall normals (Group 0)
+  // Note: lateral edges (u = 0 and u = 1) taper to thickness = 0 so dorsal & ventral shells meet cleanly.
   const pushRimQuad = (topA: number, topB: number, botA: number, botB: number) => {
     const base = positions.length / 3;
     const copyVert = (srcIdx: number) => {
@@ -199,28 +210,14 @@ export function createVolumetricNailGeometry(
     group0Indices.push(base, base + 3, base + 1);
   };
 
-  // 3) Right lateral rim wall (c = cols, walking r = 0 -> rows)
-  for (let r = 0; r < rows; r++) {
-    const t0 = r * stride + cols;
-    const t1 = (r + 1) * stride + cols;
-    pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
-  }
-
-  // 4) Distal free-edge rim wall (r = rows, walking c = cols -> 0)
+  // 3) Distal free-edge rim wall (r = rows, walking c = cols -> 0)
   for (let c = cols; c > 0; c--) {
     const t0 = rows * stride + c;
     const t1 = rows * stride + (c - 1);
     pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
   }
 
-  // 5) Left lateral rim wall (c = 0, walking r = rows -> 0)
-  for (let r = rows; r > 0; r--) {
-    const t0 = r * stride;
-    const t1 = (r - 1) * stride;
-    pushRimQuad(t0, t1, botOffset + t0, botOffset + t1);
-  }
-
-  // 6) Proximal cuticle base cap (r = 0, walking c = 0 -> cols) to guarantee a watertight closed shell
+  // 4) Proximal cuticle base cap (r = 0, walking c = 0 -> cols) to guarantee a watertight closed shell
   for (let c = 0; c < cols; c++) {
     const t0 = c;
     const t1 = c + 1;
