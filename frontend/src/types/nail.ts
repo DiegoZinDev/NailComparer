@@ -61,6 +61,8 @@ export interface NailDesign {
   finish: 'glossy' | 'chrome' | 'velvet' | 'glitter';
   imageDataUrl?: string | null;
   isCustom?: boolean;
+  detectedShape?: NailShape;
+  detectedLength?: number;
   createdAt?: string;
 }
 
@@ -77,6 +79,13 @@ export type ARViewMode = 'camera' | 'studio-demo';
 export interface NormalizedPoint {
   x: number;
   y: number;
+  z?: number;
+}
+
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
 }
 
 export interface FingerPose {
@@ -84,6 +93,9 @@ export interface FingerPose {
   tip: NormalizedPoint;
   dip: NormalizedPoint;
   pip?: NormalizedPoint;
+  mcp?: NormalizedPoint;
+  wrist?: NormalizedPoint;
+  palmNormal?: Vec3;
   widthScale: number;
   lengthScale: number;
 }

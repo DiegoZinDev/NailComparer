@@ -166,8 +166,20 @@ export function App(): React.ReactElement {
 
   const handleCreateDesign = async (draft: Omit<NailDesign, 'id' | 'createdAt'>) => {
     const res = await createNailDesign(draft);
-    setDesigns((prev) => [res.design, ...prev]);
-    setActiveDesignId(res.design.id);
+    const created: NailDesign = {
+      ...res.design,
+      detectedShape: draft.detectedShape ?? res.design.detectedShape,
+      detectedLength: draft.detectedLength ?? res.design.detectedLength,
+    };
+    setDesigns((prev) => [created, ...prev.filter((d) => d.id !== created.id)]);
+    setActiveDesignId(created.id);
+    if (created.detectedShape || created.detectedLength) {
+      setAdjustment((prev) => ({
+        ...prev,
+        shape: created.detectedShape ?? prev.shape,
+        extensionLength: created.detectedLength ?? prev.extensionLength,
+      }));
+    }
     setActiveTab('client');
     setCompareClean(false);
     setSyncStatus(res.status);
@@ -374,6 +386,13 @@ export function App(): React.ReactElement {
           onSelectDesign={(d) => {
             setCompareClean(false);
             setActiveDesignId(d.id);
+            if (d.detectedShape || d.detectedLength) {
+              setAdjustment((prev) => ({
+                ...prev,
+                shape: d.detectedShape ?? prev.shape,
+                extensionLength: d.detectedLength ?? prev.extensionLength,
+              }));
+            }
           }}
           onOpenImport={() => setImportOpen(true)}
           onDeleteCustom={handleDeleteCustom}

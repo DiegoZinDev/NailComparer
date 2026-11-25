@@ -14,14 +14,14 @@ O **Nail AR Studio** elimina a indecisão da cliente na cadeira de atendimento e
 
 ---
 
-## 2. Motor AR 3D WebGL / GLSL 60fps (Arco C + Bump Map + Luz Ambiente)
+## 2. Motor AR 3D Three.js + PBR (`MeshPhysicalMaterial` + Oclusão de Profundidade + Quatérnios 3D)
 
-Os módulos `frontend/src/lib/webglNailEngine.ts` e `frontend/src/components/ARCameraCanvas.tsx` combinam MediaPipe Hands (`HandLandmarker` em modo `VIDEO`, 21 landmarks) a um **Shader WebGL / GLSL 3D em tempo real a 60fps**:
+Os módulos [`frontend/src/lib/threeNailScene.ts`](frontend/src/lib/threeNailScene.ts), [`frontend/src/lib/nail3DGeometry.ts`](frontend/src/lib/nail3DGeometry.ts), [`frontend/src/lib/nail3DReconstructor.ts`](frontend/src/lib/nail3DReconstructor.ts) e [`frontend/src/components/ARCameraCanvas.tsx`](frontend/src/components/ARCameraCanvas.tsx) substituem a renderização 2D por um motor WebGL completo em **Three.js + PBR a 60fps** acoplado ao MediaPipe Hands (`HandLandmarker` em modo `VIDEO`, 21 landmarks):
 
-- **Geometria Curva Anatômica 3D (Arco C)**: Malha subdividida (`20×26`) projetada sobre superfície cilíndrica curva alinhada ao eixo `DIP -> TIP` de cada dedo individualmente, com cobertura de largura ampliada (`1.12x`) para evitar vazamento da unha natural e mapeamento UV conformal sem distorção ao trocar o formato.
-- **Relevo 3D & Reflexo Metálico/Gel (Procedural Bump/Normal Map)**: O fragment shader calcula em tempo real o gradiente de luminância da textura (`gx`, `gy`) para gerar relevo tátil e reflexos especulares metálicos/glossy (ex.: fios dourados 3D, cromado, pérola e topcoat em gel) que deslizam dinamicamente sobre a curvatura da unha conforme a inclinação do dedo.
-- **Adaptação à Luz do Ambiente (Ambient Light Matching)**: Amostra em tempo real a cor e luminância média da pele entre `PIP` e `DIP` (`sampleFingerSkinAmbient`) para modular exposição, temperatura de cor, oclusão lateral (*Ambient Occlusion*) e fusão suave na cutícula (*subsurface feathering*).
-- **Seletor Rápido de Formato & Alongamento**: Barra discreta acima do dock para alternar em 1 toque entre **Natural**, **Amendoada**, **Bailarina**, **Quadrada** e **Stiletto**, combinada aos sliders de **Comprimento do Alongamento** e **Largura de Encaixe** (`NailAdjustControls`).
+- **Malha Sólida Paramétrica 3D (`createNail3DGeometry`)**: Geometria `THREE.BufferGeometry` fechada (`24×30` subdivisões) com casca dorsal e ventral conectadas por bordas laterais e ponta livre com espessura real de gel esculpido (`0.045` no ápice estrutural a `0.032` na borda livre), curvatura transversal **Arco C** (`cCurveDepth = 0.18`), elevação longitudinal do **Ápice Estrutural** e UVs conformais sem distorção ao alternar os 5 formatos (**Natural**, **Amendoada**, **Bailarina**, **Quadrada** e **Stiletto**).
+- **Material PBR Fotorrealista (`THREE.MeshPhysicalMaterial`)**: Configurado com camada de topcoat em gel (`clearcoat: 1.0`, `clearcoatRoughness: 0.04`, `ior: 1.52`, `reflectivity: 0.9`), mapa de ambiente *Softbox Studio* gerado em memória via `THREE.PMREMGenerator` (100% offline) e conjunto completo de texturas PBR geradas por `generatePBRTextureMaps` (`map`, `normalMap` via gradiente Sobel 3×3, `roughnessMap`, `metalnessMap` para detalhes metálicos/folha de ouro/cromado e `alphaMap` com fusão suave na cutícula).
+- **Rastreamento 3D por Quatérnios & Oclusão de Profundidade do Dedo**: Constrói base ortonormal 3D por dedo usando o eixo `DIP -> TIP` e a normal da palma (`computePalmNormal`), suavizando posição (`lerp`) e rotação (`Quaternion.slerp`) em tempo real. Cinco cápsulas invisíveis de oclusão anatômica (`THREE.CapsuleGeometry` com `colorWrite: false` e `depthWrite: true`) posicionadas entre `PIP` e `TIP` garantem ocultação realista da parte traseira da unha quando os dedos giram em ângulo.
+- **Adaptação Dinâmica à Iluminação da Pele (`sampleFingerSkinAmbient`)**: Amostra a cada frame o RGB e luminância da pele entre `PIP` e `DIP` para modular `HemisphereLight`, `DirectionalLight` e `ACESFilmicToneMapping` sem estourar o brilho.
 
 ---
 
@@ -98,13 +98,13 @@ Disponível pelo botão de engrenagem no HUD superior (`frontend/src/components/
 
 ---
 
-## 6. Extrator de Unha de Alta Precisão ("Nail Loupe Extractor") & UI Limpa
+## 6. Reconstrutor 3D de Referências (`Nail3DReconstructor`) & UI Limpa
 
-- **Nail Loupe Extractor (`frontend/src/lib/nailExtractor.ts` + `ImportReferenceModal.tsx`)**:
-  - Ao importar uma foto de referência (Pinterest/Instagram ou câmera), executa automaticamente o MediaPipe `HandLandmarker` em modo **`IMAGE`**, calcula o centro exato da placa ungueal (`nailCenter = DIP + 0.65 * (TIP - DIP)`) e aplica **zoom automático de `4.5x`** estritamente no interior da unha (excluindo pele, anéis e fundo).
-  - **Lupa Interativa (`2.0x` a `8.0x`) + Extração Rápida por Dedo (`Unha 1`, `Unha 2`, `Unha 3`...)**: permite alternar em 1 toque entre as diferentes unhas decoradas detectadas na mesma foto e refinar o enquadramento arrastando com o dedo ou com gesto de pinça.
+- **Reconstrutor 3D Cromático + Lupa (`frontend/src/lib/nail3DReconstructor.ts` + `ImportReferenceModal.tsx`)**:
+  - Ao importar uma foto de referência (galeria ou câmera), executa MediaPipe `HandLandmarker` em modo **`IMAGE`**, realiza **segmentação cromática pele vs. placa ungueal** em espaço perceptual tipo Lab (`analyzeNailContourAndShape`) e infere automaticamente o formato 3D (`detectedShape`: *natural*, *square*, *coffin*, *almond*, *stiletto*) e o comprimento proporcional do alongamento (`detectedLength`), aplicando esses parâmetros automaticamente na malha 3D ao selecionar o design.
+  - Aplica **zoom automático de `4.5x`** (`renderLoupeNailTexture`) estritamente no interior da placa da unha com lupa interativa (`2.0x` a `8.0x`) e botões de **Extração Rápida por Dedo (`Unha 1`, `Unha 2`, `Unha 3`...)**, gerando na sequência os mapas PBR (`normalMap` Sobel, `roughnessMap`, `metalnessMap` e `alphaMap`) no motor Three.js.
 - **Seletor Rápido + Dock Limpo em 2 Abas**: Seletor discreto de 5 formatos acima do dock, 2 abas limpas (**`Referência da Cliente`** e **`Catálogo do Estúdio`**) e destaque máximo para o botão **`+ Importar Referência`**.
-- **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera + overlay WebGL 3D + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
+- **Captura 3D com Marca d'Água & Antes/Depois (`CapturePreviewModal.tsx`)**: Compõe câmera/modelo + overlay WebGL Three.js 3D + selo editorial do estúdio em PNG pronto para compartilhar no WhatsApp.
 
 ---
 
