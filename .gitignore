@@ -1,0 +1,9 @@
+node_modules/
+dist/
+backend/dist/
+frontend/dist/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+.env

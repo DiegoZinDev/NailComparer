@@ -1,0 +1,19 @@
+{
+  "name": "Nail AR Studio — White Label",
+  "short_name": "Nail AR",
+  "description": "Provador virtual de unhas em Realidade Aumentada ao vivo para estúdios e nail designers.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#171214",
+  "theme_color": "#171214",
+  "lang": "pt-BR",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

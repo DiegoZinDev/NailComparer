@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="128" fill="#171214"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" stroke="#D4A383" stroke-opacity="0.28" stroke-width="4"/>
+  <path d="M256 96C296 96 332 146 332 214V324C332 374.81 297.97 416 256 416C214.03 416 180 374.81 180 324V214C180 146 216 96 256 96Z" fill="url(#nailGrad)"/>
+  <path d="M222 148C231 128 244 116 256 116" stroke="#FFF9F5" stroke-width="14" stroke-linecap="round" opacity="0.72"/>
+  <defs>
+    <linearGradient id="nailGrad" x1="180" y1="96" x2="332" y2="416" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F3D5C0"/>
+      <stop offset="0.55" stop-color="#D4A383"/>
+      <stop offset="1" stop-color="#8C5E47"/>
+    </linearGradient>
+  </defs>
+</svg>
