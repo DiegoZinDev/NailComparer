@@ -27,8 +27,9 @@ interface ARCameraCanvasProps {
   onCameraNotice?: (message: string | null) => void;
 }
 
-const SMOOTHING_ALPHA = 0.44;
 const DEFAULT_AMBIENT: AmbientLightSample = { r: 0.78, g: 0.63, b: 0.54, luma: 0.66 };
+const AMBIENT_SAMPLE_INTERVAL_MS = 120;
+const AMBIENT_SAMPLE_MIN_FRAMES = 4;
 
 const FINGER_MCP_IDX: Record<FingerPose['id'], number> = {
   thumb: 1,
@@ -67,7 +68,9 @@ const DEMO_3D_HAND_POSES: FingerPose[] = DEMO_HAND_POSES.map((p) => {
     tip: { ...p.tip, z: 0 },
     dip: { ...p.dip, z: 0 },
     pip: p.pip ?? { x: p.dip.x - dx * 1.15, y: p.dip.y - dy * 1.15, z: 0 },
-    palmNormal: { x: 0, y: 0, z: 1 },
+    // MediaPipe -Z faces camera; handedness 'Right' with mirrorX=false preserves -Z -> +Z dorsal in Three.js
+    palmNormal: { x: 0, y: 0, z: -1 },
+    handedness: 'Right',
   };
 });
 
@@ -91,10 +94,13 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
     const videoRef = useRef<HTMLVideoElement | null>(null);
     const demoImgRef = useRef<HTMLImageElement | null>(null);
     const landmarkerRef = useRef<HandLandmarker | null>(null);
-    const smoothedPosesRef = useRef<FingerPose[] | null>(null);
+    const latestPosesRef = useRef<FingerPose[] | null>(null);
     const ambientRef = useRef<AmbientLightSample>(DEFAULT_AMBIENT);
     const lastVideoTimeRef = useRef<number>(-1);
     const lastTrackingRef = useRef<boolean>(false);
+    const lastFrameTimeRef = useRef<number>(0);
+    const lastAmbientSampleTimeRef = useRef<number>(0);
+    const ambientFrameCounterRef = useRef<number>(AMBIENT_SAMPLE_MIN_FRAMES);
 
     // Keep latest props in refs so 60fps RAF never restarts on slider drag
     const designRef = useRef(activeDesign);
@@ -294,11 +300,16 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
       };
     }, [mode, facingMode, onModeChange, onCameraNotice]);
 
-    // Main 60fps background draw + MediaPipe 3D tracking + Ambient Skin Lighting + Three.js PBR 3D render
+    // Main 60fps background draw + MediaPipe 3D tracking + Throttled Ambient Skin Lighting + Three.js PBR 3D render
     useEffect(() => {
       let rafId = 0;
 
-      const renderFrame = () => {
+      const renderFrame = (nowMs: number) => {
+        const prevTime = lastFrameTimeRef.current;
+        const deltaTimeSec =
+          prevTime > 0 ? Math.min(0.05, Math.max(0.001, (nowMs - prevTime) / 1000)) : 1 / 60;
+        lastFrameTimeRef.current = nowMs;
+
         const canvas = canvasRef.current;
         if (!canvas) {
           rafId = requestAnimationFrame(renderFrame);
@@ -331,6 +342,11 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         const video = videoRef.current;
         const demoImg = demoImgRef.current;
 
+        ambientFrameCounterRef.current += 1;
+        const canSampleAmbient =
+          ambientFrameCounterRef.current >= AMBIENT_SAMPLE_MIN_FRAMES &&
+          nowMs - lastAmbientSampleTimeRef.current >= AMBIENT_SAMPLE_INTERVAL_MS;
+
         if (
           currentMode === 'camera' &&
           video &&
@@ -356,23 +372,24 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           }
           ctx.restore();
 
-          // Run MediaPipe HandLandmarker on each new video frame
+          // Decoupled MediaPipe inference: strictly ONLY when video.currentTime advances
           const landmarker = landmarkerRef.current;
           if (landmarker && video.currentTime !== lastVideoTimeRef.current) {
             lastVideoTimeRef.current = video.currentTime;
             try {
-              const result = landmarker.detectForVideo(video, performance.now());
+              const result = landmarker.detectForVideo(video, nowMs);
               const hand = result.landmarks?.[0];
               const rawHandedness = result.handednesses?.[0]?.[0]?.categoryName;
               const handedness: FingerPose['handedness'] =
                 rawHandedness === 'Left' ? 'Left' : 'Right';
+
               if (hand && hand.length >= 21) {
                 const wrist = hand[0];
                 const indexMcp = hand[5];
                 const pinkyMcp = hand[17];
                 const palmNormal = computePalmNormal(wrist, indexMcp, pinkyMcp);
 
-                const rawPoses: FingerPose[] = MEDIAPIPE_FINGER_PAIRS.map((cfg) => {
+                latestPosesRef.current = MEDIAPIPE_FINGER_PAIRS.map((cfg) => {
                   const tip = hand[cfg.tipIdx];
                   const dip = hand[cfg.dipIdx];
                   const pip = hand[cfg.pipIdx];
@@ -403,52 +420,12 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
                   };
                 });
 
-                if (!smoothedPosesRef.current) {
-                  smoothedPosesRef.current = rawPoses;
-                } else {
-                  smoothedPosesRef.current = rawPoses.map((next, idx) => {
-                    const prev = smoothedPosesRef.current![idx];
-                    return {
-                      ...next,
-                      tip: {
-                        x: prev.tip.x + (next.tip.x - prev.tip.x) * SMOOTHING_ALPHA,
-                        y: prev.tip.y + (next.tip.y - prev.tip.y) * SMOOTHING_ALPHA,
-                        z:
-                          (prev.tip.z ?? 0) +
-                          ((next.tip.z ?? 0) - (prev.tip.z ?? 0)) * SMOOTHING_ALPHA,
-                      },
-                      dip: {
-                        x: prev.dip.x + (next.dip.x - prev.dip.x) * SMOOTHING_ALPHA,
-                        y: prev.dip.y + (next.dip.y - prev.dip.y) * SMOOTHING_ALPHA,
-                        z:
-                          (prev.dip.z ?? 0) +
-                          ((next.dip.z ?? 0) - (prev.dip.z ?? 0)) * SMOOTHING_ALPHA,
-                      },
-                      pip: next.pip,
-                      mcp: next.mcp,
-                      palmNormal: next.palmNormal,
-                      handedness: next.handedness,
-                      widthScale:
-                        prev.widthScale + (next.widthScale - prev.widthScale) * SMOOTHING_ALPHA,
-                      lengthScale:
-                        prev.lengthScale + (next.lengthScale - prev.lengthScale) * SMOOTHING_ALPHA,
-                    };
-                  });
-                }
-
-                // Sample live ambient skin light between PIP and DIP
-                ambientRef.current = sampleFingerSkinAmbient(
-                  video,
-                  smoothedPosesRef.current,
-                  ambientRef.current
-                );
-
                 if (!lastTrackingRef.current) {
                   lastTrackingRef.current = true;
                   onTrackingChange?.(true);
                 }
               } else {
-                smoothedPosesRef.current = null;
+                latestPosesRef.current = null;
                 if (lastTrackingRef.current) {
                   lastTrackingRef.current = false;
                   onTrackingChange?.(false);
@@ -459,17 +436,28 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
             }
           }
 
-          if (!compareCleanRef.current && smoothedPosesRef.current && threeScene) {
+          if (canSampleAmbient && latestPosesRef.current) {
+            ambientRef.current = sampleFingerSkinAmbient(
+              video,
+              latestPosesRef.current,
+              ambientRef.current
+            );
+            lastAmbientSampleTimeRef.current = nowMs;
+            ambientFrameCounterRef.current = 0;
+          }
+
+          if (!compareCleanRef.current && latestPosesRef.current && threeScene) {
             threeScene.renderNails(
               cssW,
               cssH,
               dpr,
               rect,
-              smoothedPosesRef.current,
+              latestPosesRef.current,
               designRef.current,
               adjustmentRef.current,
               ambientRef.current,
-              mirrorX
+              mirrorX,
+              deltaTimeSec
             );
           } else {
             threeScene?.clear(cssW, cssH, dpr);
@@ -480,11 +468,15 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
           ctx.fillRect(0, 0, cssW, cssH);
           ctx.drawImage(demoImg, rect.drawX, rect.drawY, rect.drawW, rect.drawH);
 
-          ambientRef.current = sampleFingerSkinAmbient(
-            demoImg,
-            DEMO_3D_HAND_POSES,
-            ambientRef.current
-          );
+          if (canSampleAmbient) {
+            ambientRef.current = sampleFingerSkinAmbient(
+              demoImg,
+              DEMO_3D_HAND_POSES,
+              ambientRef.current
+            );
+            lastAmbientSampleTimeRef.current = nowMs;
+            ambientFrameCounterRef.current = 0;
+          }
 
           if (!compareCleanRef.current && threeScene) {
             threeScene.renderNails(
@@ -496,7 +488,8 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
               designRef.current,
               adjustmentRef.current,
               ambientRef.current,
-              false
+              false,
+              deltaTimeSec
             );
           } else {
             threeScene?.clear(cssW, cssH, dpr);
