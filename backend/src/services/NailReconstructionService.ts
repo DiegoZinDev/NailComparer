@@ -115,8 +115,14 @@ export interface GeminiExecutionContext {
   enableGenerativeUvAtlas?: boolean;
 }
 
-const GEMINI_PRIMARY_MODEL = 'gemini-2.5-flash';
-const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash-lite';
+const GEMINI_PRIMARY_MODEL = 'gemini-3.5-flash-lite';
+const GEMINI_MODEL_CASCADE: readonly string[] = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+];
 const GEMINI_IMAGE_MODEL = 'gemini-2.5-flash-image';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const RETRY_DELAYS_MS = [1500, 3500, 7000] as const;
@@ -872,6 +878,268 @@ function parseRetryAfterMs(retryAfterHeader: string | null): number | null {
   return null;
 }
 
+const EXCLUDED_DISCOVERY_MODEL_TOKENS = [
+  'tts',
+  'audio',
+  'live',
+  'image',
+  'embedding',
+  'transcribe',
+] as const;
+
+function normalizeGeminiModelName(raw: string | undefined): string {
+  if (!raw) return '';
+  return raw.trim().replace(/^models\//i, '').trim();
+}
+
+function buildGeminiModelCascade(): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const envModel = normalizeGeminiModelName(process.env.GEMINI_MODEL);
+
+  if (envModel) {
+    ordered.push(envModel);
+    seen.add(envModel);
+  }
+
+  for (const model of GEMINI_MODEL_CASCADE) {
+    if (!seen.has(model)) {
+      ordered.push(model);
+      seen.add(model);
+    }
+  }
+
+  return ordered;
+}
+
+function buildGeminiGenerationConfig(model: string): Record<string, unknown> {
+  const normalized = model.trim().toLowerCase();
+  if (normalized.startsWith('gemini-3') || normalized.startsWith('gemini-4')) {
+    return { responseMimeType: 'application/json' };
+  }
+  if (normalized.startsWith('gemini-2')) {
+    return { responseMimeType: 'application/json', temperature: 0.15 };
+  }
+  return { responseMimeType: 'application/json' };
+}
+
+async function extractGeminiErrorMessage(response: Response, apiKey: string): Promise<string> {
+  try {
+    const rawText = await response.text();
+    if (!rawText) return '';
+    let message = '';
+    try {
+      const parsed = JSON.parse(rawText) as { error?: { message?: unknown } };
+      if (typeof parsed?.error?.message === 'string') {
+        message = parsed.error.message;
+      }
+    } catch {
+      message = rawText;
+    }
+
+    let sanitized = message;
+    if (apiKey.length > 0) {
+      sanitized = sanitized.split(apiKey).join('[REDACTED]');
+    }
+    sanitized = sanitized
+      .replace(/AIza[0-9A-Za-z_-]{10,}/g, '[REDACTED]')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return sanitized.slice(0, 180);
+  } catch {
+    return '';
+  }
+}
+
+async function discoverAvailableFlashModel(
+  apiKey: string,
+  fetchFn: typeof fetch,
+  triedModels: ReadonlySet<string>
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const listUrl = `${GEMINI_BASE_URL}?key=${encodeURIComponent(apiKey)}`;
+    const response = await fetchFn(listUrl, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutHandle);
+
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as {
+      models?: Array<{
+        name?: unknown;
+        supportedGenerationMethods?: unknown;
+      }>;
+    };
+    if (!Array.isArray(payload?.models)) return null;
+
+    for (const entry of payload.models) {
+      if (!entry || typeof entry.name !== 'string') continue;
+      const methods = Array.isArray(entry.supportedGenerationMethods)
+        ? entry.supportedGenerationMethods
+        : [];
+      if (!methods.includes('generateContent')) continue;
+
+      const modelName = normalizeGeminiModelName(entry.name);
+      if (!modelName || triedModels.has(modelName)) continue;
+
+      const lower = modelName.toLowerCase();
+      if (!lower.includes('flash')) continue;
+      if (EXCLUDED_DISCOVERY_MODEL_TOKENS.some((tok) => lower.includes(tok))) continue;
+
+      return modelName;
+    }
+
+    return null;
+  } catch {
+    clearTimeout(timeoutHandle);
+    return null;
+  }
+}
+
+async function invokeSingleGeminiModel(
+  model: string,
+  apiKey: string,
+  parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
+  fetchFn: typeof fetch,
+  sleepFn: (ms: number) => Promise<void>,
+  isLastModel: boolean
+): Promise<
+  | { ok: true; parsed: unknown; modelUsed: string }
+  | { ok: false; error: AppError; isNotFound: boolean }
+> {
+  const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const maxAttempts = isLastModel ? RETRY_DELAYS_MS.length + 1 : 2;
+  let lastError: AppError | null = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetchFn(url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: buildGeminiGenerationConfig(model),
+        }),
+      });
+
+      clearTimeout(timeoutHandle);
+
+      if (response.ok) {
+        const jsonBody = await response.json();
+        const parsed = extractGeminiJsonText(jsonBody);
+        return { ok: true, parsed, modelUsed: model };
+      }
+
+      const status = response.status;
+      const providerMsg = await extractGeminiErrorMessage(response, apiKey);
+      const providerSuffix = providerMsg ? ` Detalhe: ${providerMsg}` : '';
+
+      if (status === 401 || status === 403) {
+        throw new AppError(
+          401,
+          `Chave Gemini inválida ou sem permissão no Google AI Studio.${providerSuffix}`
+        );
+      }
+
+      if (status === 404) {
+        return {
+          ok: false,
+          isNotFound: true,
+          error: new AppError(
+            404,
+            `Modelo Gemini ${model} indisponível (HTTP 404).${providerSuffix}`
+          ),
+        };
+      }
+
+      if (status === 429 || status === 503) {
+        const retryAfterMs = parseRetryAfterMs(response.headers?.get?.('retry-after') ?? null);
+        const delayMs =
+          retryAfterMs ?? RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+
+        lastError = new AppError(
+          status,
+          `Limite temporário do Gemini Free Tier (${status}) no modelo ${model}.${providerSuffix}`
+        );
+
+        if (!isLastModel) {
+          if (retryAfterMs !== null && retryAfterMs <= 2000) {
+            await sleepFn(retryAfterMs);
+          }
+          break;
+        }
+
+        if (attempt < maxAttempts - 1) {
+          await sleepFn(delayMs);
+          continue;
+        }
+        break;
+      }
+
+      if (status >= 400 && status < 500) {
+        throw new BadRequestError(
+          `Requisição rejeitada pelo serviço Gemini (HTTP ${status}) no modelo ${model}.${providerSuffix}`
+        );
+      }
+
+      lastError = new AppError(
+        502,
+        `Falha transitória do serviço Gemini (HTTP ${status}) no modelo ${model}.${providerSuffix}`
+      );
+      if (attempt < maxAttempts - 1) {
+        await sleepFn(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
+        continue;
+      }
+    } catch (err) {
+      clearTimeout(timeoutHandle);
+      if (err instanceof AppError) {
+        if (err.statusCode === 401 || err.statusCode === 400) {
+          throw err;
+        }
+        lastError = err;
+        break;
+      }
+
+      const isAbort =
+        err instanceof Error &&
+        (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'));
+      lastError = new AppError(
+        504,
+        isAbort
+          ? `Tempo limite excedido ao consultar o modelo ${model}.`
+          : `Falha de rede ao consultar o modelo ${model}.`
+      );
+
+      if (!isLastModel) {
+        break;
+      }
+      if (attempt < maxAttempts - 1) {
+        await sleepFn(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    isNotFound: false,
+    error:
+      lastError ??
+      new AppError(503, `Modelo ${model} temporariamente indisponível.`),
+  };
+}
+
 async function callGeminiWithFallback(
   apiKey: string,
   parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }>,
@@ -884,115 +1152,51 @@ async function callGeminiWithFallback(
     throw new AppError(500, 'Fetch nativo indisponível neste runtime Node.');
   }
 
-  const modelsToTry = [GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL] as const;
+  const modelsToTry = buildGeminiModelCascade();
   let lastError: AppError | null = null;
+  let notFoundCount = 0;
 
   for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
     const model = modelsToTry[mIdx];
-    const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const maxAttempts = model === GEMINI_PRIMARY_MODEL ? 2 : RETRY_DELAYS_MS.length + 1;
+    const outcome = await invokeSingleGeminiModel(
+      model,
+      apiKey,
+      parts,
+      fetchFn,
+      sleepFn,
+      mIdx === modelsToTry.length - 1
+    );
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const controller = new AbortController();
-      const timeoutHandle = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS);
+    if (outcome.ok) {
+      return { parsed: outcome.parsed, modelUsed: outcome.modelUsed };
+    }
 
-      try {
-        const response = await fetchFn(url, {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            contents: [{ role: 'user', parts }],
-            generationConfig: {
-              responseMimeType: 'application/json',
-              temperature: 0.15,
-            },
-          }),
-        });
+    lastError = outcome.error;
+    if (outcome.isNotFound) {
+      notFoundCount += 1;
+    }
+  }
 
-        clearTimeout(timeoutHandle);
-
-        if (response.ok) {
-          const jsonBody = await response.json();
-          const parsed = extractGeminiJsonText(jsonBody);
-          return { parsed, modelUsed: model };
-        }
-
-        const status = response.status;
-        if (status === 401 || status === 403) {
-          throw new AppError(
-            401,
-            'Chave Gemini inválida ou sem permissão no Google AI Studio.'
-          );
-        }
-
-        if (status === 429 || status === 503) {
-          const retryAfterMs = parseRetryAfterMs(response.headers?.get?.('retry-after') ?? null);
-          const delayMs =
-            retryAfterMs ?? RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
-
-          lastError = new AppError(
-            status,
-            `Limite temporário do Gemini Free Tier (${status}) no modelo ${model}.`
-          );
-
-          if (model === GEMINI_PRIMARY_MODEL && attempt >= 0) {
-            if (retryAfterMs !== null && retryAfterMs <= 2000) {
-              await sleepFn(retryAfterMs);
-            }
-            break;
-          }
-
-          if (attempt < maxAttempts - 1) {
-            await sleepFn(delayMs);
-            continue;
-          }
-          break;
-        }
-
-        if (status >= 400 && status < 500) {
-          throw new BadRequestError(
-            `Requisição rejeitada pelo serviço Gemini (HTTP ${status}).`
-          );
-        }
-
-        lastError = new AppError(
-          502,
-          `Falha transitória do serviço Gemini (HTTP ${status}).`
-        );
-        if (attempt < maxAttempts - 1) {
-          await sleepFn(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
-          continue;
-        }
-      } catch (err) {
-        clearTimeout(timeoutHandle);
-        if (err instanceof AppError) {
-          if (err.statusCode === 401 || err.statusCode === 400) {
-            throw err;
-          }
-          lastError = err;
-          break;
-        }
-
-        const isAbort =
-          err instanceof Error &&
-          (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'));
-        lastError = new AppError(
-          504,
-          isAbort
-            ? `Tempo limite excedido ao consultar o modelo ${model}.`
-            : 'Falha de rede ao consultar o modelo Gemini.'
-        );
-
-        if (model === GEMINI_PRIMARY_MODEL) {
-          break;
-        }
-        if (attempt < maxAttempts - 1) {
-          await sleepFn(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
-        }
+  // Emergency auto-discovery when every model in the cascade returned HTTP 404
+  if (notFoundCount === modelsToTry.length) {
+    const discoveredModel = await discoverAvailableFlashModel(
+      apiKey,
+      fetchFn,
+      new Set(modelsToTry)
+    );
+    if (discoveredModel) {
+      const discoveredOutcome = await invokeSingleGeminiModel(
+        discoveredModel,
+        apiKey,
+        parts,
+        fetchFn,
+        sleepFn,
+        true
+      );
+      if (discoveredOutcome.ok) {
+        return { parsed: discoveredOutcome.parsed, modelUsed: discoveredOutcome.modelUsed };
       }
+      lastError = discoveredOutcome.error;
     }
   }
 
