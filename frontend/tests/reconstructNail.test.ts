@@ -134,7 +134,7 @@ test('V13.1 Health Check: GET /api/reconstruct-nail and POST action=status retur
       ok: true,
       configured: true,
       source: 'server_env',
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash-lite',
     });
     assert.ok(!JSON.stringify(payload).includes('secret-test-server-key-never-expose'));
 
@@ -143,7 +143,7 @@ test('V13.1 Health Check: GET /api/reconstruct-nail and POST action=status retur
       ok: true,
       configured: true,
       source: 'server_env',
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash-lite',
     });
 
     const clientStatus = await checkServerAiStatus(
@@ -159,7 +159,7 @@ test('V13.1 Health Check: GET /api/reconstruct-nail and POST action=status retur
       configured: true,
       source: 'server_env',
       status: 200,
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.5-flash-lite',
     });
   } finally {
     if (prevKey === undefined) {
@@ -193,4 +193,104 @@ test('V13.1 Error Transparency: HTTP 500 from /api/reconstruct-nail yields local
     `Expected descriptive HTTP 500 fallbackReason, got: ${String(result.fallbackReason)}`
   );
 });
+
+test('V13.2 Gemini 3.x Cascade: HTTP 404 on 1st model automatically falls back to 2nd model and omits temperature for Gemini 3.x', async () => {
+  const requestedUrls: string[] = [];
+  const sentGenerationConfigs: Array<Record<string, unknown>> = [];
+
+  const mockFetchCascade = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    requestedUrls.push(url);
+    if (typeof init?.body === 'string') {
+      const parsedBody = JSON.parse(init.body) as {
+        generationConfig?: Record<string, unknown>;
+      };
+      sentGenerationConfigs.push(parsedBody.generationConfig ?? {});
+    }
+
+    if (requestedUrls.length === 1) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: 404,
+            message: 'models/gemini-3.5-flash-lite is no longer available to new users.',
+            status: 'NOT_FOUND',
+          },
+        }),
+        { status: 404, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const validGlobalJson = {
+      lightingEnvironment: {
+        roomTemperature: 'neutral',
+        specularReflectionsPresent: true,
+        discountedReflectionNotesPt: 'Reflexo suave de estúdio.',
+      },
+      visibleHandsCount: 1,
+      visibleFingersCount: 5,
+      handCountScope: 5,
+      hasAccentFingers: false,
+      hasLeftRightDifferences: false,
+      identicalFingerGroups: [['thumb', 'index', 'middle', 'ring', 'pinky']],
+      accentFingers: [],
+      fingerSummaries: [],
+      predominantShape: 'almond',
+      averageFreeEdgeRatio: 0.48,
+      predominantFinish: 'mirror_chrome',
+      predominantRenderStrategy: 'procedural_pbr_3d',
+      realHexPalette: ['#D4B483'],
+      physicalAccessoriesPresent: [],
+      overallNotesPt: 'Unhas amendoadas champagne cromadas.',
+    };
+
+    return new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [{ text: JSON.stringify(validGlobalJson) }],
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  }) as typeof fetch;
+
+  const prevModel = process.env.GEMINI_MODEL;
+  delete process.env.GEMINI_MODEL;
+
+  try {
+    const res = await executeReconstructNail(
+      {
+        action: 'analyze_global',
+        fullImageBase64: 'A'.repeat(64),
+        mimeType: 'image/jpeg',
+      },
+      {},
+      {
+        envApiKey: 'test-key-v13-2',
+        fetchImpl: mockFetchCascade,
+        sleepImpl: async () => {},
+      }
+    );
+
+    assert.equal(res.configured, true);
+    assert.ok('action' in res && res.action === 'analyze_global');
+    assert.equal(res.modelUsed, 'gemini-3.1-flash-lite');
+    assert.equal(requestedUrls.length, 2);
+    assert.ok(requestedUrls[0].includes('/gemini-3.5-flash-lite:generateContent'));
+    assert.ok(requestedUrls[1].includes('/gemini-3.1-flash-lite:generateContent'));
+    assert.deepEqual(sentGenerationConfigs[0], { responseMimeType: 'application/json' });
+    assert.deepEqual(sentGenerationConfigs[1], { responseMimeType: 'application/json' });
+  } finally {
+    if (prevModel === undefined) {
+      delete process.env.GEMINI_MODEL;
+    } else {
+      process.env.GEMINI_MODEL = prevModel;
+    }
+  }
+});
+
 
