@@ -5,18 +5,20 @@ import type {
   NailFingerDesignSpec,
   NailHandSpecsBySide,
   NailShape,
+  NailTechnicalSheet,
   StudioConfig,
 } from '../types/nail';
 
 const DB_NAME = 'nail-ar-studio-db';
-const DB_VERSION = 2; // V13 schema migration: purges broken legacy V11/V12 local reconstructions
+const DB_VERSION = 3; // V14 schema migration: preserves valid designs, purges legacy raw-UV-only entries without clean parametric spec
 const STORE_CONFIG = 'studioConfig';
 const STORE_DESIGNS = 'nailDesigns';
 
 const LS_CONFIG_KEY = 'nail_ar_studio_config_v1';
-const LS_DESIGNS_KEY = 'nail_ar_studio_designs_v13';
+const LS_DESIGNS_KEY = 'nail_ar_studio_designs_v14';
+const LS_LEGACY_V13_DESIGNS_KEY = 'nail_ar_studio_designs_v13';
 const LS_LEGACY_DESIGNS_KEY = 'nail_ar_studio_designs_v1';
-const LS_MIGRATION_FLAG = 'nail_ar_studio_migrated_v13';
+const LS_MIGRATION_FLAG = 'nail_ar_studio_migrated_v14';
 
 export type SyncStatus = 'synced' | 'offline';
 
@@ -105,15 +107,54 @@ async function idbSaveConfig(config: StudioConfig): Promise<void> {
   }
 }
 
+function hasCleanParametricSpec(spec: NailFingerDesignSpec | undefined): boolean {
+  if (!spec) return false;
+  const mfg = spec.manufacturingSpec;
+  if (
+    mfg &&
+    typeof mfg.shape === 'string' &&
+    VALID_SHAPES.has(mfg.shape) &&
+    typeof mfg.trueBaseColorHex === 'string' &&
+    mfg.trueBaseColorHex.trim().length > 0
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isLegacyRawUvOnlySpecMap(
+  map: Record<FingerId, NailFingerDesignSpec> | undefined
+): boolean {
+  if (!map) return false;
+  const entries = Object.values(map).filter(Boolean);
+  if (entries.length === 0) return false;
+  const hasRawUv = entries.some(
+    (spec) => Boolean(spec.trueUvDataUrl) || spec.renderStrategy === 'canonical_uv_delighted'
+  );
+  if (!hasRawUv) return false;
+  // Purge designs that depended exclusively on raw pixel crop trueUvDataUrl without clean parametric spec
+  return entries.every((spec) => !hasCleanParametricSpec(spec));
+}
+
+function isLegacyRawUvOnlyDesign(design: NailDesign): boolean {
+  if (isLegacyRawUvOnlySpecMap(design.fingerSpecs)) return true;
+  if (isLegacyRawUvOnlySpecMap(design.handSpecsBySide?.Left)) return true;
+  if (isLegacyRawUvOnlySpecMap(design.handSpecsBySide?.Right)) return true;
+  return false;
+}
+
 /**
- * V13 Cache Hygiene:
+ * V14 Cache Hygiene:
  * - Purges legacy fictional `seed-*` entries.
  * - Purges broken legacy V11/V12 imported reconstructions lacking `v13Engine`
  *   (specifically low-fidelity `< 80%` / `< 0.80` local fallbacks or pre-V13 custom imports).
+ * - Purges legacy designs that relied exclusively on raw pixel crop `trueUvDataUrl`
+ *   without a clean parametric `manufacturingSpec`.
  */
 function stripLegacyFictionalSeeds(designs: NailDesign[]): NailDesign[] {
   return designs.filter((d) => {
     if (String(d.id).startsWith('seed-')) return false;
+    if (isLegacyRawUvOnlyDesign(d)) return false;
     if (!d.v13Engine) {
       const score = d.fidelityScore;
       const isLowFidelity =
@@ -192,14 +233,21 @@ export async function ensureOfflineSeed(): Promise<void> {
     await idbSaveConfig(lsConfig ?? DEFAULT_STUDIO_CONFIG);
   }
 
-  // V13 one-time migration: clean legacy localStorage key and persist sanitized designs
+  // V14 one-time idempotent migration: preserve valid designs, clean legacy raw-UV-only records & legacy LS keys
   const migrated = readLocalStorage<boolean>(LS_MIGRATION_FLAG, false);
   const existingDesigns = await idbGetDesigns();
   if (!migrated) {
-    const legacyLs = readLocalStorage<NailDesign[]>(LS_LEGACY_DESIGNS_KEY, []);
-    const combined = existingDesigns && existingDesigns.length > 0 ? existingDesigns : legacyLs;
+    const legacyV13Ls = readLocalStorage<NailDesign[]>(LS_LEGACY_V13_DESIGNS_KEY, []);
+    const legacyV1Ls = readLocalStorage<NailDesign[]>(LS_LEGACY_DESIGNS_KEY, []);
+    const combined =
+      existingDesigns && existingDesigns.length > 0
+        ? existingDesigns
+        : legacyV13Ls.length > 0
+          ? legacyV13Ls
+          : legacyV1Ls;
     await idbSaveAllDesigns(stripLegacyFictionalSeeds(combined));
     try {
+      localStorage.removeItem(LS_LEGACY_V13_DESIGNS_KEY);
       localStorage.removeItem(LS_LEGACY_DESIGNS_KEY);
     } catch {
       // Ignore storage error
@@ -269,6 +317,30 @@ function parseFingerSpecs(
       }
     } catch {
       return undefined;
+    }
+  }
+  return undefined;
+}
+
+function parseTechnicalSheet(rawValue: unknown): NailTechnicalSheet | undefined {
+  if (!rawValue) return undefined;
+  let candidate: unknown = rawValue;
+  if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+    try {
+      candidate = JSON.parse(rawValue);
+    } catch {
+      return undefined;
+    }
+  }
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+    const obj = candidate as Partial<NailTechnicalSheet>;
+    if (
+      typeof obj.generatedAt === 'string' &&
+      typeof obj.summaryPt === 'string' &&
+      Array.isArray(obj.fingers) &&
+      typeof obj.whatsappText === 'string'
+    ) {
+      return obj as NailTechnicalSheet;
     }
   }
   return undefined;
@@ -359,6 +431,10 @@ export function apiDesignToLocal(raw: Record<string, unknown>): NailDesign {
         ? raw.secondary_color
         : accentColor;
 
+  const technicalSheet = parseTechnicalSheet(
+    raw.technicalSheet ?? raw.technicalSheetJson ?? raw.technical_sheet_json
+  );
+
   return {
     id: String(raw.id),
     name: String(raw.name ?? 'Design'),
@@ -378,6 +454,7 @@ export function apiDesignToLocal(raw: Record<string, unknown>): NailDesign {
     v13Engine: Boolean(raw.v13Engine ?? raw.v13_engine ?? false) || undefined,
     fingerSpecs,
     handSpecsBySide,
+    technicalSheet,
     createdAt:
       typeof raw.createdAt === 'string'
         ? raw.createdAt
@@ -416,6 +493,7 @@ export function localDesignToApi(
     v13Engine: Boolean(design.v13Engine ?? true),
     fingerSpecs: design.fingerSpecs ?? null,
     handSpecsBySide: design.handSpecsBySide ?? null,
+    technicalSheet: design.technicalSheet ?? null,
   };
 }
 
@@ -496,6 +574,7 @@ export async function loadNailDesigns(): Promise<{ designs: NailDesign[]; status
                   ...mapped,
                   fingerSpecs: mapped.fingerSpecs ?? localMatch.fingerSpecs,
                   handSpecsBySide: mapped.handSpecsBySide ?? localMatch.handSpecsBySide,
+                  technicalSheet: mapped.technicalSheet ?? localMatch.technicalSheet,
                   fidelityScore: mapped.fidelityScore ?? localMatch.fidelityScore,
                   detectedShape: mapped.detectedShape ?? localMatch.detectedShape,
                   detectedLength: mapped.detectedLength ?? localMatch.detectedLength,
@@ -562,6 +641,7 @@ export async function createNailDesign(
         secondaryColor: mapped.secondaryColor ?? localItem.secondaryColor,
         fingerSpecs: mapped.fingerSpecs ?? localItem.fingerSpecs,
         handSpecsBySide: mapped.handSpecsBySide ?? localItem.handSpecsBySide,
+        technicalSheet: mapped.technicalSheet ?? localItem.technicalSheet,
         fidelityScore: mapped.fidelityScore ?? localItem.fidelityScore,
         detectedShape: mapped.detectedShape ?? localItem.detectedShape,
         detectedLength: mapped.detectedLength ?? localItem.detectedLength,

@@ -726,21 +726,7 @@ export function sanitizeManufacturingSpec(
         : []
   ).slice(0, 24);
 
-  const defaultStrategy: NailRenderStrategy =
-    isChrome || isGlazed
-      ? 'procedural_pbr_3d'
-      : motifs.some(
-            (m) =>
-              m.kind === 'flower_5petal' ||
-              m.kind === 'flower_4petal' ||
-              m.kind === 'marble_veins' ||
-              m.kind === 'tortoiseshell_spots' ||
-              m.kind === 'abstract_organic'
-          )
-        ? accessories3D.length > 0
-          ? 'hybrid_uv_plus_pbr_3d'
-          : 'canonical_uv_delighted'
-        : 'procedural_pbr_3d';
+  const defaultStrategy: NailRenderStrategy = 'procedural_pbr_3d';
 
   const renderStrategy = sanitizeEnum(
     obj.renderStrategy,
@@ -1560,13 +1546,15 @@ CRITÉRIOS GEOMÉTRICOS RÍGIDOS DE FORMATO ("predominantShape"):
 - "square": Laterais 100% paralelas até borda livre reta com cantos definidos em ~90°.
 - "natural": Acompanha o leito natural curto (freeEdgeRatio <= 0.25) com curvatura orgânica suave.
 
-CLASSIFICAÇÃO DUAL-PATH OMNIFABRIC ("renderStrategy" por dedo e "predominantRenderStrategy"):
-1. "procedural_pbr_3d": Unhas ópticas/esculturais lisas ou paramétricas — mirror chrome, glazed pearl, solid gloss, cat-eye, french, aura/ombré, bordas metálicas e/ou pedrarias/esferas/pérolas/strass 3D.
+CLASSIFICAÇÃO SEMÂNTICA V14 — PRIORIDADE ABSOLUTA "procedural_pbr_3d" ("renderStrategy" por dedo e "predominantRenderStrategy"):
+1. "procedural_pbr_3d" (PADRÃO OBRIGATÓRIO PARA 95%+ DOS DESIGNS DE SALÃO):
+   Use SEMPRE para reconstrução paramétrica/vetorial limpa: esmaltação lisa ou multicolorida dedo-a-dedo (ex.: polegar branco, anelar marrom café, filha única), cromado espelhado (mirror_chrome), perolado/glazed, gel brilhante, jelly, olho de gato, fosco/veludo, glitter, francesinhas, contornos metálicos, traços 3D/dourados, gradientes/aura, motivos florais/mármore/geométricos/abstratos vetorizáveis e acessórios 3D físicos (esferas, pérolas, strass, caviar, gotas 3D).
    EXEMPLO EXPLÍCITO OBRIGATÓRIO: Unhas cromadas douradas espelhadas com esferas metálicas 3D prateadas DEVEM usar renderStrategy: "procedural_pbr_3d", finishType: "mirror_chrome", trueBaseColorHex dourado champanhe real (descontando reflexos pretos/brancos do quarto!), strokes3D: [] e listar cada esfera metálica em accessories3D com (u, v, radiusNorm, colorHex) exatos!
-2. "canonical_uv_delighted": Arte pictórica complexa pintada à mão (flores realistas, mármore orgânico, animal print, quadriculado, ilustrações detalhadas, encapsuladas complexas) SEM camada cromada ou pedrarias 3D físicas.
-3. "hybrid_uv_plus_pbr_3d": Arte pictórica complexa pintada à mão combinada com camada metálica/cromada ou acessórios 3D físicos (esferas, pérolas, strass, gotas 3D).
+2. "canonical_uv_delighted" (EXCEÇÃO RARA): Reserve EXCLUSIVAMENTE para ilustrações pictóricas complexas pintadas à mão impossíveis de vetorizar parametricamente (ex.: retratos em miniatura, personagens de desenho, paisagens fotorrealistas) — NUNCA use para unhas lisas, francesinhas, cromadas, glitter, degradê ou filhas únicas coloridas, evitando esticar pixels crus recortados!
+3. "hybrid_uv_plus_pbr_3d" (EXCEÇÃO RARA): Apenas quando houver ilustração pictórica impossível de vetorizar combinada com acessórios 3D físicos.
 
-REGRAS ÓPTICAS CRÍTICAS:
+REGRAS ÓPTICAS & DEDO-A-DEDO CRÍTICAS:
+- Inspecione CADA DEDO INDIVIDUALMENTE (polegar, indicador, médio, anelar, mínimo): se houver cores base distintas entre dedos (ex.: polegar branco, anelar marrom café, indicador nude) ou filha única com arte/glitter/acessório diferente, NUNCA agrupe dedos diferentes em "identicalFingerGroups"! Marque os dedos distintos em "accentFingers" e descreva cada dedo com precisão em "fingerSummaries".
 - Detecte 1 mão (5 dedos) ou 2 mãos (10 dedos) e diferenças entre Left e Right.
 - Identifique a temperatura e iluminação do quarto/estúdio para descontar reflexos espelhados pretos/cinzas/brancos da cor real do esmalte em realHexPalette.
 - Reflexos especulares de janelas/lâmpadas/objetos escuros no cromo NÃO são nail art nem traços pintados!`;
@@ -1583,21 +1571,22 @@ function buildFingerAnalysisPrompt(
       : '';
 
   return `Você recebeu DUAS imagens:
-- Imagem 1: Foto completa da mão (referência de iluminação do ambiente).
+- Imagem 1: Foto completa da mão (referência de iluminação do ambiente e comparação com os outros dedos).
 - Imagem 2: Crop verticalizado 384x512 da unha específica do dedo "${fingerId}"${handSide ? ` (mão ${handSide})` : ''}.
 ${contextSnippet}
-REGRA CRÍTICA DE DESAMBIGUAÇÃO ÓPTICA & DUAL-PATH OMNIFABRIC:
-1. Analise EXCLUSIVAMENTE a placa ungueal em zoom (Imagem 2), ignorando anéis nos dedos, joias na mão, pele e fundo.
-2. Classifique a estratégia ótima em "renderStrategy":
-   - "procedural_pbr_3d": mirror chrome, glazed pearl, solid gloss, cat-eye, french, aura/ombré, bordas metálicas, pedrarias/esferas/pérolas/strass 3D.
+REGRA CRÍTICA DE RECONSTRUÇÃO SEMÂNTICA DEDO-A-DEDO (V14 — PRIORIDADE procedural_pbr_3d):
+1. Analise EXCLUSIVAMENTE a placa ungueal do dedo "${fingerId}" em zoom (Imagem 2), ignorando anéis nos dedos, joias na mão, pele e fundo.
+2. EXTRAÇÃO INDIVIDUAL FIEL: Extraia a cor base real DESTE dedo específico ("trueBaseColorHex", "secondaryColorHex", "cuticleColorHex", "tipColorHex"), seu formato ("shape"), alongamento ("freeEdgeRatio"), acabamento ("finishType"), borda/francesinha ("borderType", "borderColorHex"), traços ("strokes3D"), motivos ("motifs") e acessórios ("accessories3D") de forma 100% independente — se este dedo for branco e o anelar for marrom café (ou filha única), retorne EXATAMENTE a cor/arte DESTE dedo sem copiar a média da mão!
+3. PRIORIDADE ABSOLUTA EM "renderStrategy":
+   - "procedural_pbr_3d" (PADRÃO PREFERENCIAL): Use para todos os acabamentos ópticos e nail arts parametrizáveis (gel brilhante, cromado espelhado, perolado/glazed, jelly, olho de gato, fosco, glitter, francesinhas, contornos metálicos, traços 3D, gradientes/aura, flores/mármore/abstrato e acessórios 3D).
      EXEMPLO EXPLÍCITO: Unhas cromadas douradas espelhadas com esferas metálicas 3D prateadas DEVEM usar renderStrategy: "procedural_pbr_3d", finishType: "mirror_chrome", trueBaseColorHex dourado champanhe real (descontando reflexos pretos/brancos do quarto!), strokes3D: [] e listar cada esfera metálica em accessories3D com (u, v, radiusNorm, colorHex) exatos!
-   - "canonical_uv_delighted": arte pictórica complexa (flores realistas, mármore orgânico, animal print, quadriculado, ilustrações, encapsuladas complexas).
-   - "hybrid_uv_plus_pbr_3d": arte pictórica complexa + camada metálica/cromada + acessórios 3D físicos.
-3. PROIBIÇÃO ABSOLUTA DE ALUCINAÇÃO DE TRAÇOS:
+   - "canonical_uv_delighted": APENAS para ilustrações pictóricas complexas impossíveis de vetorizar (retratos, personagens, desenhos ultra-detalhados). Evite ao máximo para não recortar/esticar pixels crus da foto.
+   - "hybrid_uv_plus_pbr_3d": APENAS para ilustração pictórica impossível de vetorizar + acessórios 3D físicos.
+4. PROIBIÇÃO ABSOLUTA DE ALUCINAÇÃO DE TRAÇOS:
    Reflexos especulares, sombras do ambiente ou brilho metálico em unhas lisas/cromadas NÃO são strokes3D. Retorne strokes3D: [] sempre que não houver linhas/ondas fisicamente pintadas ou esculpidas.
-4. Informe "nailBoundingBox": [xMin, yMin, xMax, yMax] normalizados (0..1) delimitando exatamente o contorno da placa ungueal dentro da Imagem 2 (zoom).
-5. Use geometria realista de gel de salão: cCurveDepth entre 0.11 e 0.18 e apexHeight entre 0.042 e 0.075.
-6. Mapeie rigorosamente TODOS os acessórios físicos 3D em "accessories3D":
+5. Informe "nailBoundingBox": [xMin, yMin, xMax, yMax] normalizados (0..1) delimitando exatamente o contorno da placa ungueal dentro da Imagem 2 (zoom).
+6. Use geometria realista de gel de salão: cCurveDepth entre 0.11 e 0.18 e apexHeight entre 0.042 e 0.075.
+7. Mapeie rigorosamente TODOS os acessórios físicos 3D em "accessories3D":
    - u: esquerda -> direita (0.08 .. 0.92)
    - v: cutícula -> ponta livre (0.08 .. 0.94)
    - radiusNorm: fração da largura da unha (ex: 0.04 caviar, 0.11 stud médio, 0.16 stud grande)

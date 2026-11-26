@@ -354,6 +354,34 @@ export interface NailFingerSpecsEnvelopeV11 {
   v13Engine?: boolean;
 }
 
+// -----------------------------------------------------------------------------
+// V14 Automatic Nail Technical Sheet (Ficha Técnica Automática Dedo-a-Dedo)
+// -----------------------------------------------------------------------------
+
+export interface NailTechnicalSheetFinger {
+  fingerId: FingerId;
+  labelPt: string;
+  shape: NailShape;
+  shapeLabelPt: string;
+  extensionLevelPt: string;
+  primaryColorHex: string;
+  secondaryColorHex?: string;
+  finishLabelPt: string;
+  artDetailsPt: string[];
+  accessoriesPt: string[];
+  isAccentFinger: boolean;
+}
+
+export interface NailTechnicalSheet {
+  generatedAt: string;
+  summaryPt: string;
+  predominantShapePt: string;
+  predominantExtensionPt: string;
+  hasAccentFingers: boolean;
+  fingers: NailTechnicalSheetFinger[];
+  whatsappText: string;
+}
+
 export interface NailDesignRow {
   id: string;
   name: string;
@@ -373,6 +401,7 @@ export interface NailDesignRow {
   detected_shape: string | null;
   detected_length: number | null;
   finger_specs_json: string | null;
+  technical_sheet_json?: string | null;
   created_at: string;
 }
 
@@ -398,6 +427,8 @@ export interface NailDesign {
   v13Engine?: boolean;
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
+  technicalSheet?: NailTechnicalSheet | null;
+  technicalSheetJson?: string | null;
   createdAt: string;
 }
 
@@ -632,6 +663,37 @@ function parseFingerSpecsJson(rawJson: string | null): ParsedFingerSpecsBlob {
   }
 }
 
+function parseTechnicalSheetJson(rawJson: string | null | undefined): NailTechnicalSheet | null {
+  if (!rawJson || typeof rawJson !== 'string') {
+    return null;
+  }
+  const trimmed = rawJson.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    const sheet = parsed as Partial<NailTechnicalSheet>;
+    if (
+      typeof sheet.generatedAt !== 'string' ||
+      typeof sheet.summaryPt !== 'string' ||
+      typeof sheet.predominantShapePt !== 'string' ||
+      typeof sheet.predominantExtensionPt !== 'string' ||
+      typeof sheet.hasAccentFingers !== 'boolean' ||
+      !Array.isArray(sheet.fingers) ||
+      typeof sheet.whatsappText !== 'string'
+    ) {
+      return null;
+    }
+    return sheet as NailTechnicalSheet;
+  } catch {
+    return null;
+  }
+}
+
 export function mapNailDesignRowToEntity(row: NailDesignRow): NailDesign {
   const finish: NailFinish =
     row.finish && VALID_FINISH_SET.has(row.finish)
@@ -651,6 +713,7 @@ export function mapNailDesignRowToEntity(row: NailDesignRow): NailDesign {
       : null;
 
   const parsedBlob = parseFingerSpecsJson(row.finger_specs_json ?? null);
+  const parsedTechnicalSheet = parseTechnicalSheetJson(row.technical_sheet_json ?? null);
 
   return {
     id: row.id,
@@ -674,6 +737,7 @@ export function mapNailDesignRowToEntity(row: NailDesignRow): NailDesign {
     ...(parsedBlob.v13Engine !== undefined ? { v13Engine: parsedBlob.v13Engine } : {}),
     fingerSpecs: parsedBlob.fingerSpecs,
     ...(parsedBlob.handSpecsBySide ? { handSpecsBySide: parsedBlob.handSpecsBySide } : {}),
+    ...(parsedTechnicalSheet ? { technicalSheet: parsedTechnicalSheet } : {}),
     createdAt: row.created_at,
   };
 }

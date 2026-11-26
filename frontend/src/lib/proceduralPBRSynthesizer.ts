@@ -200,7 +200,7 @@ export function resolveEffectiveRenderStrategy(spec: NailFingerDesignSpec): Nail
   return (
     spec.renderStrategy ??
     spec.manufacturingSpec?.renderStrategy ??
-    (spec.trueUvDataUrl ? 'canonical_uv_delighted' : 'procedural_pbr_3d')
+    'procedural_pbr_3d'
   );
 }
 

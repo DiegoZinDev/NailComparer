@@ -1,6 +1,11 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Download, MessageCircle, X } from 'lucide-react';
+import { Check, Download, MessageCircle, X } from 'lucide-react';
+import {
+  TechnicalSheetCard,
+  buildWhatsappUrl,
+  resolveDesignTechnicalSheet,
+} from './TechnicalSheetCard';
 import type { NailDesign, StudioConfig } from '../types/nail';
 
 interface CapturePreviewModalProps {
@@ -16,6 +21,13 @@ export const CapturePreviewModal: React.FC<CapturePreviewModalProps> = ({
   config,
   onClose,
 }) => {
+  const [includeTechSheet, setIncludeTechSheet] = useState<boolean>(true);
+
+  const technicalSheet = useMemo(
+    () => resolveDesignTechnicalSheet(design, config.studioName),
+    [design, config.studioName]
+  );
+
   const handleDownload = () => {
     if (!imageDataUrl) return;
     const link = document.createElement('a');
@@ -28,6 +40,11 @@ export const CapturePreviewModal: React.FC<CapturePreviewModalProps> = ({
   const handleWhatsAppShare = async () => {
     if (!imageDataUrl) return;
 
+    const intro = `Olá! Adorei o modelo *${design.name}* que testei no provador AR da *${config.studioName}*.`;
+    const shareText = includeTechSheet
+      ? `${intro}\n\n${technicalSheet.whatsappText}`
+      : `${intro} Gostaria de agendar!`;
+
     // Try Web Share API with image file first (native mobile share sheet -> WhatsApp)
     try {
       const resp = await fetch(imageDataUrl);
@@ -37,7 +54,7 @@ export const CapturePreviewModal: React.FC<CapturePreviewModalProps> = ({
         await navigator.share({
           files: [file],
           title: config.studioName,
-          text: `Olha como ficou "${design.name}" no provador ao vivo da ${config.studioName}!`,
+          text: shareText,
         });
         return;
       }
@@ -46,13 +63,7 @@ export const CapturePreviewModal: React.FC<CapturePreviewModalProps> = ({
     }
 
     handleDownload();
-    const digits = config.whatsappNumber.replace(/\D/g, '');
-    const msg = encodeURIComponent(
-      `Olá! Adorei o modelo *${design.name}* que testei no provador AR da *${config.studioName}*. Gostaria de agendar!`
-    );
-    const waUrl = digits
-      ? `https://wa.me/${digits}?text=${msg}`
-      : `https://wa.me/?text=${msg}`;
+    const waUrl = buildWhatsappUrl(shareText, config.whatsappNumber);
     window.open(waUrl, '_blank', 'noopener,noreferrer');
   };
 
@@ -94,19 +105,43 @@ export const CapturePreviewModal: React.FC<CapturePreviewModalProps> = ({
               </button>
             </div>
 
-            <div className="capture-frame">
-              <img src={imageDataUrl} alt={`Provador AR - ${design.name}`} />
-            </div>
+            <div className="modal-body capture-modal-body">
+              <div className="capture-frame">
+                <img src={imageDataUrl} alt={`Provador AR - ${design.name}`} />
+              </div>
 
-            <div className="modal-actions">
-              <button type="button" className="btn-secondary" onClick={handleDownload}>
-                <Download size={16} />
-                <span>Salvar Foto</span>
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={includeTechSheet}
+                onClick={() => setIncludeTechSheet((v) => !v)}
+                className={`capture-sheet-toggle ${includeTechSheet ? 'is-checked' : ''}`}
+              >
+                <span className="capture-sheet-checkbox" aria-hidden="true">
+                  {includeTechSheet && <Check size={12} />}
+                </span>
+                <span>Incluir Ficha Técnica Unha-por-Unha ao enviar no WhatsApp</span>
               </button>
-              <button type="button" className="btn-primary" onClick={handleWhatsAppShare}>
-                <MessageCircle size={16} />
-                <span>Enviar WhatsApp</span>
-              </button>
+
+              <TechnicalSheetCard
+                sheet={technicalSheet}
+                studioWhatsapp={config.whatsappNumber}
+                title="Ficha Técnica do Modelo"
+                collapsible
+                defaultOpen={false}
+                compact
+              />
+
+              <div className="modal-actions">
+                <button type="button" className="btn-secondary" onClick={handleDownload}>
+                  <Download size={16} />
+                  <span>Salvar Foto</span>
+                </button>
+                <button type="button" className="btn-primary" onClick={handleWhatsAppShare}>
+                  <MessageCircle size={16} />
+                  <span>Enviar WhatsApp</span>
+                </button>
+              </div>
             </div>
           </motion.div>
         </motion.div>

@@ -6,6 +6,7 @@ import {
   type NailDesign,
   type NailDesignRow,
   type NailFingerSpecsMap,
+  type NailTechnicalSheet,
 } from '../entities/NailDesign.js';
 
 const NAIL_DESIGN_SELECT_COLUMNS = `
@@ -27,6 +28,7 @@ const NAIL_DESIGN_SELECT_COLUMNS = `
   detected_shape,
   detected_length,
   finger_specs_json,
+  technical_sheet_json,
   created_at
 `;
 
@@ -35,6 +37,19 @@ function serializeFingerSpecs(specs: NailFingerSpecsMap | null | undefined): str
     return null;
   }
   return JSON.stringify(specs);
+}
+
+function serializeTechnicalSheet(
+  sheet: NailTechnicalSheet | null | undefined,
+  rawJson?: string | null
+): string | null {
+  if (sheet) {
+    return JSON.stringify(sheet);
+  }
+  if (typeof rawJson === 'string' && rawJson.trim().length > 0) {
+    return rawJson.trim();
+  }
+  return null;
 }
 
 export class NailDesignRepository {
@@ -101,8 +116,9 @@ export class NailDesignRepository {
         detected_shape,
         detected_length,
         finger_specs_json,
+        technical_sheet_json,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -124,6 +140,7 @@ export class NailDesignRepository {
       entity.detectedShape,
       entity.detectedLength,
       serializeFingerSpecs(entity.fingerSpecs),
+      serializeTechnicalSheet(entity.technicalSheet, entity.technicalSheetJson),
       entity.createdAt
     );
 
@@ -213,6 +230,10 @@ export class NailDesignRepository {
     if (partial.fingerSpecs !== undefined) {
       setClauses.push('finger_specs_json = ?');
       values.push(serializeFingerSpecs(partial.fingerSpecs));
+    }
+    if (partial.technicalSheet !== undefined || partial.technicalSheetJson !== undefined) {
+      setClauses.push('technical_sheet_json = ?');
+      values.push(serializeTechnicalSheet(partial.technicalSheet, partial.technicalSheetJson));
     }
 
     if (setClauses.length === 0) {

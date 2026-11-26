@@ -32,6 +32,13 @@ const NAIL_DESIGNS_V9_COLUMNS: ReadonlyArray<{
   { name: 'is_studio_catalog', definition: 'INTEGER NOT NULL DEFAULT 0' },
 ];
 
+const NAIL_DESIGNS_V14_COLUMNS: ReadonlyArray<{
+  name: string;
+  definition: string;
+}> = [
+  { name: 'technical_sheet_json', definition: 'TEXT' },
+];
+
 function ensureNailDesignV9Columns(db: DatabaseSync): void {
   const columns = db
     .prepare('PRAGMA table_info(nail_designs)')
@@ -40,6 +47,22 @@ function ensureNailDesignV9Columns(db: DatabaseSync): void {
   const existingColumns = new Set(columns.map((column) => column.name));
 
   for (const column of NAIL_DESIGNS_V9_COLUMNS) {
+    if (!existingColumns.has(column.name)) {
+      db.exec(
+        `ALTER TABLE nail_designs ADD COLUMN ${column.name} ${column.definition};`
+      );
+    }
+  }
+}
+
+export function ensureNailDesignV14Columns(db: DatabaseSync): void {
+  const columns = db
+    .prepare('PRAGMA table_info(nail_designs)')
+    .all() as unknown as SqliteTableColumnInfo[];
+
+  const existingColumns = new Set(columns.map((column) => column.name));
+
+  for (const column of NAIL_DESIGNS_V14_COLUMNS) {
     if (!existingColumns.has(column.name)) {
       db.exec(
         `ALTER TABLE nail_designs ADD COLUMN ${column.name} ${column.definition};`
@@ -81,6 +104,7 @@ function runMigrations(db: DatabaseSync): void {
       detected_shape TEXT,
       detected_length REAL,
       finger_specs_json TEXT,
+      technical_sheet_json TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -89,6 +113,7 @@ function runMigrations(db: DatabaseSync): void {
   `);
 
   ensureNailDesignV9Columns(db);
+  ensureNailDesignV14Columns(db);
 }
 
 export function getDatabasePath(): string {

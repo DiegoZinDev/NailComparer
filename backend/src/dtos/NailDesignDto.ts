@@ -30,6 +30,8 @@ import {
   type NailRenderStrategy,
   type NailShape,
   type NailStyleType,
+  type NailTechnicalSheet,
+  type NailTechnicalSheetFinger,
   type NailUvPinTarget,
   type OrganicMotifElement,
   type RibbonStrokeElement,
@@ -204,6 +206,7 @@ export interface NailDesignDTO {
   v13Engine?: boolean;
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
+  technicalSheet?: NailTechnicalSheet | null;
   createdAt: string;
 }
 
@@ -229,6 +232,7 @@ export interface CreateNailDesignDTO {
   v13Engine?: boolean;
   fingerSpecs?: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
+  technicalSheet?: NailTechnicalSheet | null;
 }
 
 export interface UpdateNailDesignDTO {
@@ -252,6 +256,7 @@ export interface UpdateNailDesignDTO {
   v13Engine?: boolean;
   fingerSpecs?: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
+  technicalSheet?: NailTechnicalSheet | null;
 }
 
 export type NailDesignValidationResult<T> =
@@ -1438,6 +1443,138 @@ function parseAndValidateHandSpecsBySideInput(
   return { provided: true, value: out };
 }
 
+function parseAndValidateTechnicalSheetInput(
+  rawTechnicalSheet: unknown,
+  rawTechnicalSheetJson: unknown,
+  errors: string[]
+): { provided: boolean; value: NailTechnicalSheet | null } {
+  const source =
+    rawTechnicalSheet !== undefined ? rawTechnicalSheet : rawTechnicalSheetJson;
+
+  if (source === undefined) {
+    return { provided: false, value: null };
+  }
+  if (source === null) {
+    return { provided: true, value: null };
+  }
+
+  let obj: unknown = source;
+  if (typeof source === 'string') {
+    const trimmed = source.trim();
+    if (!trimmed) {
+      return { provided: true, value: null };
+    }
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      errors.push('technicalSheetJson deve conter um JSON válido.');
+      return { provided: true, value: null };
+    }
+  }
+
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    errors.push('technicalSheet deve ser um objeto JSON válido ou null.');
+    return { provided: true, value: null };
+  }
+
+  const raw = obj as Record<string, unknown>;
+  if (
+    typeof raw.generatedAt !== 'string' ||
+    typeof raw.summaryPt !== 'string' ||
+    typeof raw.predominantShapePt !== 'string' ||
+    typeof raw.predominantExtensionPt !== 'string' ||
+    typeof raw.hasAccentFingers !== 'boolean' ||
+    typeof raw.whatsappText !== 'string' ||
+    !Array.isArray(raw.fingers)
+  ) {
+    errors.push(
+      'technicalSheet inválido: campos obrigatórios (generatedAt, summaryPt, predominantShapePt, predominantExtensionPt, hasAccentFingers, fingers, whatsappText) ausentes ou malformados.'
+    );
+    return { provided: true, value: null };
+  }
+
+  if (raw.fingers.length > 10) {
+    errors.push('technicalSheet.fingers deve conter no máximo 10 dedos.');
+    return { provided: true, value: null };
+  }
+
+  const fingers: NailTechnicalSheetFinger[] = [];
+  for (let i = 0; i < raw.fingers.length; i++) {
+    const fRaw = raw.fingers[i];
+    if (!fRaw || typeof fRaw !== 'object' || Array.isArray(fRaw)) {
+      errors.push(`technicalSheet.fingers[${i}] deve ser um objeto válido.`);
+      return { provided: true, value: null };
+    }
+    const f = fRaw as Record<string, unknown>;
+    if (
+      typeof f.fingerId !== 'string' ||
+      !(VALID_FINGER_IDS as readonly string[]).includes(f.fingerId)
+    ) {
+      errors.push(`technicalSheet.fingers[${i}].fingerId inválido.`);
+      return { provided: true, value: null };
+    }
+    if (!isValidNailShape(f.shape)) {
+      errors.push(`technicalSheet.fingers[${i}].shape inválido.`);
+      return { provided: true, value: null };
+    }
+    if (
+      typeof f.labelPt !== 'string' ||
+      typeof f.shapeLabelPt !== 'string' ||
+      typeof f.extensionLevelPt !== 'string' ||
+      !isValidHexColor(f.primaryColorHex) ||
+      typeof f.finishLabelPt !== 'string' ||
+      !Array.isArray(f.artDetailsPt) ||
+      !Array.isArray(f.accessoriesPt) ||
+      typeof f.isAccentFinger !== 'boolean'
+    ) {
+      errors.push(`technicalSheet.fingers[${i}] possui campos inválidos.`);
+      return { provided: true, value: null };
+    }
+
+    let secondaryColorHex: string | undefined;
+    if (f.secondaryColorHex !== undefined && f.secondaryColorHex !== null && f.secondaryColorHex !== '') {
+      if (!isValidHexColor(f.secondaryColorHex)) {
+        errors.push(`technicalSheet.fingers[${i}].secondaryColorHex inválido.`);
+        return { provided: true, value: null };
+      }
+      secondaryColorHex = normalizeHexColor(f.secondaryColorHex);
+    }
+
+    fingers.push({
+      fingerId: f.fingerId as FingerId,
+      labelPt: f.labelPt.trim().slice(0, 80),
+      shape: f.shape,
+      shapeLabelPt: f.shapeLabelPt.trim().slice(0, 80),
+      extensionLevelPt: f.extensionLevelPt.trim().slice(0, 80),
+      primaryColorHex: normalizeHexColor(f.primaryColorHex),
+      ...(secondaryColorHex ? { secondaryColorHex } : {}),
+      finishLabelPt: f.finishLabelPt.trim().slice(0, 120),
+      artDetailsPt: f.artDetailsPt
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim().slice(0, 200))
+        .slice(0, 16),
+      accessoriesPt: f.accessoriesPt
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim().slice(0, 200))
+        .slice(0, 16),
+      isAccentFinger: f.isAccentFinger,
+    });
+  }
+
+  return {
+    provided: true,
+    value: {
+      generatedAt: raw.generatedAt.trim().slice(0, 64),
+      summaryPt: raw.summaryPt.trim().slice(0, 600),
+      predominantShapePt: raw.predominantShapePt.trim().slice(0, 80),
+      predominantExtensionPt: raw.predominantExtensionPt.trim().slice(0, 80),
+      hasAccentFingers: raw.hasAccentFingers,
+      fingers,
+      whatsappText: raw.whatsappText.trim().slice(0, 4000),
+    },
+  };
+}
+
 export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
   const cleanFingerSpecs =
     entity.fingerSpecs && Object.prototype.hasOwnProperty.call(entity.fingerSpecs, 'toJSON')
@@ -1468,6 +1605,7 @@ export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
     ...(entity.v13Engine !== undefined ? { v13Engine: entity.v13Engine } : {}),
     fingerSpecs: cleanFingerSpecs,
     ...(entity.handSpecsBySide ? { handSpecsBySide: entity.handSpecsBySide } : {}),
+    ...(entity.technicalSheet ? { technicalSheet: entity.technicalSheet } : {}),
     createdAt: entity.createdAt,
   };
 }
@@ -1671,6 +1809,12 @@ export function validateCreateNailDesignDTO(
     errors
   );
 
+  const parsedTechnicalSheet = parseAndValidateTechnicalSheetInput(
+    input.technicalSheet,
+    input.technicalSheetJson ?? input.technical_sheet_json,
+    errors
+  );
+
   if (errors.length > 0) {
     return { valid: false, errors };
   }
@@ -1724,6 +1868,7 @@ export function validateCreateNailDesignDTO(
     ...(resolvedV13Engine !== undefined ? { v13Engine: resolvedV13Engine } : {}),
     fingerSpecs: resolvedFingerSpecs,
     ...(resolvedHandSpecsBySide ? { handSpecsBySide: resolvedHandSpecsBySide } : {}),
+    ...(parsedTechnicalSheet.provided ? { technicalSheet: parsedTechnicalSheet.value } : {}),
   };
 
   return { valid: true, data: result };
@@ -1931,6 +2076,12 @@ export function validateUpdateNailDesignDTO(
     errors
   );
 
+  const parsedTechnicalSheet = parseAndValidateTechnicalSheetInput(
+    input.technicalSheet,
+    input.technicalSheetJson ?? input.technical_sheet_json,
+    errors
+  );
+
   const resolvedHandSpecsBySide = parsedHandSpecsBySide.provided
     ? parsedHandSpecsBySide.value
     : parsedFingerSpecs.envelopeHandSpecsBySide;
@@ -1960,6 +2111,9 @@ export function validateUpdateNailDesignDTO(
   }
   if (resolvedHandSpecsBySide !== undefined) {
     sanitized.handSpecsBySide = resolvedHandSpecsBySide;
+  }
+  if (parsedTechnicalSheet.provided) {
+    sanitized.technicalSheet = parsedTechnicalSheet.value;
   }
 
   if (errors.length > 0) {
