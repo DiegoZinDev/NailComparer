@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "typecheck:api": "tsc --noEmit --strict --noUnusedLocals --noUnusedParameters --target ES2022 --module ESNext --moduleResolution bundler --skipLibCheck api/reconstruct-nail.ts",
+    "build": "tsc && npm run typecheck:api && vite build",
     "preview": "vite preview",
     "test": "npx --prefix ../backend tsx --test tests/*.test.ts"
   },

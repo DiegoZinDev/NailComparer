@@ -77,6 +77,8 @@ export interface DeepReconstructionProgress {
 export interface DeepReconstructionResult {
   mode: 'deep_vlm' | 'local_fallback';
   missingApiKey?: boolean;
+  fallbackReason?: string;
+  httpStatus?: number;
   fingerSpecs: Record<FingerId, NailFingerDesignSpec>;
   handSpecsBySide?: NailHandSpecsBySide;
   handsCount: 1 | 2;
@@ -87,6 +89,83 @@ export interface DeepReconstructionResult {
   averageFidelityScore: number;
   summaryPt: string;
   detectedFingersCount: number;
+}
+
+export interface ServerAiStatus {
+  reachable: boolean;
+  configured: boolean;
+  source: 'header' | 'server_env' | 'none';
+  status?: number;
+  model?: string;
+}
+
+function resolveReconstructEndpointUrl(): string {
+  const apiBase =
+    typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL
+      ? String(import.meta.env.VITE_API_URL).replace(/\/$/, '')
+      : '';
+  return `${apiBase}/api/reconstruct-nail`;
+}
+
+export async function checkServerAiStatus(
+  fetchImpl: typeof fetch = fetch,
+  options?: { signal?: AbortSignal; apiKey?: string }
+): Promise<ServerAiStatus> {
+  const endpointUrl = resolveReconstructEndpointUrl();
+  const apiKey = (options?.apiKey ?? getSavedGeminiApiKey()).trim();
+  const headers: Record<string, string> = {};
+  if (apiKey) {
+    headers['x-gemini-key'] = apiKey;
+  }
+
+  try {
+    const res = await fetchImpl(endpointUrl, {
+      method: 'GET',
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!res.ok) {
+      return {
+        reachable: false,
+        configured: false,
+        source: 'none',
+        status: res.status,
+      };
+    }
+
+    const text = await res.text();
+    let parsed: Record<string, unknown> = {};
+    try {
+      parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    } catch {
+      return {
+        reachable: false,
+        configured: false,
+        source: 'none',
+        status: res.status,
+      };
+    }
+
+    const source =
+      parsed.source === 'header' || parsed.source === 'server_env' ? parsed.source : 'none';
+    return {
+      reachable: true,
+      configured: parsed.configured === true,
+      source,
+      status: res.status,
+      model: typeof parsed.model === 'string' ? parsed.model : undefined,
+    };
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err;
+    }
+    return {
+      reachable: false,
+      configured: false,
+      source: 'none',
+    };
+  }
 }
 
 export interface DeepReconstructionOptions {
@@ -877,6 +956,59 @@ function buildMacroCenterCrop(img: HTMLImageElement, labelPt: string): string {
   return canvas.toDataURL('image/jpeg', 0.92);
 }
 
+class ReconstructApiHttpError extends Error {
+  public readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ReconstructApiHttpError';
+    this.status = status;
+  }
+}
+
+function formatReconstructFallbackReason(err: unknown): {
+  fallbackReason: string;
+  httpStatus?: number;
+} {
+  if (err instanceof ReconstructApiHttpError) {
+    const status = err.status;
+    const rawMsg = err.message.trim();
+    const hasCustomDetail =
+      rawMsg.length > 0 && rawMsg.toUpperCase() !== `HTTP ${status}`;
+    const detailSuffix = hasCustomDetail ? ` — ${rawMsg}` : '';
+
+    if (status === 429) {
+      return {
+        httpStatus: status,
+        fallbackReason: `Cota gratuita Gemini atingida (HTTP 429). Aguarde instantes e tente novamente.`,
+      };
+    }
+    if (status === 401 || status === 403) {
+      return {
+        httpStatus: status,
+        fallbackReason: `Chave Gemini rejeitada ou sem permissão (HTTP ${status})${detailSuffix}`,
+      };
+    }
+    if (status === 404 || status >= 500) {
+      return {
+        httpStatus: status,
+        fallbackReason: `Endpoint /api/reconstruct-nail indisponível (HTTP ${status})${detailSuffix}`,
+      };
+    }
+    return {
+      httpStatus: status,
+      fallbackReason: `Falha na API /api/reconstruct-nail (HTTP ${status})${detailSuffix}`,
+    };
+  }
+
+  const msg = err instanceof Error ? err.message.trim() : '';
+  return {
+    fallbackReason: msg
+      ? `Falha de rede/timeout ao conectar com /api/reconstruct-nail (${msg}).`
+      : 'Falha de rede/timeout ao conectar com /api/reconstruct-nail.',
+  };
+}
+
 async function callReconstructApi(
   fetchImpl: typeof fetch,
   endpointUrl: string,
@@ -903,7 +1035,10 @@ async function callReconstructApi(
   }
 
   if (!res.ok) {
-    throw new Error(String(parsed.error || parsed.message || `HTTP ${res.status}`));
+    throw new ReconstructApiHttpError(
+      res.status,
+      String(parsed.error || parsed.message || `HTTP ${res.status}`)
+    );
   }
   return parsed;
 }
@@ -950,17 +1085,65 @@ function buildCompleteHandRecord(
 async function runCleanLocalFallback(
   imageDataUrl: string,
   missingApiKey: boolean,
-  options?: DeepReconstructionOptions
+  options?: DeepReconstructionOptions,
+  fallbackMeta?: { fallbackReason?: string; httpStatus?: number }
 ): Promise<DeepReconstructionResult> {
+  const fallbackReason = fallbackMeta?.fallbackReason;
+  const httpStatus = fallbackMeta?.httpStatus;
+
   options?.onProgress?.({
     stage: 'fallback_local',
     message: missingApiKey
       ? 'Chave gratuita Gemini não configurada — executando reconstrução local paramétrica...'
-      : 'Modo offline ativo — executando reconstrução local paramétrica...',
+      : fallbackReason
+        ? `${fallbackReason} — executando reconstrução local...`
+        : 'Modo offline ativo — executando reconstrução local paramétrica...',
     currentFingerIndex: 1,
     totalFingers: 5,
     percent: 45,
   });
+
+  // Non-DOM Node unit test environment: produce a clean deterministic local fallback without Canvas/Image
+  if (typeof document === 'undefined' || typeof Image === 'undefined') {
+    const fallbackSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
+    for (const fid of ORDERED_FINGERS) {
+      const mSpec = sanitizeManufacturingSpecClient(
+        {
+          fingerId: fid,
+          handSide: 'Right',
+          renderStrategy: 'canonical_uv_delighted',
+          shape: 'almond',
+          freeEdgeRatio: 0.45,
+          finishType: 'solid_gloss_gel',
+          trueBaseColorHex: '#D8B4A0',
+        },
+        fid,
+        'Right'
+      );
+      fallbackSpecs[fid] = manufacturingSpecToFingerDesignSpec(mSpec, {
+        detectedFromPhoto: false,
+        fidelityScore: 76,
+      });
+    }
+
+    return {
+      mode: 'local_fallback',
+      missingApiKey,
+      fallbackReason,
+      httpStatus,
+      fingerSpecs: fallbackSpecs,
+      handsCount: 1,
+      primaryShape: 'almond',
+      primaryLengthMultiplier: 1.45,
+      primaryFreeEdgeRatio: 0.45,
+      primaryExtensionLevel: classifyExtensionLevel(0.45),
+      averageFidelityScore: 76,
+      summaryPt:
+        fallbackReason ||
+        'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).',
+      detectedFingersCount: 0,
+    };
+  }
 
   // Convert data URL into a Blob/File for analyzeReferencePerFinger if browser supports it
   const resp = await fetch(imageDataUrl);
@@ -1006,6 +1189,8 @@ async function runCleanLocalFallback(
     return {
       mode: 'local_fallback',
       missingApiKey,
+      fallbackReason,
+      httpStatus,
       fingerSpecs: upgradedSpecs,
       handsCount: 1,
       primaryShape: middle.shape,
@@ -1014,6 +1199,7 @@ async function runCleanLocalFallback(
       primaryExtensionLevel: classifyExtensionLevel(freeEdge),
       averageFidelityScore: 76,
       summaryPt:
+        fallbackReason ||
         'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).',
       detectedFingersCount: localAnalysis.detectedFingerIds.length,
     };
@@ -1189,7 +1375,8 @@ export async function runDeepPerFingerReconstruction(
     }
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    return await runCleanLocalFallback(imageDataUrl, !apiKey, options);
+    const fallbackMeta = formatReconstructFallbackReason(err);
+    return await runCleanLocalFallback(imageDataUrl, false, options, fallbackMeta);
   }
 
   throwIfAborted(signal);
