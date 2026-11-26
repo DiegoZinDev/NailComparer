@@ -8,6 +8,7 @@ import {
   extractTrueUVNailTexture,
   type PerFingerAnalysisResult,
 } from './perFingerVisionAnalyzer';
+import { generateNailTechnicalSheet } from './nailTechnicalSheet';
 import type {
   ArtisticPattern,
   FingerId,
@@ -27,6 +28,7 @@ import type {
   NailHandSpecsBySide,
   NailRenderStrategy,
   NailShape,
+  NailTechnicalSheet,
   NailUvPinTarget,
   NormalizedPoint,
 } from '../types/nail';
@@ -89,6 +91,7 @@ export interface DeepReconstructionResult {
   averageFidelityScore: number;
   summaryPt: string;
   detectedFingersCount: number;
+  technicalSheet: NailTechnicalSheet;
 }
 
 export interface ServerAiStatus {
@@ -184,12 +187,15 @@ interface GlobalAnalysisPayload {
   handsDetected?: number;
   visibleFingers?: Array<{ fingerId: FingerId; handSide?: 'Left' | 'Right' }>;
   identicalGroups?: string[][];
+  identicalFingerGroups?: string[][];
+  accentFingers?: FingerId[];
   globalShape?: NailShape;
   globalFreeEdgeRatio?: number;
   globalFinishType?: Nail3DFinishType;
   globalPalette?: string[];
   accessoriesPresent?: string[];
   summaryPt?: string;
+  overallNotesPt?: string;
 }
 
 interface FingerCropTarget {
@@ -673,15 +679,7 @@ export function blueprintToManufacturingSpec(
     1.15
   );
 
-  const inferredStrategy: NailRenderStrategy =
-    spec.renderStrategy ??
-    (finishType === 'mirror_chrome'
-      ? 'procedural_pbr_3d'
-      : spec.trueUvDataUrl
-        ? accessories3D.length > 0
-          ? 'hybrid_uv_plus_pbr_3d'
-          : 'canonical_uv_delighted'
-        : 'procedural_pbr_3d');
+  const inferredStrategy: NailRenderStrategy = spec.renderStrategy ?? 'procedural_pbr_3d';
 
   return sanitizeManufacturingSpecClient(
     {
@@ -1111,7 +1109,7 @@ async function runCleanLocalFallback(
         {
           fingerId: fid,
           handSide: 'Right',
-          renderStrategy: 'canonical_uv_delighted',
+          renderStrategy: 'procedural_pbr_3d',
           shape: 'almond',
           freeEdgeRatio: 0.45,
           finishType: 'solid_gloss_gel',
@@ -1123,8 +1121,20 @@ async function runCleanLocalFallback(
       fallbackSpecs[fid] = manufacturingSpecToFingerDesignSpec(mSpec, {
         detectedFromPhoto: false,
         fidelityScore: 76,
+        trueUvDataUrl: undefined,
       });
     }
+
+    const fallbackExtLevel = classifyExtensionLevel(0.45);
+    const fallbackSummary =
+      fallbackReason ||
+      'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).';
+    const technicalSheet = generateNailTechnicalSheet({
+      fingerSpecs: fallbackSpecs,
+      predominantShape: 'almond',
+      extensionLevel: fallbackExtLevel,
+      summaryPt: fallbackSummary,
+    });
 
     return {
       mode: 'local_fallback',
@@ -1136,12 +1146,11 @@ async function runCleanLocalFallback(
       primaryShape: 'almond',
       primaryLengthMultiplier: 1.45,
       primaryFreeEdgeRatio: 0.45,
-      primaryExtensionLevel: classifyExtensionLevel(0.45),
+      primaryExtensionLevel: fallbackExtLevel,
       averageFidelityScore: 76,
-      summaryPt:
-        fallbackReason ||
-        'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).',
+      summaryPt: fallbackSummary,
       detectedFingersCount: 0,
+      technicalSheet,
     };
   }
 
@@ -1162,11 +1171,14 @@ async function runCleanLocalFallback(
     const upgradedSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
     for (const fid of ORDERED_FINGERS) {
       const baseSpec = localAnalysis.fingerSpecs[fid];
-      const mSpec = blueprintToManufacturingSpec(baseSpec, 'Right');
+      const mSpec = {
+        ...blueprintToManufacturingSpec(baseSpec, 'Right'),
+        renderStrategy: 'procedural_pbr_3d' as const,
+      };
       const preliminary = manufacturingSpecToFingerDesignSpec(mSpec, {
         detectedFromPhoto: baseSpec.detectedFromPhoto,
         fidelityScore: 76,
-        trueUvDataUrl: baseSpec.trueUvDataUrl,
+        trueUvDataUrl: undefined,
         uvExtractionTarget: baseSpec.uvExtractionTarget,
       });
       preliminary.blueprint = baseSpec.blueprint;
@@ -1176,6 +1188,16 @@ async function runCleanLocalFallback(
 
     const middle = upgradedSpecs.middle ?? upgradedSpecs.ring;
     const freeEdge = middle.freeEdgeRatio ?? 0.45;
+    const primaryExtensionLevel = classifyExtensionLevel(freeEdge);
+    const localSummary =
+      fallbackReason ||
+      'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).';
+    const technicalSheet = generateNailTechnicalSheet({
+      fingerSpecs: upgradedSpecs,
+      predominantShape: middle.shape,
+      extensionLevel: primaryExtensionLevel,
+      summaryPt: localSummary,
+    });
 
     options?.onProgress?.({
       stage: 'done',
@@ -1196,12 +1218,11 @@ async function runCleanLocalFallback(
       primaryShape: middle.shape,
       primaryLengthMultiplier: Number((1 + freeEdge).toFixed(2)),
       primaryFreeEdgeRatio: freeEdge,
-      primaryExtensionLevel: classifyExtensionLevel(freeEdge),
+      primaryExtensionLevel,
       averageFidelityScore: 76,
-      summaryPt:
-        fallbackReason ||
-        'Reconstrução local paramétrica (configure sua chave gratuita Google AI Studio nas Configurações para ativar análise profunda VLM com acessórios 3D e 95–99% de fidelidade).',
+      summaryPt: localSummary,
       detectedFingersCount: localAnalysis.detectedFingerIds.length,
+      technicalSheet,
     };
   } finally {
     session?.dispose();
@@ -1381,19 +1402,32 @@ export async function runDeepPerFingerReconstruction(
 
   throwIfAborted(signal);
 
-  // Deduplicate identical groups reported by globalAnalysis while keeping every distinct finger!
+  // Deduplicate identical groups reported by globalAnalysis while keeping every distinct / accent finger!
+  const accentFingerSet = new Set<string>(
+    Array.isArray(globalAnalysis.accentFingers)
+      ? globalAnalysis.accentFingers.map((f) => f.toLowerCase())
+      : []
+  );
+  const identicalGroupsList =
+    Array.isArray(globalAnalysis.identicalFingerGroups) &&
+    globalAnalysis.identicalFingerGroups.length > 0
+      ? globalAnalysis.identicalFingerGroups
+      : Array.isArray(globalAnalysis.identicalGroups)
+        ? globalAnalysis.identicalGroups
+        : [];
+
   const representativeMap = new Map<string, string>(); // targetKey -> representativeKey
-  if (Array.isArray(globalAnalysis.identicalGroups)) {
-    for (const group of globalAnalysis.identicalGroups) {
-      if (!Array.isArray(group) || group.length < 2) continue;
-      const matchingTargets = targets.filter((t) =>
+  for (const group of identicalGroupsList) {
+    if (!Array.isArray(group) || group.length < 2) continue;
+    const matchingTargets = targets.filter(
+      (t) =>
+        !accentFingerSet.has(t.fingerId.toLowerCase()) &&
         group.some((g) => g.toLowerCase() === t.key.toLowerCase() || g.toLowerCase() === t.fingerId)
-      );
-      if (matchingTargets.length >= 2) {
-        const rep = matchingTargets[0];
-        for (let i = 1; i < matchingTargets.length; i++) {
-          representativeMap.set(matchingTargets[i].key, rep.key);
-        }
+    );
+    if (matchingTargets.length >= 2) {
+      const rep = matchingTargets[0];
+      for (let i = 1; i < matchingTargets.length; i++) {
+        representativeMap.set(matchingTargets[i].key, rep.key);
       }
     }
   }
@@ -1734,6 +1768,18 @@ export async function runDeepPerFingerReconstruction(
   const refSpec = primaryFingerSpecs.ring ?? primaryFingerSpecs.middle ?? primaryFingerSpecs.index;
   const primaryFreeEdgeRatio = refSpec.freeEdgeRatio ?? 0.45;
   const primaryLengthMultiplier = Number((1 + primaryFreeEdgeRatio).toFixed(2));
+  const primaryExtensionLevel = classifyExtensionLevel(primaryFreeEdgeRatio);
+  const summaryPt =
+    globalAnalysis.summaryPt ||
+    globalAnalysis.overallNotesPt ||
+    `Set 3D reconstruído (${handsCount === 2 ? '10 dedos • Mão Esquerda e Direita' : '5 dedos'}) com fidelidade média verificada de ${avgFidelity}%.`;
+
+  const technicalSheet = generateNailTechnicalSheet({
+    fingerSpecs: primaryFingerSpecs,
+    predominantShape: refSpec.shape,
+    extensionLevel: primaryExtensionLevel,
+    summaryPt,
+  });
 
   options?.onProgress?.({
     stage: 'done',
@@ -1753,11 +1799,10 @@ export async function runDeepPerFingerReconstruction(
     primaryShape: refSpec.shape,
     primaryLengthMultiplier,
     primaryFreeEdgeRatio,
-    primaryExtensionLevel: classifyExtensionLevel(primaryFreeEdgeRatio),
+    primaryExtensionLevel,
     averageFidelityScore: avgFidelity,
-    summaryPt:
-      globalAnalysis.summaryPt ||
-      `Set 3D reconstruído (${handsCount === 2 ? '10 dedos • Mão Esquerda e Direita' : '5 dedos'}) com fidelidade média verificada de ${avgFidelity}%.`,
+    summaryPt,
     detectedFingersCount: targets.length,
+    technicalSheet,
   };
 }

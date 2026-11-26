@@ -161,6 +161,23 @@ A versão **V13** elimina definitivamente auto-oclusão, aspecto "dedal/bala", u
 
 ---
 
+## 2.6 Arquitetura V14 (`feat/v14-static-photo-semantic-nails-techsheet`) — Provador em Foto Estática da Mão, Reconstrução Semântica 3D Paramétrica & Ficha Técnica Unha-por-Unha
+
+A versão **V14** inaugura o fluxo de **alta precisão em foto estática da mão da cliente**, prioriza reconstrução semântica 100% limpa em PBR 3D dedo-a-dedo (eliminando recortes crus esticados em modo paramétrico/offline) e entrega uma **Ficha Técnica automática pronta para envio no WhatsApp**:
+
+- **Persistência SQLite & IndexedDB V14 (`NailDesign.ts`, `database.ts`, `NailDesignDto.ts`, `NailDesignRepository.ts`, `NailDesignService.ts`, `offlineStore.ts`)**:
+  - Contrato tipado `NailTechnicalSheet` / `NailTechnicalSheetFinger` compartilhado entre `frontend/src/types/nail.ts` e `backend/src/entities/NailDesign.ts`.
+  - Migração SQLite idempotente adicionando a coluna `technical_sheet_json TEXT` à tabela `nail_designs` (com validação no DTO e persistência encapsulada exclusivamente em `NailDesignRepository.ts`) e migração client-side **`DB_VERSION = 3`** em `offlineStore.ts`.
+- **Reconstrução Semântica 3D Paramétrica & Gerador de Ficha Técnica (`nailTechnicalSheet.ts`, `reconstruct-nail.ts`, `NailReconstructionService.ts`, `deepNailReconstructor.ts`, `proceduralPBRSynthesizer.ts`)**:
+  - Priorização estrita de `renderStrategy: 'procedural_pbr_3d'` dedo-a-dedo no backend, serverless e cliente, garantindo `trueUvDataUrl === undefined` no modo paramétrico/offline (zero pixels crus recortados esticados sobre a malha 3D).
+  - `generateNailTechnicalSheet()` analisa os 5 dedos (`Polegar`, `Indicador`, `Médio`, `Anelar`, `Mínimo`), identifica formato predominante (`Stiletto`, `Bailarina`, `Amendoada`, `Quadrada`, `Oval`, `Natural`), alongamento, acabamentos, artes/traços 3D, acessórios 3D, detecta automaticamente **filha única / destaque (`isAccentFinger`)** por clusterização CIELab (`deltaE > 14`) + arte/acessórios e gera `whatsappText` formatado com a assinatura do estúdio — retornado nativamente em `DeepReconstructionResult.technicalSheet`.
+- **Provador em Foto Estática, Ficha Técnica Interativa & Controles por Dedo (`StaticPhotoTryOnModal.tsx`, `TechnicalSheetCard.tsx`, `ARCameraCanvas.tsx`, `ImportReferenceModal.tsx`, `CapturePreviewModal.tsx`, `App.tsx`)**:
+  - **Botão "Foto da Mão"** no fluxo principal (`App.tsx`) + `captureRawFrameDataUrl()` em `ARCameraCanvas.tsx` abrindo `StaticPhotoTryOnModal.tsx`: captura direta da câmera ou upload de foto estática da mão, detecção MediaPipe em modo `IMAGE`, render 3D PBR limpo sem tremor, **slider Antes/Depois**, **zoom interativo `1×–3×`**, selo/marca d'água do estúdio e compartilhamento direto no WhatsApp com a ficha técnica.
+  - **`TechnicalSheetCard.tsx`**: cartão editorial exibindo resumo técnico, chips de cor por dedo, badge de *Filha Única*, botão de cópia 1-toque e envio direto no WhatsApp, integrado ao `ImportReferenceModal.tsx` (com controles paramétricos dedo-a-dedo) e ao `CapturePreviewModal.tsx`.
+- **Qualidade & Suíte Automatizada V14 (`frontend/tests/technicalSheetV14.test.ts`)**: 12/12 testes automatizados aprovados validando geração da ficha técnica (formatos marcantes `stiletto`/`coffin`, cores distintas, filha única, traço dourado 3D, francesinha, acessórios 3D, `whatsappText`), default semântico `procedural_pbr_3d` e garantia de `trueUvDataUrl === undefined` no fallback local.
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:

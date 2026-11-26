@@ -372,6 +372,34 @@ export interface NailHandSpecsBySide {
   Right?: Record<FingerId, NailFingerDesignSpec>;
 }
 
+// -----------------------------------------------------------------------------
+// V14 Automatic Nail Technical Sheet (Ficha Técnica Automática Dedo-a-Dedo)
+// -----------------------------------------------------------------------------
+
+export interface NailTechnicalSheetFinger {
+  fingerId: FingerId;
+  labelPt: string;
+  shape: NailShape;
+  shapeLabelPt: string;
+  extensionLevelPt: string;
+  primaryColorHex: string;
+  secondaryColorHex?: string;
+  finishLabelPt: string;
+  artDetailsPt: string[];
+  accessoriesPt: string[];
+  isAccentFinger: boolean;
+}
+
+export interface NailTechnicalSheet {
+  generatedAt: string;
+  summaryPt: string;
+  predominantShapePt: string;
+  predominantExtensionPt: string;
+  hasAccentFingers: boolean;
+  fingers: NailTechnicalSheetFinger[];
+  whatsappText: string;
+}
+
 export interface NailDesign {
   id: string;
   name: string;
@@ -391,6 +419,8 @@ export interface NailDesign {
   fingerSpecs?: Record<FingerId, NailFingerDesignSpec>;
   /** Optional 10-finger set supporting distinct Left and Right hand designs in AR */
   handSpecsBySide?: NailHandSpecsBySide;
+  /** V14 Automatic Technical Sheet for salon execution and WhatsApp sharing */
+  technicalSheet?: NailTechnicalSheet;
   createdAt?: string;
 }
 

@@ -17,6 +17,7 @@ import type {
 
 export interface ARCameraCanvasHandle {
   captureCompositeDataUrl: (studioName: string, logoDataUrl: string | null) => string | null;
+  captureRawFrameDataUrl: () => string | null;
 }
 
 interface ARCameraCanvasProps {
@@ -706,6 +707,46 @@ export const ARCameraCanvas = React.forwardRef<ARCameraCanvasHandle, ARCameraCan
         ctx.restore();
 
         return out.toDataURL('image/jpeg', 0.92);
+      },
+      captureRawFrameDataUrl() {
+        const currentMode = modeRef.current;
+        const video = videoRef.current;
+        const demoImg = demoImgRef.current;
+
+        if (
+          currentMode === 'camera' &&
+          video &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0 &&
+          video.videoHeight > 0
+        ) {
+          const out = document.createElement('canvas');
+          out.width = video.videoWidth;
+          out.height = video.videoHeight;
+          const ctx = out.getContext('2d');
+          if (!ctx) return null;
+          const mirrorX = facingRef.current === 'user';
+          ctx.save();
+          if (mirrorX) {
+            ctx.translate(out.width, 0);
+            ctx.scale(-1, 1);
+          }
+          ctx.drawImage(video, 0, 0, out.width, out.height);
+          ctx.restore();
+          return out.toDataURL('image/jpeg', 0.94);
+        }
+
+        if (demoImg && demoImg.complete && demoImg.naturalWidth > 0) {
+          const out = document.createElement('canvas');
+          out.width = demoImg.naturalWidth;
+          out.height = demoImg.naturalHeight;
+          const ctx = out.getContext('2d');
+          if (!ctx) return null;
+          ctx.drawImage(demoImg, 0, 0, out.width, out.height);
+          return out.toDataURL('image/jpeg', 0.94);
+        }
+
+        return null;
       },
     }));
 

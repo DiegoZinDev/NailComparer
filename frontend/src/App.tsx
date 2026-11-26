@@ -6,6 +6,7 @@ import {
   Eye,
   EyeOff,
   Hand,
+  ImagePlus,
   RefreshCw,
   Settings,
   SlidersHorizontal,
@@ -17,6 +18,7 @@ import { ImportReferenceModal } from './components/ImportReferenceModal';
 import { InstallAppModal } from './components/InstallAppModal';
 import { MagneticDesignDock } from './components/MagneticDesignDock';
 import { NailAdjustControls } from './components/NailAdjustControls';
+import { StaticPhotoTryOnModal } from './components/StaticPhotoTryOnModal';
 import { WhiteLabelModal } from './components/WhiteLabelModal';
 import { DEFAULT_STUDIO_CONFIG } from './data/presets';
 import {
@@ -97,6 +99,7 @@ export function App(): React.ReactElement {
   const [whiteLabelOpen, setWhiteLabelOpen] = useState<boolean>(false);
   const [importOpen, setImportOpen] = useState<boolean>(false);
   const [importModalMode, setImportModalMode] = useState<'client' | 'studio'>('client');
+  const [staticPhotoOpen, setStaticPhotoOpen] = useState<boolean>(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [cameraNotice, setCameraNotice] = useState<string | null>(null);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -214,6 +217,8 @@ export function App(): React.ReactElement {
     const created: NailDesign = {
       ...res.design,
       fingerSpecs: draft.fingerSpecs ?? res.design.fingerSpecs,
+      handSpecsBySide: draft.handSpecsBySide ?? res.design.handSpecsBySide,
+      technicalSheet: draft.technicalSheet ?? res.design.technicalSheet,
       secondaryColor: draft.secondaryColor ?? res.design.secondaryColor,
       detectedShape: draft.detectedShape ?? res.design.detectedShape,
       detectedLength: draft.detectedLength ?? res.design.detectedLength,
@@ -351,6 +356,19 @@ export function App(): React.ReactElement {
           <motion.button
             type="button"
             whileTap={{ scale: 0.94 }}
+            onClick={() => setStaticPhotoOpen(true)}
+            className={`mode-toggle-btn glass-panel static-photo-trigger-btn ${staticPhotoOpen ? 'is-live' : ''}`}
+            title="Modo Foto Estática da Mão (Antes/Depois + Zoom)"
+            aria-label="Abrir Modo Foto da Mão"
+          >
+            <ImagePlus size={14} />
+            <span className="label-short">Foto</span>
+            <span className="label-full">Foto da Mão</span>
+          </motion.button>
+
+          <motion.button
+            type="button"
+            whileTap={{ scale: 0.94 }}
             onClick={toggleMode}
             className={`mode-toggle-btn glass-panel ${mode === 'camera' ? 'is-live' : ''}`}
             title={
@@ -360,7 +378,10 @@ export function App(): React.ReactElement {
             }
           >
             {mode === 'camera' ? <Hand size={15} /> : <Camera size={15} />}
-            <span>{mode === 'camera' ? 'Mão Modelo' : 'Câmera AR'}</span>
+            <span className="label-short">{mode === 'camera' ? 'Modelo' : 'AR'}</span>
+            <span className="label-full">
+              {mode === 'camera' ? 'Mão Modelo' : 'Câmera AR'}
+            </span>
           </motion.button>
 
           <motion.button
@@ -491,9 +512,26 @@ export function App(): React.ReactElement {
       <ImportReferenceModal
         open={importOpen}
         targetMode={importModalMode}
+        studioName={config.studioName}
+        studioWhatsapp={config.whatsappNumber}
         onClose={() => setImportOpen(false)}
         onCreateDesign={handleCreateDesign}
         onOpenSettings={() => setWhiteLabelOpen(true)}
+      />
+
+      <StaticPhotoTryOnModal
+        open={staticPhotoOpen}
+        activeDesign={activeDesign}
+        designs={designs}
+        onSelectDesign={(d) => {
+          setCompareClean(false);
+          setActiveDesignId(d.id);
+          syncAdjustmentForDesign(d);
+        }}
+        adjustment={adjustment}
+        config={config}
+        onCaptureCurrentFrame={() => arRef.current?.captureRawFrameDataUrl() ?? null}
+        onClose={() => setStaticPhotoOpen(false)}
       />
 
       {activeDesign && (

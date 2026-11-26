@@ -123,6 +123,7 @@ export class NailDesignService {
       detectedShape: input.detectedShape ?? null,
       detectedLength: input.detectedLength ?? null,
       fingerSpecs: input.fingerSpecs ?? null,
+      ...(input.technicalSheet !== undefined ? { technicalSheet: input.technicalSheet } : {}),
       createdAt: new Date().toISOString(),
     };
 
