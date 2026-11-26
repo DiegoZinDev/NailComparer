@@ -705,6 +705,208 @@ export function computeFingerAnatomicalBasis(
   return mat.makeBasis(_axisX, _axisY, _axisZ);
 }
 
+const _bioPalmZ = new THREE.Vector3();
+const _bioVProx = new THREE.Vector3();
+const _bioVMid = new THREE.Vector3();
+const _bioVDist = new THREE.Vector3();
+const _bioBend = new THREE.Vector3();
+const _bioWristToIdx = new THREE.Vector3();
+const _bioWristToPinky = new THREE.Vector3();
+
+const BIOMECH_FINGER_IDS: readonly FingerId[] = ['index', 'middle', 'ring', 'pinky'];
+const RAD_TO_DEG = 180 / Math.PI;
+
+/**
+ * Computes the unit palm dorsal normal (`+Z` when dorsal faces camera) from `scenePoints3D`,
+ * `handedness`, and `mirrorX`. Zero heap allocations when `out` is provided.
+ */
+export function computePalmDorsalNormal(
+  scenePoints3D: readonly THREE.Vector3[],
+  handedness: 'Left' | 'Right',
+  mirrorX: boolean,
+  out?: THREE.Vector3
+): THREE.Vector3 {
+  const target = out ?? new THREE.Vector3();
+  const wrist = scenePoints3D[WRIST];
+  const indexMcp = scenePoints3D[INDEX_MCP];
+  const pinkyMcp = scenePoints3D[PINKY_MCP];
+
+  if (!wrist || !indexMcp || !pinkyMcp) {
+    return target.set(0, 0, 1);
+  }
+
+  _bioWristToIdx.subVectors(indexMcp, wrist);
+  _bioWristToPinky.subVectors(pinkyMcp, wrist);
+  target.crossVectors(_bioWristToIdx, _bioWristToPinky);
+  if (target.lengthSq() < 1e-10) {
+    return target.set(0, 0, 1);
+  }
+  target.normalize();
+
+  const flipLateral = (handedness === 'Right') !== mirrorX;
+  if (flipLateral) {
+    target.negate();
+  }
+  return target;
+}
+
+export interface BiomechanicalSignVerification {
+  needsFlip: boolean;
+  avgFlexDeg: number;
+  palmarAgreement: number;
+}
+
+/**
+ * Handedness-independent biomechanical dorsal/palmar sign check:
+ * Human fingers NEVER hyper-flex toward the dorsal surface (`+palmDorsalZ`);
+ * flexion (`flexDeg > 18°`) always curls toward the palm (`-palmDorsalZ`).
+ * If the flexion-weighted bend vector `(vMid - vProx)` (plus distal segment fallback)
+ * clearly points along `+palmDorsalZ` (`dot > +0.18`), `handedness` is inverted (`needsFlip: true`).
+ */
+export function verifyDorsalSignFromBiomechanics(
+  points3D: readonly THREE.Vector3[],
+  palmDorsalZ: THREE.Vector3
+): BiomechanicalSignVerification {
+  const pzLenSq = palmDorsalZ.lengthSq();
+  if (pzLenSq < 1e-10) {
+    return { needsFlip: false, avgFlexDeg: 0, palmarAgreement: 0 };
+  }
+
+  _bioPalmZ.copy(palmDorsalZ).divideScalar(Math.sqrt(pzLenSq));
+
+  let flexSum = 0;
+  let flexCount = 0;
+  let weightedDotSum = 0;
+  let weightSum = 0;
+
+  for (let i = 0; i < BIOMECH_FINGER_IDS.length; i++) {
+    const spec = FINGER_LANDMARK_INDICES[BIOMECH_FINGER_IDS[i]];
+    const mcp = points3D[spec.mcp];
+    const pip = points3D[spec.pip];
+    const dip = points3D[spec.dip];
+    const tip = points3D[spec.tip];
+    if (!mcp || !pip || !dip) continue;
+
+    _bioVProx.subVectors(pip, mcp);
+    _bioVMid.subVectors(dip, pip);
+    const proxLenSq = _bioVProx.lengthSq();
+    const midLenSq = _bioVMid.lengthSq();
+    if (proxLenSq < 1e-10 || midLenSq < 1e-10) continue;
+
+    _bioVProx.divideScalar(Math.sqrt(proxLenSq));
+    _bioVMid.divideScalar(Math.sqrt(midLenSq));
+
+    const pipFlexDeg = Math.acos(clamp(_bioVProx.dot(_bioVMid), -1, 1)) * RAD_TO_DEG;
+
+    let activeFlexDeg = pipFlexDeg;
+    _bioBend.subVectors(_bioVMid, _bioVProx);
+
+    if (tip) {
+      _bioVDist.subVectors(tip, dip);
+      const distLenSq = _bioVDist.lengthSq();
+      if (distLenSq >= 1e-10) {
+        _bioVDist.divideScalar(Math.sqrt(distLenSq));
+        const dipFlexDeg = Math.acos(clamp(_bioVMid.dot(_bioVDist), -1, 1)) * RAD_TO_DEG;
+        if (dipFlexDeg > pipFlexDeg && pipFlexDeg <= 18) {
+          activeFlexDeg = dipFlexDeg;
+          _bioBend.subVectors(_bioVDist, _bioVMid);
+        } else if (dipFlexDeg > 18) {
+          _bioBend.add(_bioVDist).sub(_bioVMid);
+        }
+      }
+    }
+
+    flexSum += activeFlexDeg;
+    flexCount += 1;
+
+    if (activeFlexDeg > 18) {
+      const bendLenSq = _bioBend.lengthSq();
+      if (bendLenSq >= 1e-10) {
+        _bioBend.divideScalar(Math.sqrt(bendLenSq));
+        const weight = activeFlexDeg - 18;
+        weightedDotSum += _bioBend.dot(_bioPalmZ) * weight;
+        weightSum += weight;
+      }
+    }
+  }
+
+  const avgFlexDeg = flexCount > 0 ? flexSum / flexCount : 0;
+  if (weightSum <= 0) {
+    return { needsFlip: false, avgFlexDeg, palmarAgreement: 0 };
+  }
+
+  // Average weighted dot against +palmDorsalZ: negative means bending toward palm (-palmDorsalZ),
+  // positive (> +0.18) means impossible dorsal bending => needsFlip: true.
+  const meanDorsalDot = weightedDotSum / weightSum;
+  const palmarAgreement = -meanDorsalDot;
+
+  return {
+    needsFlip: meanDorsalDot > 0.18,
+    avgFlexDeg,
+    palmarAgreement,
+  };
+}
+
+export const BIOMECH_SIGN_HYSTERESIS_FRAMES = 8 as const;
+
+/**
+ * 8-frame biomechanical hysteresis guard that automatically corrects inverted MediaPipe
+ * `Left`/`Right` labels whenever finger flexion contradicts the predicted dorsal normal.
+ * Zero per-frame heap allocations in steady-state `update()`.
+ */
+export class BiomechanicalSignGuard {
+  private readonly requiredFrames: number;
+  private flipActive = false;
+  private candidateFlip = false;
+  private candidateFrames = 0;
+  private readonly tmpPalmZ = new THREE.Vector3();
+
+  constructor(requiredFrames = BIOMECH_SIGN_HYSTERESIS_FRAMES) {
+    this.requiredFrames = Math.max(1, Math.round(requiredFrames));
+  }
+
+  public update(
+    points3D: readonly THREE.Vector3[],
+    handedness: 'Left' | 'Right',
+    mirrorX: boolean
+  ): 'Left' | 'Right' {
+    const opposite: 'Left' | 'Right' = handedness === 'Right' ? 'Left' : 'Right';
+    const currentEffective: 'Left' | 'Right' = this.flipActive ? opposite : handedness;
+
+    computePalmDorsalNormal(points3D, currentEffective, mirrorX, this.tmpPalmZ);
+    const check = verifyDorsalSignFromBiomechanics(points3D, this.tmpPalmZ);
+
+    // Only transition when flexed fingers give clear directional evidence
+    const desiredFlip = check.needsFlip ? !this.flipActive : this.flipActive;
+
+    if (desiredFlip === this.flipActive) {
+      this.candidateFlip = this.flipActive;
+      this.candidateFrames = 0;
+      return currentEffective;
+    }
+
+    if (this.candidateFlip === desiredFlip) {
+      this.candidateFrames += 1;
+    } else {
+      this.candidateFlip = desiredFlip;
+      this.candidateFrames = 1;
+    }
+
+    if (this.candidateFrames >= this.requiredFrames) {
+      this.flipActive = desiredFlip;
+      this.candidateFrames = 0;
+    }
+
+    return this.flipActive ? opposite : handedness;
+  }
+
+  public reset(): void {
+    this.flipActive = false;
+    this.candidateFlip = false;
+    this.candidateFrames = 0;
+  }
+}
+
 export interface FingerMetricDimensions {
   distalLenMeters: number;
   bedLengthMeters: number;

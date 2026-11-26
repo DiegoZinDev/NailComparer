@@ -80,8 +80,8 @@ function rgbCss(r: number, g: number, b: number, a = 1): string {
 
 /**
  * Generates a high-contrast HDR Studio Room Environment Map via `THREE.PMREMGenerator`
- * featuring dark architectural contrast walls (`#120F12` / `#0C0A0E`),
- * two high-intensity bright light windows/strips (`intensity 3.8–4.5`),
+ * featuring rich architectural contrast walls (`#221C22` / `#1C171B` — zero harsh pure-black blotches),
+ * soft-feathered daylight windows/strips (`intensity 3.8–4.5`),
  * crisp specular catchlights, and a warm golden/skin lower bounce card (`#6E4C3C`)
  * so `mirror_chrome` and metallic 3D accessories exhibit true liquid-mirror reflections.
  */
@@ -90,7 +90,7 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
   pmrem.compileEquirectangularShader();
 
   const envScene = new THREE.Scene();
-  envScene.background = new THREE.Color(0x120f12);
+  envScene.background = new THREE.Color(0x221c22);
 
   const disposables: Array<{ dispose: () => void }> = [];
 
@@ -138,16 +138,47 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
       grad.addColorStop(1, bottomHex);
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, c.width, c.height);
+
+      // Soft photographic vignette edge fade so light windows blend smoothly without harsh edges
+      const edgeGrad = ctx.createLinearGradient(0, 0, c.width, 0);
+      edgeGrad.addColorStop(0, 'rgba(34, 28, 34, 0.35)');
+      edgeGrad.addColorStop(0.16, 'rgba(255, 255, 255, 0)');
+      edgeGrad.addColorStop(0.84, 'rgba(255, 255, 255, 0)');
+      edgeGrad.addColorStop(1, 'rgba(34, 28, 34, 0.35)');
+      ctx.fillStyle = edgeGrad;
+      ctx.fillRect(0, 0, c.width, c.height);
     }
     return c;
   };
 
-  // 1) Alternating dark architectural baffles (#0C0A0E) to carve sharp dark reflections into chrome
-  const darkPanelColor = new THREE.Color(0x0c0a0e);
-  addPanel(12, 16, [-9.5, 0.5, 0.2], darkPanelColor);
-  addPanel(12, 16, [9.5, 0.5, 0.2], darkPanelColor);
-  addPanel(18, 12, [0, 1.5, -9.2], darkPanelColor);
-  addPanel(10, 6, [0, 8.8, 0.5], darkPanelColor);
+  const makeSoftPanelCanvas = (centerHex: string, edgeHex: string) => {
+    const c = document.createElement('canvas');
+    c.width = 64;
+    c.height = 64;
+    const ctx = c.getContext('2d');
+    if (ctx) {
+      const grad = ctx.createRadialGradient(
+        c.width * 0.5,
+        c.height * 0.5,
+        4,
+        c.width * 0.5,
+        c.height * 0.5,
+        c.width * 0.55
+      );
+      grad.addColorStop(0, centerHex);
+      grad.addColorStop(1, edgeHex);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, c.width, c.height);
+    }
+    return c;
+  };
+
+  // 1) Soft dark luxury salon architectural baffles (#1C171B / #221C22) — zero hard black blotches
+  const darkPanelCanvas = makeSoftPanelCanvas('#1C171B', '#221C22');
+  addPanel(12, 16, [-9.5, 0.5, 0.2], darkPanelCanvas);
+  addPanel(12, 16, [9.5, 0.5, 0.2], darkPanelCanvas);
+  addPanel(18, 12, [0, 1.5, -9.2], darkPanelCanvas);
+  addPanel(10, 6, [0, 8.8, 0.5], darkPanelCanvas);
 
   // 2) Two high-intensity bright studio daylight windows/strips (intensity 3.8 .. 4.5)
   const skyWindowCanvas = makeWindowCanvas('#DCEBFF', '#FFF3E8');
@@ -155,15 +186,17 @@ export function createStudioRoomEnvMap(renderer: THREE.WebGLRenderer): THREE.Tex
   addPanel(5.4, 11.0, [6.8, 3.8, 5.0], skyWindowCanvas, 3.8);
 
   // 3) Overhead salon softbox + razor-sharp HDR catchlight strips for liquid chrome highlights
-  addPanel(11, 4.2, [-0.8, 7.6, 4.2], new THREE.Color(3.9, 3.82, 3.72));
+  const softboxCanvas = makeSoftPanelCanvas('#FFFFFF', '#E6DDD8');
+  addPanel(11, 4.2, [-0.8, 7.6, 4.2], softboxCanvas, 3.9);
   addPanel(13, 0.85, [0.3, 4.9, 6.8], new THREE.Color(4.5, 4.45, 4.38));
   addPanel(0.95, 11.5, [-4.8, 2.0, 6.4], new THREE.Color(4.1, 4.18, 4.35));
 
   // 4) Secondary cool studio rim strip (rear-right)
   addPanel(5.0, 4.0, [4.6, 5.6, -4.4], new THREE.Color(2.2, 2.28, 2.45));
 
-  // 5) Warm golden/skin lower bounce reflector card (#6E4C3C)
-  addPanel(18, 18, [0, -7.2, 1.2], new THREE.Color(0x6e4c3c));
+  // 5) Warm golden/skin lower bounce reflector card (#6E4C3C -> #3F2C27 soft gradient)
+  const warmBounceCanvas = makeSoftPanelCanvas('#8A604C', '#4A342C');
+  addPanel(18, 18, [0, -7.2, 1.2], warmBounceCanvas, 1.15);
 
   const envRT = pmrem.fromScene(envScene, 0.028);
 
@@ -226,13 +259,13 @@ export function applyFinishTypeToDorsalMaterial(
   switch (finishType) {
     case 'mirror_chrome':
       material.metalness = oMetal ?? 0.96;
-      material.roughness = oRough ?? 0.06;
+      material.roughness = oRough ?? 0.055;
       material.clearcoat = oClear ?? 1.0;
-      material.clearcoatRoughness = 0.02;
+      material.clearcoatRoughness = 0.018;
       material.ior = 1.52;
       material.iridescence = 0.08;
       material.iridescenceIOR = 1.3;
-      material.envMapIntensity = 2.35;
+      material.envMapIntensity = 2.45;
       break;
 
     case 'glazed_pearl':
@@ -314,12 +347,12 @@ export function createAccessory3DMaterials(
   const metalStud = new THREE.MeshPhysicalMaterial({
     color: new THREE.Color(0xffffff),
     metalness: 0.98,
-    roughness: 0.05,
+    roughness: 0.07,
     clearcoat: 1.0,
     clearcoatRoughness: 0.02,
     ior: 1.52,
     envMap,
-    envMapIntensity: 2.5,
+    envMapIntensity: 2.6,
     side: THREE.FrontSide,
   });
 

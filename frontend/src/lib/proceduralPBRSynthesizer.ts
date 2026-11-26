@@ -12,6 +12,7 @@ import type {
   Nail3DMotifSpec,
   Nail3DStrokeSpec,
   NailDesignBlueprint,
+  NailRenderStrategy,
   NailShape,
   OrganicMotifElement,
   RibbonStrokeElement,
@@ -195,13 +196,30 @@ function hashShortString(str: string): string {
   return `${str.length}:${(h >>> 0).toString(36)}`;
 }
 
+export function resolveEffectiveRenderStrategy(spec: NailFingerDesignSpec): NailRenderStrategy {
+  return (
+    spec.renderStrategy ??
+    spec.manufacturingSpec?.renderStrategy ??
+    (spec.trueUvDataUrl ? 'canonical_uv_delighted' : 'procedural_pbr_3d')
+  );
+}
+
 export function hashFingerSpec(spec: NailFingerDesignSpec): string {
-  if (spec.trueUvDataUrl) {
-    return `v12-trueuv|${spec.shape}|${hashShortString(spec.trueUvDataUrl)}`;
+  const effectiveStrategy = resolveEffectiveRenderStrategy(spec);
+  const useTrueUv =
+    (effectiveStrategy === 'canonical_uv_delighted' ||
+      effectiveStrategy === 'hybrid_uv_plus_pbr_3d') &&
+    Boolean(spec.trueUvDataUrl);
+
+  if (useTrueUv && spec.trueUvDataUrl) {
+    const accSig = (spec.manufacturingSpec?.accessories3D ?? [])
+      .map((a) => `${a.kind}:${a.u.toFixed(2)},${a.v.toFixed(2)}:${a.radiusNorm.toFixed(2)}:${a.hasBezelRing ? 1 : 0}`)
+      .join(';');
+    return `v13-trueuv|${effectiveStrategy}|${spec.shape}|${hashShortString(spec.trueUvDataUrl)}|${accSig}`;
   }
 
   if (spec.manufacturingSpec) {
-    return hashManufacturingSpec(spec.manufacturingSpec);
+    return `${effectiveStrategy}|${hashManufacturingSpec(spec.manufacturingSpec)}`;
   }
 
   const bp = resolveBlueprint(spec);
@@ -2361,11 +2379,10 @@ function buildFastSobelNormalMap(
 }
 
 /**
- * V12 Gaussian Feathered AlphaMap (`256×256` POT, iOS Safari + Android Chrome WebGL2 safe):
- * - Cuticle (`v ∈ [0, 0.14]`): Gaussian ramp `f(t) = 1 - exp(-(t / sigma)^2)` from 0 at `v=0` to 255 at `v=0.14`.
- * - Lateral margins (`u ∈ [0, 0.06]` & `[0.94, 1.0]`): Gaussian ramp from 0 at edges to 255 inside,
- *   eliminating 100% of jagged white borders.
- * - Free edge (`v ∈ [0.14, 1.0]`, interior): 100% crisp opaque (255) with 1.5% tip micro-AA.
+ * V13 Gaussian Feathered AlphaMap (`256×256` POT, iOS Safari + Android Chrome WebGL2 safe):
+ * - Cuticle (`v ∈ [0, 0.10]`): Gaussian ramp `f(t) = 1 - exp(-(t / sigma)^2)` from 0 at `v=0` to 255 at `v=0.10`.
+ * - Lateral margins (`u ∈ [0, 0.04]` & `[0.96, 1.0]`): ultra-refined Gaussian ramp eliminating white halos.
+ * - Free edge (`v ∈ [0.10, 1.0]`, interior): 100% crisp opaque (255) with 1.5% tip micro-AA.
  */
 function buildGaussianFeatheredAlphaCanvas(size: number): HTMLCanvasElement {
   const { canvas, ctx } = makeTextureSurface(size, size);
@@ -2384,13 +2401,13 @@ function buildGaussianFeatheredAlphaCanvas(size: number): HTMLCanvasElement {
   for (let y = 0; y < size; y++) {
     // Three.js UV convention: y = 0 is tip (v = 1), y = size - 1 is cuticle (v = 0)
     const v = 1 - y / Math.max(1, size - 1);
-    const cuticleFactor = v < 0.14 ? gaussianRamp(v / 0.14, 0.44) : 1.0;
+    const cuticleFactor = v < 0.10 ? gaussianRamp(v / 0.10, 0.44) : 1.0;
     const tipFactor = v > 0.985 ? gaussianRamp((1 - v) / 0.015, 0.46) : 1.0;
 
     for (let x = 0; x < size; x++) {
       const u = x / Math.max(1, size - 1);
-      const leftFactor = u < 0.06 ? gaussianRamp(u / 0.06, 0.42) : 1.0;
-      const rightFactor = u > 0.94 ? gaussianRamp((1 - u) / 0.06, 0.42) : 1.0;
+      const leftFactor = u < 0.04 ? gaussianRamp(u / 0.04, 0.42) : 1.0;
+      const rightFactor = u > 0.96 ? gaussianRamp((1 - u) / 0.04, 0.42) : 1.0;
 
       const alphaByte = clampByte(cuticleFactor * tipFactor * leftFactor * rightFactor * 255);
       const idx = (y * size + x) * 4;
@@ -2591,19 +2608,34 @@ function deriveTrueUvPBRMapsFromImage(
 }
 
 /**
- * V12 PBR Synthesizer:
- * - ABSOLUTE PRIORITY: When `spec.trueUvDataUrl` is present, directly transfers the real `512×512`
- *   photorealistic UV texture (`SRGBColorSpace`) and derives physical `normalMap` (`512×512` 3×3 blur + Sobel),
- *   `metalnessMap` (`256×256`, up to `0.85`), `roughnessMap` (`256×256`), and Gaussian feathered `alphaMap` (`256×256`).
- * - Falls back cleanly to V11 `manufacturingSpec` or V10 `blueprint` for non-UV studio designs.
+ * V13 Dual-Path PBR Synthesizer:
+ * - Resolves explicit `effectiveStrategy`:
+ *   - `'procedural_pbr_3d'`: uses clean procedural PBR compiler (`paintManufacturingLayers`),
+ *     ignoring `trueUvDataUrl` even if a local fallback populated one (for mirror chrome + real 3D studs).
+ *   - `'canonical_uv_delighted'` / `'hybrid_uv_plus_pbr_3d'` with `trueUvDataUrl`: transfers the
+ *     silhouette-conformed TrueUV texture + pixel-derived PBR maps AND paints contact AO + bezel rings
+ *     beneath any `spec.manufacturingSpec?.accessories3D`.
  * - Strictly POT canvases (`HTMLCanvasElement`) with mipmaps enabled for iOS Safari + Android Chrome WebGL2.
+ * - Fires optional `onTextureReady` after async `img.onload` updates all 4 PBR maps (`needsUpdate = true`).
  */
 export function synthesizeCleanPBRBundle(
-  spec: NailFingerDesignSpec
+  spec: NailFingerDesignSpec,
+  onTextureReady?: () => void
 ): ProceduralPBRBundle {
+  const effectiveStrategy = resolveEffectiveRenderStrategy(spec);
+  const useTrueUvPath =
+    (effectiveStrategy === 'canonical_uv_delighted' ||
+      effectiveStrategy === 'hybrid_uv_plus_pbr_3d') &&
+    Boolean(spec.trueUvDataUrl);
+
   const specHash = hashFingerSpec(spec);
   const cached = pbrBundleCache.get(specHash);
-  if (cached) return cached;
+  if (cached) {
+    if (!useTrueUvPath && onTextureReady) {
+      onTextureReady();
+    }
+    return cached;
+  }
 
   const { canvas: albedoCanvas, ctx: albedoCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
   const { canvas: normalCanvas, ctx: normalCtx } = makeTextureSurface(ALBEDO_SIZE, ALBEDO_SIZE);
@@ -2611,7 +2643,7 @@ export function synthesizeCleanPBRBundle(
   const { canvas: roughCanvas, ctx: roughCtx } = makeTextureSurface(AUX_SIZE, AUX_SIZE);
 
   // Instant clean frame-0 base fill (zero black flash while Image decodes asynchronously)
-  albedoCtx.fillStyle = spec.baseColor || '#D4B483';
+  albedoCtx.fillStyle = spec.manufacturingSpec?.trueBaseColorHex || spec.baseColor || '#D4B483';
   albedoCtx.fillRect(0, 0, ALBEDO_SIZE, ALBEDO_SIZE);
   normalCtx.fillStyle = 'rgb(128,128,255)';
   normalCtx.fillRect(0, 0, ALBEDO_SIZE, ALBEDO_SIZE);
@@ -2620,7 +2652,7 @@ export function synthesizeCleanPBRBundle(
   roughCtx.fillStyle = 'rgb(36,36,36)';
   roughCtx.fillRect(0, 0, AUX_SIZE, AUX_SIZE);
 
-  if (!spec.trueUvDataUrl) {
+  if (!useTrueUvPath) {
     const { ctx: heightCtx } = makeSurface(ALBEDO_SIZE, ALBEDO_SIZE);
     const hasRaisedRelief = spec.manufacturingSpec
       ? paintManufacturingLayers(
@@ -2653,7 +2685,7 @@ export function synthesizeCleanPBRBundle(
     normalCtx.putImageData(normalData, 0, 0);
   }
 
-  // V12 256×256 Gaussian Feathered AlphaMap (cuticle v∈[0,0.14] + lateral edges u∈[0,0.06]∪[0.94,1])
+  // V13 256×256 Gaussian Feathered AlphaMap (cuticle v∈[0,0.10] + lateral edges u∈[0,0.04]∪[0.96,1])
   const alphaCanvas = buildGaussianFeatheredAlphaCanvas(AUX_SIZE);
 
   const map = new THREE.CanvasTexture(albedoCanvas);
@@ -2692,7 +2724,7 @@ export function synthesizeCleanPBRBundle(
 
   let disposed = false;
 
-  if (spec.trueUvDataUrl && typeof Image !== 'undefined') {
+  if (useTrueUvPath && spec.trueUvDataUrl && typeof Image !== 'undefined') {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
@@ -2706,12 +2738,35 @@ export function synthesizeCleanPBRBundle(
         ALBEDO_SIZE,
         AUX_SIZE
       );
+
+      // Paint contact AO + bezel rings under any real 3D accessories even in TrueUV / hybrid path
+      const accessories = spec.manufacturingSpec?.accessories3D ?? [];
+      if (accessories.length > 0) {
+        const { ctx: dummyHeightCtx } = makeSurface(ALBEDO_SIZE, ALBEDO_SIZE);
+        for (const acc of accessories) {
+          renderAccessoryContactAO(
+            acc,
+            albedoCtx,
+            dummyHeightCtx,
+            metalCtx,
+            roughCtx,
+            ALBEDO_SIZE,
+            ALBEDO_SIZE,
+            AUX_SIZE,
+            AUX_SIZE
+          );
+        }
+      }
+
       map.needsUpdate = true;
       normalMap.needsUpdate = true;
       metalnessMap.needsUpdate = true;
       roughnessMap.needsUpdate = true;
+      onTextureReady?.();
     };
     img.src = spec.trueUvDataUrl;
+  } else if (onTextureReady) {
+    onTextureReady();
   }
 
   const bundle: ProceduralPBRBundle = {

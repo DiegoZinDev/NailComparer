@@ -172,15 +172,24 @@ export type Nail3DBorderType =
   | 'micro_french'
   | 'deep_v_french';
 
+export type NailRenderStrategy =
+  | 'procedural_pbr_3d'
+  | 'canonical_uv_delighted'
+  | 'hybrid_uv_plus_pbr_3d';
+
 export interface Nail3DManufacturingSpec {
   fingerId: FingerId;
   handSide?: 'Left' | 'Right';
+  /** V13 OmniFabric-Nail Dual-Path Strategy */
+  renderStrategy?: NailRenderStrategy;
+  /** Optional VLM-guided bounding box [xMin, yMin, xMax, yMax] inside finger zoom crop */
+  nailBoundingBox?: [number, number, number, number];
   // 1. Clean parametric salon geometry (NO noisy pixel width profiles!)
   shape: NailShape;
   freeEdgeRatio: number; // 0.12 (short) .. 1.15 (extra long)
   tipRoundness: number; // 0..1
-  cCurveDepth: number; // 0.16..0.28
-  apexHeight: number; // 0.06..0.11
+  cCurveDepth: number; // 0.11..0.18 (V13 thin salon gel shell)
+  apexHeight: number; // 0.042..0.075 (V13 refined gel apex)
   // 2. Real optical physics (environmental reflections discounted from true base color)
   substrateType: Nail3DSubstrateType;
   finishType: Nail3DFinishType;
@@ -332,7 +341,8 @@ export interface NailFingerDesignSpec {
   strokeAnchors: StrokeAnchor[];
   metallicIntensity: number;
   glossIntensity: number;
-  // V12 Photorealistic True UV Texture Transfer (512x512 WebP/PNG + interactive 4x loupe target)
+  // V12/V13 Photorealistic True UV Texture Transfer + Dual-Path Routing
+  renderStrategy?: NailRenderStrategy;
   trueUvDataUrl?: string;
   uvExtractionTarget?: NailUvPinTarget;
   // V11 Primary 3D Manufacturing Spec + Real 3D Offscreen Render Preview
@@ -377,6 +387,7 @@ export interface NailDesign {
   detectedShape?: NailShape;
   detectedLength?: number;
   fidelityScore?: number;
+  v13Engine?: boolean;
   fingerSpecs?: Record<FingerId, NailFingerDesignSpec>;
   /** Optional 10-finger set supporting distinct Left and Right hand designs in AR */
   handSpecsBySide?: NailHandSpecsBySide;

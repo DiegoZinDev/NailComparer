@@ -4,6 +4,8 @@ import {
   FINGER_LABELS_PT,
   ORDERED_FINGERS,
   analyzeReferencePerFinger,
+  createPinTargetFromLandmarks,
+  extractTrueUVNailTexture,
   type PerFingerAnalysisResult,
 } from './perFingerVisionAnalyzer';
 import type {
@@ -23,7 +25,9 @@ import type {
   NailFingerDesignSpec,
   NailFinishV10,
   NailHandSpecsBySide,
+  NailRenderStrategy,
   NailShape,
+  NailUvPinTarget,
   NormalizedPoint,
 } from '../types/nail';
 
@@ -116,7 +120,14 @@ interface FingerCropTarget {
   zoomDataUrl: string;
   zoomBase64: string;
   labelPt: string;
+  pinTarget?: NailUvPinTarget;
 }
+
+const VALID_RENDER_STRATEGIES: ReadonlySet<NailRenderStrategy> = new Set([
+  'procedural_pbr_3d',
+  'canonical_uv_delighted',
+  'hybrid_uv_plus_pbr_3d',
+]);
 
 const VALID_SHAPES: ReadonlySet<NailShape> = new Set([
   'natural',
@@ -262,8 +273,29 @@ export function sanitizeManufacturingSpecClient(
 
   const freeEdgeRatio = clamp(Number(obj.freeEdgeRatio ?? 0.45), 0.12, 1.15);
   const tipRoundness = clamp(Number(obj.tipRoundness ?? 0.55), 0, 1);
-  const cCurveDepth = clamp(Number(obj.cCurveDepth ?? 0.22), 0.16, 0.28);
-  const apexHeight = clamp(Number(obj.apexHeight ?? 0.085), 0.06, 0.11);
+  const cCurveDepth = clamp(Number(obj.cCurveDepth ?? 0.145), 0.11, 0.18);
+  const apexHeight = clamp(Number(obj.apexHeight ?? 0.058), 0.042, 0.075);
+
+  const renderStrategy: NailRenderStrategy = VALID_RENDER_STRATEGIES.has(
+    obj.renderStrategy as NailRenderStrategy
+  )
+    ? (obj.renderStrategy as NailRenderStrategy)
+    : 'procedural_pbr_3d';
+
+  let nailBoundingBox: [number, number, number, number] | undefined;
+  if (Array.isArray(obj.nailBoundingBox) && obj.nailBoundingBox.length >= 4) {
+    const x0 = clamp(Number(obj.nailBoundingBox[0]), 0, 1);
+    const y0 = clamp(Number(obj.nailBoundingBox[1]), 0, 1);
+    const x1 = clamp(Number(obj.nailBoundingBox[2]), 0, 1);
+    const y1 = clamp(Number(obj.nailBoundingBox[3]), 0, 1);
+    const minX = Math.min(x0, x1);
+    const maxX = Math.max(x0, x1);
+    const minY = Math.min(y0, y1);
+    const maxY = Math.max(y0, y1);
+    if (maxX - minX >= 0.04 && maxY - minY >= 0.04) {
+      nailBoundingBox = [minX, minY, maxX, maxY];
+    }
+  }
 
   const substrateType: Nail3DSubstrateType = VALID_SUBSTRATES.has(
     obj.substrateType as Nail3DSubstrateType
@@ -338,12 +370,24 @@ export function sanitizeManufacturingSpecClient(
       return fb;
     };
     const col = sanitizeHex(sr.colorHex, '#D9B668');
-    // Guard against fake dark environmental reflection stripes on mirror chrome
-    if (finishType === 'mirror_chrome' && !sr.isMetallic) {
+    // Guard against fake dark environmental reflection stripes or spurious streaks on mirror chrome / solid gloss gel
+    if (
+      renderStrategy === 'procedural_pbr_3d' &&
+      (finishType === 'mirror_chrome' || finishType === 'solid_gloss_gel')
+    ) {
       const r = parseInt(col.slice(1, 3), 16);
       const g = parseInt(col.slice(3, 5), 16);
       const b = parseInt(col.slice(5, 7), 16);
-      if (Math.max(r, g, b) < 55) continue;
+      const maxC = Math.max(r, g, b);
+      const minC = Math.min(r, g, b);
+      const isDarkOrNeutralReflection =
+        maxC < 65 || (maxC - minC < 18 && maxC > 215 && !sr.isMetallic);
+      if (finishType === 'mirror_chrome' && (!sr.isMetallic || isDarkOrNeutralReflection)) {
+        continue;
+      }
+      if (finishType === 'solid_gloss_gel' && !sr.isMetallic && isDarkOrNeutralReflection) {
+        continue;
+      }
     }
     strokes3D.push({
       p0: toPt(sr.p0, [0.2, 0.3]),
@@ -406,6 +450,8 @@ export function sanitizeManufacturingSpecClient(
     handSide: (obj.handSide === 'Left' || obj.handSide === 'Right'
       ? obj.handSide
       : handSide) as 'Left' | 'Right' | undefined,
+    renderStrategy,
+    ...(nailBoundingBox ? { nailBoundingBox } : {}),
     shape,
     freeEdgeRatio,
     tipRoundness,
@@ -548,15 +594,26 @@ export function blueprintToManufacturingSpec(
     1.15
   );
 
+  const inferredStrategy: NailRenderStrategy =
+    spec.renderStrategy ??
+    (finishType === 'mirror_chrome'
+      ? 'procedural_pbr_3d'
+      : spec.trueUvDataUrl
+        ? accessories3D.length > 0
+          ? 'hybrid_uv_plus_pbr_3d'
+          : 'canonical_uv_delighted'
+        : 'procedural_pbr_3d');
+
   return sanitizeManufacturingSpecClient(
     {
       fingerId: spec.fingerId,
       handSide,
+      renderStrategy: inferredStrategy,
       shape: bp?.geometry.shape ?? spec.shape,
       freeEdgeRatio,
       tipRoundness: bp?.geometry.tipRoundness ?? spec.tipRoundness ?? 0.55,
-      cCurveDepth: 0.22,
-      apexHeight: 0.085,
+      cCurveDepth: 0.145,
+      apexHeight: 0.058,
       substrateType:
         finishType === 'jelly_translucent' ? 'milky_jelly' : 'opaque_gel_polish',
       finishType,
@@ -640,11 +697,16 @@ export function manufacturingSpecToFingerDesignSpec(
     preview3DDataUrl?: string;
     referenceZoomDataUrl?: string;
     fidelityScore?: number;
+    trueUvDataUrl?: string;
+    uvExtractionTarget?: NailUvPinTarget;
   }
 ): NailFingerDesignSpec {
   const pattern = inferPatternFromManufacturing(mSpec);
   const lengthMultiplier = Number((1 + mSpec.freeEdgeRatio).toFixed(2));
   const fidelityScore = meta?.fidelityScore ?? mSpec.fidelityScore;
+  const renderStrategy: NailRenderStrategy = mSpec.renderStrategy ?? 'procedural_pbr_3d';
+  const effectiveTrueUv =
+    renderStrategy === 'procedural_pbr_3d' ? undefined : meta?.trueUvDataUrl;
   const accentColor =
     mSpec.accessories3D[0]?.colorHex ??
     (mSpec.borderIsMetallic ? mSpec.borderColorHex : undefined) ??
@@ -670,8 +732,12 @@ export function manufacturingSpecToFingerDesignSpec(
     })),
     metallicIntensity: mSpec.metalness,
     glossIntensity: mSpec.finishType === 'velvet_matte' ? 0.55 : 0.96,
+    renderStrategy,
+    ...(effectiveTrueUv ? { trueUvDataUrl: effectiveTrueUv } : {}),
+    ...(meta?.uvExtractionTarget ? { uvExtractionTarget: meta.uvExtractionTarget } : {}),
     manufacturingSpec: {
       ...mSpec,
+      renderStrategy,
       fidelityScore,
     },
     preview3DDataUrl: meta?.preview3DDataUrl,
@@ -917,6 +983,8 @@ async function runCleanLocalFallback(
       const preliminary = manufacturingSpecToFingerDesignSpec(mSpec, {
         detectedFromPhoto: baseSpec.detectedFromPhoto,
         fidelityScore: 76,
+        trueUvDataUrl: baseSpec.trueUvDataUrl,
+        uvExtractionTarget: baseSpec.uvExtractionTarget,
       });
       preliminary.blueprint = baseSpec.blueprint;
       preliminary.preview3DDataUrl = renderPreview(preliminary);
@@ -984,12 +1052,18 @@ export async function runDeepPerFingerReconstruction(
     percent: 8,
   });
 
+  let sourceImg: HTMLImageElement | null = null;
+  let sourceImgW = 0;
+  let sourceImgH = 0;
   let fullImageDataUrl = imageDataUrl;
   const targets: FingerCropTarget[] = [];
   const detectedHandSides = new Set<'Left' | 'Right'>();
 
   if (typeof document !== 'undefined' && typeof Image !== 'undefined') {
     const img = await loadHtmlImage(imageDataUrl);
+    sourceImg = img;
+    sourceImgW = img.naturalWidth || img.width || 1;
+    sourceImgH = img.naturalHeight || img.height || 1;
     fullImageDataUrl = encodeResizedJpeg(img, 1024, 0.88) || imageDataUrl;
 
     try {
@@ -1020,6 +1094,14 @@ export async function runDeepPerFingerReconstruction(
           const sidePt = side === 'Left' ? 'Mão Esquerda' : 'Mão Direita';
           const labelPt = `${FINGER_LABELS_PT[fid]} • ${sidePt}`;
           const zoomDataUrl = buildVerticalizedFingerZoom(img, dip, tip, labelPt);
+          const pinTarget = createPinTargetFromLandmarks(
+            dip,
+            tip,
+            sourceImgW,
+            sourceImgH,
+            fid,
+            true
+          );
           if (zoomDataUrl) {
             targets.push({
               key: `${side}:${fid}`,
@@ -1028,6 +1110,7 @@ export async function runDeepPerFingerReconstruction(
               zoomDataUrl,
               zoomBase64: stripDataUrlPrefix(zoomDataUrl),
               labelPt,
+              pinTarget,
             });
           }
         }
@@ -1038,6 +1121,14 @@ export async function runDeepPerFingerReconstruction(
 
     if (targets.length === 0) {
       const macroZoom = buildMacroCenterCrop(img, 'Referência Macro');
+      const macroPinTarget = createPinTargetFromLandmarks(
+        { x: 0.5, y: 0.64 },
+        { x: 0.5, y: 0.36 },
+        sourceImgW,
+        sourceImgH,
+        'middle',
+        false
+      );
       targets.push({
         key: 'Right:middle',
         fingerId: 'middle',
@@ -1045,6 +1136,7 @@ export async function runDeepPerFingerReconstruction(
         zoomDataUrl: macroZoom,
         zoomBase64: stripDataUrlPrefix(macroZoom),
         labelPt: 'Médio • Referência Macro',
+        pinTarget: macroPinTarget,
       });
       detectedHandSides.add('Right');
     }
@@ -1186,6 +1278,56 @@ export async function runDeepPerFingerReconstruction(
         target.handSide
       );
 
+      const resolveCanonicalUvForSpec = async (
+        specToResolve: Nail3DManufacturingSpec
+      ): Promise<string | undefined> => {
+        const strategy = specToResolve.renderStrategy ?? 'procedural_pbr_3d';
+        if (strategy === 'procedural_pbr_3d') {
+          return undefined;
+        }
+
+        // Optional server canonical UV generator (V13 OmniFabric-Nail path)
+        try {
+          const canonicalRes = await callReconstructApi(
+            fetchImpl,
+            endpointUrl,
+            apiKey,
+            {
+              action: 'generate_canonical_uv',
+              fingerId: target.fingerId,
+              handSide: target.handSide,
+              fingerZoomBase64: target.zoomBase64,
+              spec: specToResolve,
+              mimeType: 'image/jpeg',
+            },
+            signal
+          );
+          if (
+            canonicalRes.enabled === true &&
+            typeof canonicalRes.canonicalUvDataUrl === 'string' &&
+            canonicalRes.canonicalUvDataUrl.startsWith('data:image/')
+          ) {
+            return canonicalRes.canonicalUvDataUrl;
+          }
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') throw err;
+          // Fall back silently to client-side silhouette-conformed TrueUV extraction
+        }
+
+        if (sourceImg && target.pinTarget) {
+          const extracted = extractTrueUVNailTexture(
+            sourceImg,
+            target.pinTarget,
+            512,
+            specToResolve.shape
+          );
+          if (extracted) return extracted;
+        }
+        return undefined;
+      };
+
+      let currentTrueUvDataUrl = await resolveCanonicalUvForSpec(currentSpec);
+
       options?.onProgress?.({
         stage: 'rendering_3d',
         message: `Dedo ${FINGER_LABELS_PT[target.fingerId]} (${idx + 1}/${totalWork}): Construindo molde 3D${
@@ -1202,11 +1344,14 @@ export async function runDeepPerFingerReconstruction(
       let currentFingerDesign = manufacturingSpecToFingerDesignSpec(currentSpec, {
         detectedFromPhoto: true,
         referenceZoomDataUrl: target.zoomDataUrl,
+        trueUvDataUrl: currentTrueUvDataUrl,
+        uvExtractionTarget: target.pinTarget,
       });
       let currentPreview3D = renderPreview(currentFingerDesign);
       currentFingerDesign.preview3DDataUrl = currentPreview3D;
 
       let bestSpec = currentSpec;
+      let bestTrueUvDataUrl = currentTrueUvDataUrl;
       let bestPreview3D = currentPreview3D;
       let bestScore = 85;
       let rounds = 0;
@@ -1261,15 +1406,26 @@ export async function runDeepPerFingerReconstruction(
               )
             : currentSpec;
 
+          const refinedStrategy = refinedSpec.renderStrategy ?? 'procedural_pbr_3d';
+          const refinedTrueUv =
+            refinedStrategy === 'procedural_pbr_3d'
+              ? undefined
+              : refinedSpec.shape !== currentSpec.shape || !currentTrueUvDataUrl
+                ? await resolveCanonicalUvForSpec(refinedSpec)
+                : currentTrueUvDataUrl;
+
           if (score >= bestScore || round === 1) {
             bestScore = score;
             if (score >= 92) {
               bestSpec = { ...refinedSpec, fidelityScore: score, refinementRounds: rounds };
+              bestTrueUvDataUrl = refinedTrueUv;
               // Re-render final 3D preview if refinedSpec improved anything
               const finalDesign = manufacturingSpecToFingerDesignSpec(bestSpec, {
                 detectedFromPhoto: true,
                 referenceZoomDataUrl: target.zoomDataUrl,
                 fidelityScore: score,
+                trueUvDataUrl: bestTrueUvDataUrl,
+                uvExtractionTarget: target.pinTarget,
               });
               bestPreview3D = renderPreview(finalDesign);
               break;
@@ -1278,15 +1434,19 @@ export async function runDeepPerFingerReconstruction(
 
           // Apply refinedSpec and re-render 3D for next verification round
           currentSpec = { ...refinedSpec, fidelityScore: score, refinementRounds: rounds };
+          currentTrueUvDataUrl = refinedTrueUv;
           currentFingerDesign = manufacturingSpecToFingerDesignSpec(currentSpec, {
             detectedFromPhoto: true,
             referenceZoomDataUrl: target.zoomDataUrl,
             fidelityScore: score,
+            trueUvDataUrl: currentTrueUvDataUrl,
+            uvExtractionTarget: target.pinTarget,
           });
           currentPreview3D = renderPreview(currentFingerDesign);
 
           if (score >= bestScore) {
             bestSpec = currentSpec;
+            bestTrueUvDataUrl = currentTrueUvDataUrl;
             bestPreview3D = currentPreview3D;
           }
         } catch (err) {
@@ -1298,6 +1458,10 @@ export async function runDeepPerFingerReconstruction(
 
       bestSpec.fidelityScore = bestScore;
       bestSpec.refinementRounds = rounds;
+      if ((bestSpec.renderStrategy ?? 'procedural_pbr_3d') === 'procedural_pbr_3d') {
+        bestSpec.renderStrategy = 'procedural_pbr_3d';
+        bestTrueUvDataUrl = undefined;
+      }
       fidelityScores.push(bestScore);
 
       options?.onProgress?.({
@@ -1317,6 +1481,8 @@ export async function runDeepPerFingerReconstruction(
           preview3DDataUrl: bestPreview3D,
           referenceZoomDataUrl: target.zoomDataUrl,
           fidelityScore: bestScore,
+          trueUvDataUrl: bestTrueUvDataUrl,
+          uvExtractionTarget: target.pinTarget,
         })
       );
     }

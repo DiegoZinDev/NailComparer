@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import {
+  BiomechanicalSignGuard,
   FINGER_LANDMARK_INDICES,
   HAND_LANDMARK_COUNT,
   HandSkeletonFilter,
@@ -9,6 +10,19 @@ import {
   projectHandToPerspectiveMeters,
 } from './handKinematics';
 import {
+  DEFAULT_APEX_HEIGHT,
+  DEFAULT_C_CURVE_DEPTH,
+  V13_APEX_HEIGHT_MAX,
+  V13_APEX_HEIGHT_MIN,
+  V13_C_CURVE_MAX,
+  V13_C_CURVE_MIN,
+  V13_DIP_SPHERE_PALMAR_SHIFT,
+  V13_DIP_SPHERE_RADIUS_MULT,
+  V13_DISTAL_CYL_PALMAR_SHIFT,
+  V13_DISTAL_CYL_RADIUS_MULT,
+  V13_NAIL_DORSAL_OFFSET_MULT,
+  V13_PULP_SPHERE_PALMAR_SHIFT,
+  V13_PULP_SPHERE_RADIUS_MULT,
   type VolumetricNailGeometryOptions,
   createClearDropGeometry,
   createCuticleContactSkirtGeometry,
@@ -56,6 +70,18 @@ import type {
 const PERSPECTIVE_FOV_DEG = 58;
 const PERSPECTIVE_NEAR = 0.01;
 const PERSPECTIVE_FAR = 10.0;
+
+export const V13_OCCLUDER_CONSTANTS = {
+  cuticleLerpT: 0.22,
+  dorsalOffsetMult: V13_NAIL_DORSAL_OFFSET_MULT,
+  distalCylPalmarShift: V13_DISTAL_CYL_PALMAR_SHIFT,
+  distalCylRadiusMult: V13_DISTAL_CYL_RADIUS_MULT,
+  dipSpherePalmarShift: V13_DIP_SPHERE_PALMAR_SHIFT,
+  dipSphereRadiusMult: V13_DIP_SPHERE_RADIUS_MULT,
+  pulpLerpT: 0.78,
+  pulpSpherePalmarShift: V13_PULP_SPHERE_PALMAR_SHIFT,
+  pulpSphereRadiusMult: V13_PULP_SPHERE_RADIUS_MULT,
+} as const;
 
 /**
  * Instanced volumetric hand occluder counts:
@@ -123,6 +149,7 @@ export class ThreeNailScene {
   private rimLight: THREE.DirectionalLight;
 
   private readonly skeletonFilter = new HandSkeletonFilter();
+  private readonly biomechSignGuard = new BiomechanicalSignGuard(8);
   private readonly projectedPoints: THREE.Vector3[] = Array.from(
     { length: HAND_LANDMARK_COUNT },
     () => new THREE.Vector3()
@@ -438,6 +465,7 @@ export class ThreeNailScene {
 
   public resetTracking(): void {
     this.skeletonFilter.reset();
+    this.biomechSignGuard.reset();
     this.hideAll();
   }
 
@@ -452,10 +480,14 @@ export class ThreeNailScene {
     const roundedQ =
       tipRoundness !== undefined ? clamp(quantizeStep(tipRoundness, 0.05), 0, 1) : 0.5;
     const cCurveQ =
-      cCurveDepth !== undefined ? clamp(quantizeStep(cCurveDepth, 0.01), 0.16, 0.28) : 0.22;
+      cCurveDepth !== undefined
+        ? clamp(quantizeStep(cCurveDepth, 0.005), V13_C_CURVE_MIN, V13_C_CURVE_MAX)
+        : DEFAULT_C_CURVE_DEPTH;
     const apexQ =
-      apexHeight !== undefined ? clamp(quantizeStep(apexHeight, 0.005), 0.06, 0.11) : 0.085;
-    const key = `${shape}:${quantizedBed.toFixed(2)}:${roundedQ.toFixed(2)}:${cCurveQ.toFixed(2)}:${apexQ.toFixed(3)}`;
+      apexHeight !== undefined
+        ? clamp(quantizeStep(apexHeight, 0.004), V13_APEX_HEIGHT_MIN, V13_APEX_HEIGHT_MAX)
+        : DEFAULT_APEX_HEIGHT;
+    const key = `${shape}:${quantizedBed.toFixed(2)}:${roundedQ.toFixed(2)}:${cCurveQ.toFixed(3)}:${apexQ.toFixed(3)}`;
 
     let geo = this.nailGeometries.get(key);
     if (!geo) {
@@ -473,13 +505,21 @@ export class ThreeNailScene {
   private getOrCreateSkirtGeometry(
     shape: NailShape,
     bedFraction: number,
-    cCurveDepth = 0.22,
-    apexHeight = 0.085
+    cCurveDepth = DEFAULT_C_CURVE_DEPTH,
+    apexHeight = DEFAULT_APEX_HEIGHT
   ): THREE.BufferGeometry {
     const quantizedBed = clamp(quantizeStep(bedFraction, 0.02), 0.44, 0.90);
-    const cCurveQ = clamp(quantizeStep(cCurveDepth, 0.01), 0.16, 0.28);
-    const apexQ = clamp(quantizeStep(apexHeight, 0.005), 0.06, 0.11);
-    const key = `${shape}:${quantizedBed.toFixed(2)}:${cCurveQ.toFixed(2)}:${apexQ.toFixed(3)}`;
+    const cCurveQ = clamp(
+      quantizeStep(cCurveDepth, 0.005),
+      V13_C_CURVE_MIN,
+      V13_C_CURVE_MAX
+    );
+    const apexQ = clamp(
+      quantizeStep(apexHeight, 0.004),
+      V13_APEX_HEIGHT_MIN,
+      V13_APEX_HEIGHT_MAX
+    );
+    const key = `${shape}:${quantizedBed.toFixed(2)}:${cCurveQ.toFixed(3)}:${apexQ.toFixed(3)}`;
     let geo = this.skirtGeometries.get(key);
     if (!geo) {
       geo = createCuticleContactSkirtGeometry(shape, quantizedBed, cCurveQ, apexQ);
@@ -594,9 +634,9 @@ export class ThreeNailScene {
         if (!s) return '';
         const mSpec = s.manufacturingSpec;
         const mSig = mSpec
-          ? `:${mSpec.finishType}:${mSpec.trueBaseColorHex}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.cCurveDepth.toFixed(2)}:${mSpec.apexHeight.toFixed(3)}:${mSpec.strokes3D.length}:${mSpec.accessories3D.length}`
+          ? `:${mSpec.renderStrategy ?? ''}:${mSpec.finishType}:${mSpec.trueBaseColorHex}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.cCurveDepth.toFixed(2)}:${mSpec.apexHeight.toFixed(3)}:${mSpec.strokes3D.length}:${mSpec.accessories3D.length}`
           : '';
-        return `${id}:${s.shape}:${(s.freeEdgeRatio ?? 0).toFixed(2)}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}${mSig}`;
+        return `${id}:${s.shape}:${s.renderStrategy ?? ''}:${(s.freeEdgeRatio ?? 0).toFixed(2)}:${(s.lengthMultiplier ?? s.relativeLength).toFixed(2)}:${s.hasMetallicOutline ? s.outlineColor ?? '1' : '0'}:${hashFingerSpec(s)}${mSig}`;
       }).join('~');
     }
     const sideKey = design.handSpecsBySide ? activeHandSide : 'any';
@@ -746,9 +786,10 @@ export class ThreeNailScene {
       if (!rig) continue;
 
       const mSpec = spec.manufacturingSpec;
+      const renderStrategy = spec.renderStrategy ?? mSpec?.renderStrategy;
       const mSig = mSpec
-        ? `|m11:${mSpec.finishType}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.clearcoat.toFixed(2)}:${mSpec.strokes3D.length}`
-        : '';
+        ? `|m13:${renderStrategy ?? ''}:${mSpec.finishType}:${mSpec.metalness.toFixed(2)}:${mSpec.roughness.toFixed(2)}:${mSpec.clearcoat.toFixed(2)}:${mSpec.strokes3D.length}`
+        : `|s13:${renderStrategy ?? ''}`;
       const fullRigHash = `${bundle.specHash}${mSig}`;
 
       if (rig.currentSpecHash !== fullRigHash) {
@@ -758,7 +799,13 @@ export class ThreeNailScene {
         rig.dorsalMaterial.metalnessMap = bundle.metalnessMap;
         rig.dorsalMaterial.alphaMap = bundle.alphaMap;
 
-        if (spec.trueUvDataUrl) {
+        const useProceduralChromePath =
+          renderStrategy === 'procedural_pbr_3d' ||
+          (mSpec?.finishType === 'mirror_chrome' &&
+            renderStrategy !== 'canonical_uv_delighted' &&
+            renderStrategy !== 'hybrid_uv_plus_pbr_3d');
+
+        if (spec.trueUvDataUrl && !useProceduralChromePath) {
           rig.dorsalMaterial.metalness = 1.0;
           rig.dorsalMaterial.roughness = 1.0;
           rig.dorsalMaterial.clearcoat = 1.0;
@@ -780,7 +827,7 @@ export class ThreeNailScene {
           const hasReliefStrokes =
             mSpec.strokes3D.some((st) => st.reliefHeight > 0.05) || mSpec.borderIs3DRaised;
           if (mSpec.finishType === 'mirror_chrome') {
-            const chromeNormal = hasReliefStrokes ? 1.1 : 0.35;
+            const chromeNormal = hasReliefStrokes ? 0.95 : 0.15;
             rig.dorsalMaterial.normalScale.set(chromeNormal, chromeNormal);
           } else {
             const nScale = hasReliefStrokes ? 1.35 : 0.95;
@@ -799,7 +846,7 @@ export class ThreeNailScene {
             spec.finishStyle === 'velvet_matte' ||
             (!spec.finishStyle && spec.glossIntensity < 0.65);
 
-          const nScale = isRelief ? 1.45 : isChrome ? 0.35 : 1.05;
+          const nScale = isRelief ? 1.45 : isChrome ? 0.15 : 1.05;
           rig.dorsalMaterial.normalScale.set(nScale, nScale);
           rig.dorsalMaterial.metalness = 1.0;
           rig.dorsalMaterial.roughness = 1.0;
@@ -808,10 +855,10 @@ export class ThreeNailScene {
           rig.dorsalMaterial.clearcoatRoughness = isVelvet
             ? 0.34
             : isChrome
-              ? 0.02
+              ? 0.018
               : 0.035;
           rig.dorsalMaterial.envMapIntensity = isChrome
-            ? 2.25
+            ? 2.45
             : isVelvet
               ? 0.9
               : 1.5;
@@ -1003,8 +1050,13 @@ export class ThreeNailScene {
     const points3D = projection.points3D;
     const focalPx = projection.focalPx;
 
-    // 3. Cached off-RAF PBR texture synthesis & material binding (supports 5 or 10 fingers by handedness)
-    this.ensureDesignPBRCache(design, filtered.handedness);
+    // 3. Biomechanical handedness sign guard (8-frame hysteresis) + cached off-RAF PBR binding
+    const effectiveHandedness = this.biomechSignGuard.update(
+      points3D,
+      filtered.handedness,
+      mirrorX
+    );
+    this.ensureDesignPBRCache(design, effectiveHandedness);
 
     // 4. Directional Room Lighting & Adaptive Skin-Tone Fill
     const lumExposure = clamp(0.74 + ambient.luma * 0.78, 0.72, 1.32);
@@ -1032,8 +1084,7 @@ export class ThreeNailScene {
     const fineExtMult = clamp(adjustment.extensionLength, 0.85, 1.15);
     const fineWidthMult = clamp(adjustment.scale, 0.85, 1.2);
     const rotRad = (-adjustment.rotationDeg * Math.PI) / 180;
-    const undersideOpacity = clamp(adjustment.opacity, 0.7, 1.0);
-    const undersideTransparent = undersideOpacity < 0.99;
+    const baseOpacity = clamp(adjustment.opacity, 0.7, 1.0);
 
     let refPalmThicknessMeters = 0.022;
     let middleWidthMeters = 0.0125;
@@ -1063,7 +1114,7 @@ export class ThreeNailScene {
       visibleFingers += 1;
 
       const sideSpec =
-        design.handSpecsBySide?.[filtered.handedness]?.[fingerId] ??
+        design.handSpecsBySide?.[effectiveHandedness]?.[fingerId] ??
         design.fingerSpecs?.[fingerId];
       const spec = sideSpec ?? this.cachedFingerSpecs?.[fingerId];
       const mSpec = spec?.manufacturingSpec;
@@ -1080,8 +1131,16 @@ export class ThreeNailScene {
         : mSpec?.shape ?? spec?.shape ?? adjustment.shape;
       const tipRoundness =
         mSpec?.tipRoundness ?? spec?.blueprint?.geometry.tipRoundness ?? spec?.tipRoundness;
-      const cCurveDepth = clamp(mSpec?.cCurveDepth ?? 0.22, 0.16, 0.28);
-      const apexHeight = clamp(mSpec?.apexHeight ?? 0.085, 0.06, 0.11);
+      const cCurveDepth = clamp(
+        mSpec?.cCurveDepth ?? DEFAULT_C_CURVE_DEPTH,
+        V13_C_CURVE_MIN,
+        V13_C_CURVE_MAX
+      );
+      const apexHeight = clamp(
+        mSpec?.apexHeight ?? DEFAULT_APEX_HEIGHT,
+        V13_APEX_HEIGHT_MIN,
+        V13_APEX_HEIGHT_MAX
+      );
 
       // Client-native real metric dimensions (live camera scanline calibration prioritized)
       const dims = computeFingerMetricDimensions(fingerId, filtered.worldLandmarks, {
@@ -1102,8 +1161,8 @@ export class ThreeNailScene {
       const safeBedLengthMeters =
         fingerId === 'pinky' ? Math.max(dims.bedLengthMeters, 0.0078) : dims.bedLengthMeters;
 
-      // Client owns 100% of nail width; reference `relativeWidth` NEVER overrides client finger width
-      const nailWMeters = safeNailWidthMeters * fineWidthMult;
+      // V13 Realistic Nail Bed Width: avoids overhanging past lateral skin folds
+      const nailWMeters = safeNailWidthMeters * 0.94 * fineWidthMult;
       const nailDepthMeters = nailWMeters;
 
       // Real nail bed (v <= bedFraction) + proportional reference free-edge extension
@@ -1141,19 +1200,11 @@ export class ThreeNailScene {
         rig.cuticleSkirtMesh.geometry = skirtGeo;
       }
 
-      applyDorsalMaterialOpacity(rig.dorsalMaterial, adjustment.opacity);
-      if (rig.undersideBundle.material.transparent !== undersideTransparent) {
-        rig.undersideBundle.material.transparent = undersideTransparent;
-        rig.undersideBundle.material.depthWrite = !undersideTransparent;
-        rig.undersideBundle.material.needsUpdate = true;
-      }
-      rig.undersideBundle.material.opacity = undersideOpacity;
-
       // Guaranteed right-handed SO(3) anatomical basis (det === +1)
       const basis = computeFingerAnatomicalBasis(
         fingerId,
         points3D,
-        filtered.handedness,
+        effectiveHandedness,
         mirrorX,
         this.tmpBasisMatrix
       );
@@ -1165,9 +1216,46 @@ export class ThreeNailScene {
         this.tmpNailQuat.premultiply(this.tmpRotOffsetQuat);
       }
 
-      // Dorsal cuticle anchor strictly attached to distal cylinder surface at lerp(DIP, TIP, 0.20)
-      this.tmpCuticlePos.copy(dipPt).lerp(tipPt, 0.20);
-      const dorsalOffset = dims.phalanxRadiusMeters * 0.88;
+      // V13 Palmar Anti-Bleed Visibility Gate:
+      // - When palm faces camera (`axisZ.z < -0.35`): hide dorsal plate (Group 0) and cuticle skirt completely;
+      //   only show ventral free-edge cavity (Group 1) when `effectiveFreeEdge > 0.28`, fading smoothly to 0 by `axisZ.z < -0.55`.
+      // - Smooth fade across `-0.15 .. -0.35` before dorsal cutoff.
+      const axisZz = this.tmpAxisZ.z;
+      const isPalmFacing = axisZz < -0.35;
+      const dorsalFade = isPalmFacing
+        ? 0
+        : axisZz < -0.15
+          ? clamp((axisZz + 0.35) / 0.20, 0, 1)
+          : 1;
+      const effectiveDorsalOpacity = baseOpacity * dorsalFade;
+      rig.dorsalMaterial.visible = !isPalmFacing && effectiveDorsalOpacity > 0.01;
+      applyDorsalMaterialOpacity(rig.dorsalMaterial, effectiveDorsalOpacity);
+
+      let showVentralCavity = true;
+      let effectiveUndersideOpacity = baseOpacity;
+      if (isPalmFacing) {
+        if (effectiveFreeEdge <= 0.28 || axisZz < -0.55) {
+          showVentralCavity = false;
+          effectiveUndersideOpacity = 0;
+        } else {
+          const ventralFade = clamp((axisZz + 0.55) / 0.20, 0, 1);
+          effectiveUndersideOpacity = baseOpacity * ventralFade;
+          showVentralCavity = effectiveUndersideOpacity > 0.01;
+        }
+      }
+      rig.undersideBundle.material.visible = showVentralCavity;
+      const undersideTransparent = effectiveUndersideOpacity < 0.99;
+      if (rig.undersideBundle.material.transparent !== undersideTransparent) {
+        rig.undersideBundle.material.transparent = undersideTransparent;
+        rig.undersideBundle.material.depthWrite = !undersideTransparent;
+        rig.undersideBundle.material.needsUpdate = true;
+      }
+      rig.undersideBundle.material.opacity = effectiveUndersideOpacity;
+
+      // Dorsal cuticle anchor attached cleanly at lerp(DIP, TIP, 0.22) with zero-clipping dorsal offset
+      this.tmpCuticlePos.copy(dipPt).lerp(tipPt, V13_OCCLUDER_CONSTANTS.cuticleLerpT);
+      const dorsalOffset =
+        dims.phalanxRadiusMeters * V13_OCCLUDER_CONSTANTS.dorsalOffsetMult;
       this.tmpNailPos
         .copy(this.tmpCuticlePos)
         .addScaledVector(this.tmpAxisZ, dorsalOffset);
@@ -1175,12 +1263,17 @@ export class ThreeNailScene {
       rig.nailMesh.position.copy(this.tmpNailPos);
       rig.nailMesh.quaternion.copy(this.tmpNailQuat);
       rig.nailMesh.scale.set(nailWMeters, totalLenMeters, nailDepthMeters);
-      rig.nailMesh.visible = true;
+      rig.nailMesh.visible = rig.dorsalMaterial.visible || rig.undersideBundle.material.visible;
       rig.nailMesh.updateMatrixWorld();
 
-      // Anchor true 3D geometric accessories (studs, caviar, pearls, rhinestones, drops) onto curved plate
+      // Anchor true 3D geometric accessories (ALWAYS active regardless of trueUvDataUrl when dorsal is visible)
       const accessories = mSpec?.accessories3D;
-      if (accessories && accessories.length > 0 && adjustment.opacity > 0.25) {
+      if (
+        accessories &&
+        accessories.length > 0 &&
+        axisZz >= -0.25 &&
+        adjustment.opacity > 0.25
+      ) {
         this.tmpSurfaceOpts.bedFraction = quantizedBedFraction;
         this.tmpSurfaceOpts.tipRoundness = tipRoundness;
         this.tmpSurfaceOpts.cCurveDepth = cCurveDepth;
@@ -1270,9 +1363,9 @@ export class ThreeNailScene {
         }
       }
 
-      // Conformal Cuticle & Lateral Sulcus AO Contact Skirt aligned 1:1 with nail plate
-      const skirtOpacity = clamp((this.tmpAxisZ.z + 0.05) / 0.25, 0, 1);
-      if (skirtOpacity > 0.02 && adjustment.opacity > 0.2) {
+      // Conformal Cuticle & Lateral Sulcus AO Contact Skirt aligned 1:1 with nail plate (hidden on palm view)
+      const skirtOpacity = isPalmFacing ? 0 : clamp((axisZz + 0.05) / 0.25, 0, 1);
+      if (skirtOpacity > 0.02 && adjustment.opacity > 0.2 && !isPalmFacing) {
         rig.cuticleSkirtMesh.position.copy(this.tmpNailPos);
         rig.cuticleSkirtMesh.quaternion.copy(this.tmpNailQuat);
         rig.cuticleSkirtMesh.scale.set(nailWMeters, totalLenMeters, nailDepthMeters);
@@ -1282,6 +1375,7 @@ export class ThreeNailScene {
       }
 
       // Volumetric Phalanx Cylinder + Joint Sphere Instanced Occluders (renderOrder = 1)
+      // Zero-Clipping Palmar Clearance: dorsal ceiling stays strictly below cuticle bed
       const distalRadius = dims.phalanxRadiusMeters;
       const middleRadius = distalRadius * 1.08;
       const proximalRadius = distalRadius * 1.16;
@@ -1289,19 +1383,45 @@ export class ThreeNailScene {
       const pBase = rig.fingerIndex * 3;
       this.setPhalanxInstance(pBase, mcpPt, pipPt, proximalRadius);
       this.setPhalanxInstance(pBase + 1, pipPt, dipPt, middleRadius);
-      this.setPhalanxInstance(pBase + 2, dipPt, tipPt, distalRadius * 0.82);
+
+      // Distal cylinder shifted palmarly (-0.32 * r) with radius 0.66 * r => dorsal ceiling +0.34 * r
+      this.tmpRodCenter
+        .copy(dipPt)
+        .addScaledVector(this.tmpAxisZ, V13_OCCLUDER_CONSTANTS.distalCylPalmarShift * distalRadius);
+      this.tmpPulpPos
+        .copy(tipPt)
+        .addScaledVector(this.tmpAxisZ, V13_OCCLUDER_CONSTANTS.distalCylPalmarShift * distalRadius);
+      this.setPhalanxInstance(
+        pBase + 2,
+        this.tmpRodCenter,
+        this.tmpPulpPos,
+        distalRadius * V13_OCCLUDER_CONSTANTS.distalCylRadiusMult
+      );
 
       const jBase = rig.fingerIndex * 4;
       this.setJointInstance(jBase, mcpPt, proximalRadius * 1.03);
       this.setJointInstance(jBase + 1, pipPt, middleRadius * 1.02);
-      this.setJointInstance(jBase + 2, dipPt, distalRadius * 1.0);
 
-      // Ventral Distal Pulp Sphere: centered at lerp(DIP, TIP, 0.82) shifted -0.12*distalRadius along -axisZ
+      // DIP joint sphere shifted palmarly (-0.24 * r) with radius 0.76 * r => dorsal ceiling +0.52 * r
       this.tmpPulpPos
         .copy(dipPt)
-        .lerp(tipPt, 0.82)
-        .addScaledVector(this.tmpAxisZ, -0.12 * distalRadius);
-      this.setJointInstance(jBase + 3, this.tmpPulpPos, distalRadius * 0.96);
+        .addScaledVector(this.tmpAxisZ, V13_OCCLUDER_CONSTANTS.dipSpherePalmarShift * distalRadius);
+      this.setJointInstance(
+        jBase + 2,
+        this.tmpPulpPos,
+        distalRadius * V13_OCCLUDER_CONSTANTS.dipSphereRadiusMult
+      );
+
+      // Ventral Distal Pulp Sphere: lerp(DIP, TIP, 0.78) shifted -0.36 * r with radius 0.76 * r => dorsal ceiling +0.40 * r
+      this.tmpPulpPos
+        .copy(dipPt)
+        .lerp(tipPt, V13_OCCLUDER_CONSTANTS.pulpLerpT)
+        .addScaledVector(this.tmpAxisZ, V13_OCCLUDER_CONSTANTS.pulpSpherePalmarShift * distalRadius);
+      this.setJointInstance(
+        jBase + 3,
+        this.tmpPulpPos,
+        distalRadius * V13_OCCLUDER_CONSTANTS.pulpSphereRadiusMult
+      );
     }
 
     this.finalizeAccessoryMesh(this.metalStudInstancedMesh, metalCount);
