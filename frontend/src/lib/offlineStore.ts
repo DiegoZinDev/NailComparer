@@ -9,12 +9,14 @@ import type {
 } from '../types/nail';
 
 const DB_NAME = 'nail-ar-studio-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // V13 schema migration: purges broken legacy V11/V12 local reconstructions
 const STORE_CONFIG = 'studioConfig';
 const STORE_DESIGNS = 'nailDesigns';
 
 const LS_CONFIG_KEY = 'nail_ar_studio_config_v1';
-const LS_DESIGNS_KEY = 'nail_ar_studio_designs_v1';
+const LS_DESIGNS_KEY = 'nail_ar_studio_designs_v13';
+const LS_LEGACY_DESIGNS_KEY = 'nail_ar_studio_designs_v1';
+const LS_MIGRATION_FLAG = 'nail_ar_studio_migrated_v13';
 
 export type SyncStatus = 'synced' | 'offline';
 
@@ -103,8 +105,26 @@ async function idbSaveConfig(config: StudioConfig): Promise<void> {
   }
 }
 
+/**
+ * V13 Cache Hygiene:
+ * - Purges legacy fictional `seed-*` entries.
+ * - Purges broken legacy V11/V12 imported reconstructions lacking `v13Engine`
+ *   (specifically low-fidelity `< 80%` / `< 0.80` local fallbacks or pre-V13 custom imports).
+ */
 function stripLegacyFictionalSeeds(designs: NailDesign[]): NailDesign[] {
-  return designs.filter((d) => !String(d.id).startsWith('seed-'));
+  return designs.filter((d) => {
+    if (String(d.id).startsWith('seed-')) return false;
+    if (!d.v13Engine) {
+      const score = d.fidelityScore;
+      const isLowFidelity =
+        typeof score === 'number' &&
+        (score <= 1 ? score < 0.8 : score < 80);
+      if (isLowFidelity) return false;
+      // Legacy V11/V12 imported designs without v13Engine & without verified >=80% fidelity
+      if ((d.isCustom || d.isStudioCatalog) && score === undefined) return false;
+    }
+    return true;
+  });
 }
 
 async function idbGetDesigns(): Promise<NailDesign[] | null> {
@@ -172,8 +192,22 @@ export async function ensureOfflineSeed(): Promise<void> {
     await idbSaveConfig(lsConfig ?? DEFAULT_STUDIO_CONFIG);
   }
 
-  // Purge any legacy V8 fictional seeds from local caches without repopulating
+  // V13 one-time migration: clean legacy localStorage key and persist sanitized designs
+  const migrated = readLocalStorage<boolean>(LS_MIGRATION_FLAG, false);
   const existingDesigns = await idbGetDesigns();
+  if (!migrated) {
+    const legacyLs = readLocalStorage<NailDesign[]>(LS_LEGACY_DESIGNS_KEY, []);
+    const combined = existingDesigns && existingDesigns.length > 0 ? existingDesigns : legacyLs;
+    await idbSaveAllDesigns(stripLegacyFictionalSeeds(combined));
+    try {
+      localStorage.removeItem(LS_LEGACY_DESIGNS_KEY);
+    } catch {
+      // Ignore storage error
+    }
+    writeLocalStorage(LS_MIGRATION_FLAG, true);
+    return;
+  }
+
   if (existingDesigns === null) {
     const lsDesigns = stripLegacyFictionalSeeds(
       readLocalStorage<NailDesign[]>(LS_DESIGNS_KEY, [])
@@ -341,6 +375,7 @@ export function apiDesignToLocal(raw: Record<string, unknown>): NailDesign {
     detectedShape,
     detectedLength,
     fidelityScore,
+    v13Engine: Boolean(raw.v13Engine ?? raw.v13_engine ?? false) || undefined,
     fingerSpecs,
     handSpecsBySide,
     createdAt:
@@ -378,6 +413,7 @@ export function localDesignToApi(
     detectedShape: design.detectedShape ?? null,
     detectedLength: design.detectedLength ?? null,
     fidelityScore: design.fidelityScore ?? null,
+    v13Engine: Boolean(design.v13Engine ?? true),
     fingerSpecs: design.fingerSpecs ?? null,
     handSpecsBySide: design.handSpecsBySide ?? null,
   };

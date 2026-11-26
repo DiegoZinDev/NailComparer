@@ -1,4 +1,9 @@
-import type { FingerId, NailDesign, NailFingerDesignSpec } from '../types/nail';
+import type {
+  FingerId,
+  NailDesign,
+  NailFingerDesignSpec,
+  NailRenderStrategy,
+} from '../types/nail';
 import { buildFingerSpecsFromStudioDesign } from './perFingerVisionAnalyzer';
 import {
   hashFingerSpec,
@@ -10,6 +15,23 @@ const PRIORITY_FINGERS: FingerId[] = ['ring', 'middle', 'index', 'thumb', 'pinky
 const swatchBgCache = new Map<string, string>();
 const trueUvSwatchCache = new Map<string, string>();
 
+function getEffectiveStrategy(spec: NailFingerDesignSpec): NailRenderStrategy {
+  return (
+    spec.renderStrategy ??
+    spec.manufacturingSpec?.renderStrategy ??
+    (spec.trueUvDataUrl ? 'canonical_uv_delighted' : 'procedural_pbr_3d')
+  );
+}
+
+function shouldUseTrueUvSwatch(spec: NailFingerDesignSpec): boolean {
+  const effectiveStrategy = getEffectiveStrategy(spec);
+  return (
+    (effectiveStrategy === 'canonical_uv_delighted' ||
+      effectiveStrategy === 'hybrid_uv_plus_pbr_3d') &&
+    Boolean(spec.trueUvDataUrl)
+  );
+}
+
 function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
   const handSets: Array<Partial<Record<FingerId, NailFingerDesignSpec>> | undefined> = [
     design.fingerSpecs,
@@ -17,25 +39,32 @@ function pickPrimaryFingerSpec(design: NailDesign): NailFingerDesignSpec {
     design.handSpecsBySide?.Left,
   ];
 
-  // 1. V12 Absolute Priority: any finger carrying a photorealistic True UV texture (`trueUvDataUrl`)
+  // 1. Respect explicit Dual-Path priority: procedural_pbr_3d prefers preview3DDataUrl,
+  //    canonical_uv_delighted / hybrid_uv_plus_pbr_3d prefers trueUvDataUrl
   for (const fingerMap of handSets) {
     if (!fingerMap) continue;
     for (const fid of PRIORITY_FINGERS) {
       const spec = fingerMap[fid];
-      if (spec?.trueUvDataUrl) return spec;
+      if (!spec) continue;
+      if (getEffectiveStrategy(spec) === 'procedural_pbr_3d' && spec.preview3DDataUrl) {
+        return spec;
+      }
+      if (shouldUseTrueUvSwatch(spec)) {
+        return spec;
+      }
     }
   }
 
-  // 2. Any finger carrying a rendered 3D preview (`preview3DDataUrl`)
+  // 2. Any finger carrying a rendered 3D preview (`preview3DDataUrl`) or TrueUV texture
   for (const fingerMap of handSets) {
     if (!fingerMap) continue;
     for (const fid of PRIORITY_FINGERS) {
       const spec = fingerMap[fid];
-      if (spec?.preview3DDataUrl) return spec;
+      if (spec?.preview3DDataUrl || spec?.trueUvDataUrl) return spec;
     }
   }
 
-  // 3. Any finger carrying rich V11 manufacturingSpec or V10 blueprint elements
+  // 3. Any finger carrying rich V11/V13 manufacturingSpec or V10 blueprint elements
   for (const fingerMap of handSets) {
     if (!fingerMap) continue;
     for (const fid of PRIORITY_FINGERS) {
@@ -132,25 +161,29 @@ function buildTrueUvNailSvgDataUrl(
 }
 
 /**
- * Generates a crisp circular thumbnail preview (`background`):
- * - V12 Priority: renders real photorealistic `trueUvDataUrl` inside an anatomical nail silhouette
- *   with subtle C-curve cylindrical shading and UV-gel gloss!
- * - Falls back cleanly to `preview3DDataUrl` or the vector PBR compiler.
+ * Generates a crisp circular thumbnail preview (`background`) respecting V13 Dual-Path routing:
+ * - `procedural_pbr_3d`: prioritizes real 3D render (`preview3DDataUrl`) or procedural blueprint canvas
+ *   (chrome + 3D spheres), ignoring any fallback `trueUvDataUrl`.
+ * - `canonical_uv_delighted` / `hybrid_uv_plus_pbr_3d`: prioritizes silhouette-conformed `trueUvDataUrl`
+ *   inside the anatomical nail silhouette with C-curve cylindrical shading and UV-gel gloss.
  */
 export function getSwatchBackground(design: NailDesign): string {
   const spec = pickPrimaryFingerSpec(design);
+  const effectiveStrategy = getEffectiveStrategy(spec);
   const baseHex =
     spec.manufacturingSpec?.trueBaseColorHex ||
     spec.blueprint?.baseLayer.baseColorHex ||
     spec.baseColor ||
     '#D4A383';
 
-  if (spec.trueUvDataUrl) {
+  if (effectiveStrategy === 'procedural_pbr_3d') {
+    if (spec.preview3DDataUrl) {
+      return `url("${spec.preview3DDataUrl}") center/cover no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
+    }
+  } else if (shouldUseTrueUvSwatch(spec) && spec.trueUvDataUrl) {
     const svgUrl = buildTrueUvNailSvgDataUrl(spec.trueUvDataUrl, spec.shape, 96, 132);
     return `url("${svgUrl}") center/contain no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
-  }
-
-  if (spec.preview3DDataUrl) {
+  } else if (spec.preview3DDataUrl) {
     return `url("${spec.preview3DDataUrl}") center/cover no-repeat, radial-gradient(circle at 34% 30%, ${baseHex}44 0%, #161114 85%)`;
   }
 
@@ -204,28 +237,37 @@ export function getSwatchBackground(design: NailDesign): string {
   }
 }
 
+function renderSpecSwatchDataUrl(
+  spec: NailFingerDesignSpec,
+  width: number,
+  height: number
+): string {
+  const effectiveStrategy = getEffectiveStrategy(spec);
+  if (effectiveStrategy === 'procedural_pbr_3d') {
+    if (spec.preview3DDataUrl) {
+      return spec.preview3DDataUrl;
+    }
+    return renderProceduralNailSwatchDataUrl(spec, width, height);
+  }
+  if (shouldUseTrueUvSwatch(spec) && spec.trueUvDataUrl) {
+    return buildTrueUvNailSvgDataUrl(spec.trueUvDataUrl, spec.shape, width, height);
+  }
+  if (spec.preview3DDataUrl) {
+    return spec.preview3DDataUrl;
+  }
+  return renderProceduralNailSwatchDataUrl(spec, width, height);
+}
+
 export function generateNailSwatchDataUrl(
   input: NailDesign | NailFingerDesignSpec,
   width = 180,
   height = 260
 ): string {
   if ('fingerId' in input) {
-    if (input.trueUvDataUrl) {
-      return buildTrueUvNailSvgDataUrl(input.trueUvDataUrl, input.shape, width, height);
-    }
-    if (input.preview3DDataUrl) {
-      return input.preview3DDataUrl;
-    }
-    return renderProceduralNailSwatchDataUrl(input, width, height);
+    return renderSpecSwatchDataUrl(input, width, height);
   }
   const primarySpec = pickPrimaryFingerSpec(input);
-  if (primarySpec.trueUvDataUrl) {
-    return buildTrueUvNailSvgDataUrl(primarySpec.trueUvDataUrl, primarySpec.shape, width, height);
-  }
-  if (primarySpec.preview3DDataUrl) {
-    return primarySpec.preview3DDataUrl;
-  }
-  return renderProceduralNailSwatchDataUrl(primarySpec, width, height);
+  return renderSpecSwatchDataUrl(primarySpec, width, height);
 }
 
 export async function renderAsyncNailSwatchPng(

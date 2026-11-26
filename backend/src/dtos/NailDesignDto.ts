@@ -27,8 +27,10 @@ import {
   type NailGradientMode,
   type NailHandSpecsBySide,
   type NailPatternType,
+  type NailRenderStrategy,
   type NailShape,
   type NailStyleType,
+  type NailUvPinTarget,
   type OrganicMotifElement,
   type RibbonStrokeElement,
   type VectorArtElement,
@@ -174,6 +176,12 @@ export const VALID_V11_BORDER_TYPES: readonly Nail3DBorderType[] = [
   'deep_v_french',
 ] as const;
 
+export const VALID_V13_RENDER_STRATEGIES: readonly NailRenderStrategy[] = [
+  'procedural_pbr_3d',
+  'canonical_uv_delighted',
+  'hybrid_uv_plus_pbr_3d',
+] as const;
+
 export interface NailDesignDTO {
   id: string;
   name: string;
@@ -193,6 +201,7 @@ export interface NailDesignDTO {
   detectedShape: NailShape | null;
   detectedLength: number | null;
   fidelityScore?: number | null;
+  v13Engine?: boolean;
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
   createdAt: string;
@@ -217,6 +226,7 @@ export interface CreateNailDesignDTO {
   detectedShape?: NailShape | null;
   detectedLength?: number | null;
   fidelityScore?: number | null;
+  v13Engine?: boolean;
   fingerSpecs?: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
 }
@@ -239,6 +249,7 @@ export interface UpdateNailDesignDTO {
   detectedShape?: NailShape | null;
   detectedLength?: number | null;
   fidelityScore?: number | null;
+  v13Engine?: boolean;
   fingerSpecs?: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
 }
@@ -615,6 +626,45 @@ function validateAndSanitizeManufacturingSpec(
 
   const s = rawSpec as Record<string, unknown>;
 
+  let renderStrategy: NailRenderStrategy | undefined;
+  if (s.renderStrategy !== undefined) {
+    if (
+      typeof s.renderStrategy !== 'string' ||
+      !(VALID_V13_RENDER_STRATEGIES as readonly string[]).includes(s.renderStrategy)
+    ) {
+      errors.push(
+        `fingerSpecs.${fingerKey}.manufacturingSpec.renderStrategy inválido. Valores aceitos: ${VALID_V13_RENDER_STRATEGIES.join(', ')}.`
+      );
+      return undefined;
+    }
+    renderStrategy = s.renderStrategy as NailRenderStrategy;
+  }
+
+  let nailBoundingBox: [number, number, number, number] | undefined;
+  if (s.nailBoundingBox !== undefined && s.nailBoundingBox !== null) {
+    if (
+      !Array.isArray(s.nailBoundingBox) ||
+      s.nailBoundingBox.length !== 4 ||
+      s.nailBoundingBox.some((v) => typeof v !== 'number' || !Number.isFinite(v))
+    ) {
+      errors.push(
+        `fingerSpecs.${fingerKey}.manufacturingSpec.nailBoundingBox deve conter 4 números [xMin, yMin, xMax, yMax] entre 0 e 1.`
+      );
+      return undefined;
+    }
+    const x0 = clampNumber(s.nailBoundingBox[0] as number, 0, 1);
+    const y0 = clampNumber(s.nailBoundingBox[1] as number, 0, 1);
+    const x1 = clampNumber(s.nailBoundingBox[2] as number, 0, 1);
+    const y1 = clampNumber(s.nailBoundingBox[3] as number, 0, 1);
+    const minX = Math.min(x0, x1);
+    const maxX = Math.max(x0, x1);
+    const minY = Math.min(y0, y1);
+    const maxY = Math.max(y0, y1);
+    if (maxX - minX >= 0.04 && maxY - minY >= 0.04) {
+      nailBoundingBox = [minX, minY, maxX, maxY];
+    }
+  }
+
   const shape: NailShape = isValidNailShape(s.shape) ? s.shape : 'almond';
   if (s.shape !== undefined && !isValidNailShape(s.shape)) {
     errors.push(
@@ -896,6 +946,8 @@ function validateAndSanitizeManufacturingSpec(
       ? s.fingerId
       : fingerKey.split('.').pop() ?? 'middle') as FingerId,
     ...(handSide ? { handSide } : {}),
+    ...(renderStrategy ? { renderStrategy } : {}),
+    ...(nailBoundingBox ? { nailBoundingBox } : {}),
     shape,
     freeEdgeRatio: clampNumber(
       typeof s.freeEdgeRatio === 'number' && Number.isFinite(s.freeEdgeRatio)
@@ -914,14 +966,14 @@ function validateAndSanitizeManufacturingSpec(
     cCurveDepth: clampNumber(
       typeof s.cCurveDepth === 'number' && Number.isFinite(s.cCurveDepth)
         ? s.cCurveDepth
-        : 0.22,
-      0.16,
-      0.28
+        : 0.145,
+      0.11,
+      0.18
     ),
     apexHeight: clampNumber(
-      typeof s.apexHeight === 'number' && Number.isFinite(s.apexHeight) ? s.apexHeight : 0.08,
-      0.06,
-      0.11
+      typeof s.apexHeight === 'number' && Number.isFinite(s.apexHeight) ? s.apexHeight : 0.058,
+      0.042,
+      0.075
     ),
     substrateType,
     finishType,
@@ -1005,6 +1057,77 @@ function sanitizePreview3DDataUrl(
   return trimmed;
 }
 
+function sanitizeTrueUvDataUrl(
+  value: unknown,
+  fingerPath: string,
+  errors: string[]
+): string | undefined {
+  if (value === undefined || value === null || value === '') {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    errors.push(`${fingerPath}.trueUvDataUrl deve ser uma string data:image/* válida.`);
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (
+    !trimmed.startsWith('data:image/') &&
+    !trimmed.startsWith('http://') &&
+    !trimmed.startsWith('https://') &&
+    !trimmed.startsWith('/')
+  ) {
+    errors.push(`${fingerPath}.trueUvDataUrl deve começar com data:image/ ou URL válida.`);
+    return undefined;
+  }
+  if (trimmed.length > 750000) {
+    errors.push(`${fingerPath}.trueUvDataUrl excede tamanho máximo permitido.`);
+    return undefined;
+  }
+  return trimmed;
+}
+
+function sanitizeUvExtractionTarget(
+  value: unknown,
+  fingerPath: string,
+  errors: string[]
+): NailUvPinTarget | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    errors.push(`${fingerPath}.uvExtractionTarget deve ser um objeto válido.`);
+    return undefined;
+  }
+  const obj = value as Record<string, unknown>;
+  if (
+    typeof obj.cxNorm !== 'number' ||
+    !Number.isFinite(obj.cxNorm) ||
+    typeof obj.cyNorm !== 'number' ||
+    !Number.isFinite(obj.cyNorm) ||
+    typeof obj.widthNorm !== 'number' ||
+    !Number.isFinite(obj.widthNorm) ||
+    typeof obj.heightNorm !== 'number' ||
+    !Number.isFinite(obj.heightNorm) ||
+    typeof obj.angleRad !== 'number' ||
+    !Number.isFinite(obj.angleRad)
+  ) {
+    errors.push(
+      `${fingerPath}.uvExtractionTarget deve conter cxNorm, cyNorm, widthNorm, heightNorm e angleRad numéricos finitos.`
+    );
+    return undefined;
+  }
+
+  return {
+    cxNorm: clampNumber(obj.cxNorm, 0, 1),
+    cyNorm: clampNumber(obj.cyNorm, 0, 1),
+    widthNorm: clampNumber(obj.widthNorm, 0.01, 1),
+    heightNorm: clampNumber(obj.heightNorm, 0.01, 1),
+    angleRad: clampNumber(obj.angleRad, -Math.PI * 2, Math.PI * 2),
+    detectedFromPhoto:
+      typeof obj.detectedFromPhoto === 'boolean' ? obj.detectedFromPhoto : true,
+  };
+}
+
 function validateAndSanitizeFingerMapRecord(
   record: Record<string, unknown>,
   pathPrefix: string,
@@ -1066,6 +1189,17 @@ function validateAndSanitizeFingerMapRecord(
     }
 
     if (
+      specObj.renderStrategy !== undefined &&
+      (typeof specObj.renderStrategy !== 'string' ||
+        !(VALID_V13_RENDER_STRATEGIES as readonly string[]).includes(specObj.renderStrategy))
+    ) {
+      errors.push(
+        `${pathPrefix}.${key}.renderStrategy inválido. Valores aceitos: ${VALID_V13_RENDER_STRATEGIES.join(', ')}.`
+      );
+      continue;
+    }
+
+    if (
       specObj.fidelityScore !== undefined &&
       !isFiniteNumberInRange(specObj.fidelityScore, 0, 100)
     ) {
@@ -1088,6 +1222,16 @@ function validateAndSanitizeFingerMapRecord(
       `${pathPrefix}.${key}`,
       errors
     );
+    const sanitizedTrueUvDataUrl = sanitizeTrueUvDataUrl(
+      specObj.trueUvDataUrl,
+      `${pathPrefix}.${key}`,
+      errors
+    );
+    const sanitizedUvExtractionTarget = sanitizeUvExtractionTarget(
+      specObj.uvExtractionTarget,
+      `${pathPrefix}.${key}`,
+      errors
+    );
 
     // Strip legacy raster map DataURLs and transient raw inspection crops so finger_specs_json stays compact
     const {
@@ -1098,6 +1242,8 @@ function validateAndSanitizeFingerMapRecord(
       roughnessMapDataUrl: _rough,
       referenceZoomDataUrl: _refZoom,
       preview3DDataUrl: _rawPreview,
+      trueUvDataUrl: _rawTrueUv,
+      uvExtractionTarget: _rawUvTarget,
       ...cleanSpecFields
     } = specObj;
 
@@ -1106,11 +1252,21 @@ function validateAndSanitizeFingerMapRecord(
         ? Math.round(clampNumber(specObj.fidelityScore as number, 0, 100))
         : validatedManufacturingSpec?.fidelityScore;
 
+    const resolvedRenderStrategy =
+      typeof specObj.renderStrategy === 'string'
+        ? (specObj.renderStrategy as NailRenderStrategy)
+        : validatedManufacturingSpec?.renderStrategy;
+
     const sanitizedSpec: NailFingerDesignSpec = {
       ...(cleanSpecFields as unknown as NailFingerDesignSpec),
       fingerId: key as FingerId,
       ...(specObj.freeEdgeRatio !== undefined
         ? { freeEdgeRatio: clampNumber(specObj.freeEdgeRatio as number, 0.12, 1.15) }
+        : {}),
+      ...(resolvedRenderStrategy !== undefined ? { renderStrategy: resolvedRenderStrategy } : {}),
+      ...(sanitizedTrueUvDataUrl !== undefined ? { trueUvDataUrl: sanitizedTrueUvDataUrl } : {}),
+      ...(sanitizedUvExtractionTarget !== undefined
+        ? { uvExtractionTarget: sanitizedUvExtractionTarget }
         : {}),
       ...(validatedBlueprint !== undefined ? { blueprint: validatedBlueprint } : {}),
       ...(validatedManufacturingSpec !== undefined
@@ -1137,6 +1293,7 @@ function parseAndValidateFingerSpecsInput(
   value: NailFingerSpecsMap | null;
   envelopeHandSpecsBySide?: NailHandSpecsBySide | null;
   envelopeFidelityScore?: number | null;
+  envelopeV13Engine?: boolean;
 } {
   if (rawFingerSpecs === undefined && rawFingerSpecsJson === undefined) {
     return { provided: false, value: null };
@@ -1188,8 +1345,13 @@ function parseAndValidateFingerSpecsInput(
 
   const record = candidate as Record<string, unknown>;
 
-  // Support V11 envelope directly in fingerSpecsJson if sent by a client
-  if (record.__v11Envelope === true || 'fingerSpecs' in record || 'handSpecsBySide' in record) {
+  // Support V11/V13 envelope directly in fingerSpecsJson if sent by a client
+  if (
+    record.__v11Envelope === true ||
+    'fingerSpecs' in record ||
+    'handSpecsBySide' in record ||
+    'v13Engine' in record
+  ) {
     const innerFingerSpecs =
       record.fingerSpecs && typeof record.fingerSpecs === 'object' && !Array.isArray(record.fingerSpecs)
         ? validateAndSanitizeFingerMapRecord(
@@ -1209,11 +1371,15 @@ function parseAndValidateFingerSpecsInput(
         ? Math.round(clampNumber(record.fidelityScore, 0, 100))
         : undefined;
 
+    const envelopeV13Engine =
+      typeof record.v13Engine === 'boolean' ? record.v13Engine : undefined;
+
     return {
       provided: true,
       value: innerFingerSpecs,
       ...(envelopeHandSpecs !== undefined ? { envelopeHandSpecsBySide: envelopeHandSpecs } : {}),
       ...(envelopeScore !== undefined ? { envelopeFidelityScore: envelopeScore } : {}),
+      ...(envelopeV13Engine !== undefined ? { envelopeV13Engine } : {}),
     };
   }
 
@@ -1299,6 +1465,7 @@ export function toNailDesignDTO(entity: NailDesign): NailDesignDTO {
     ...(entity.fidelityScore !== undefined && entity.fidelityScore !== null
       ? { fidelityScore: entity.fidelityScore }
       : {}),
+    ...(entity.v13Engine !== undefined ? { v13Engine: entity.v13Engine } : {}),
     fingerSpecs: cleanFingerSpecs,
     ...(entity.handSpecsBySide ? { handSpecsBySide: entity.handSpecsBySide } : {}),
     createdAt: entity.createdAt,
@@ -1484,6 +1651,15 @@ export function validateCreateNailDesignDTO(
     }
   }
 
+  let v13Engine: boolean | undefined;
+  if (input.v13Engine !== undefined && input.v13Engine !== null) {
+    if (typeof input.v13Engine !== 'boolean') {
+      errors.push('v13Engine deve ser boolean.');
+    } else {
+      v13Engine = input.v13Engine;
+    }
+  }
+
   const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
     input.fingerSpecs,
     input.fingerSpecsJson,
@@ -1506,10 +1682,14 @@ export function validateCreateNailDesignDTO(
   const resolvedFidelityScore =
     fidelityScore ?? parsedFingerSpecs.envelopeFidelityScore ?? null;
 
+  const resolvedV13Engine =
+    v13Engine ?? parsedFingerSpecs.envelopeV13Engine;
+
   const resolvedFingerSpecs = attachV11SerializationEnvelope(
     parsedFingerSpecs.provided ? parsedFingerSpecs.value : null,
     resolvedHandSpecsBySide,
-    resolvedFidelityScore
+    resolvedFidelityScore,
+    resolvedV13Engine
   );
 
   const resolvedIsCustom =
@@ -1541,6 +1721,7 @@ export function validateCreateNailDesignDTO(
     detectedShape,
     detectedLength,
     ...(resolvedFidelityScore !== null ? { fidelityScore: resolvedFidelityScore } : {}),
+    ...(resolvedV13Engine !== undefined ? { v13Engine: resolvedV13Engine } : {}),
     fingerSpecs: resolvedFingerSpecs,
     ...(resolvedHandSpecsBySide ? { handSpecsBySide: resolvedHandSpecsBySide } : {}),
   };
@@ -1731,6 +1912,14 @@ export function validateUpdateNailDesignDTO(
     }
   }
 
+  if (input.v13Engine !== undefined && input.v13Engine !== null) {
+    if (typeof input.v13Engine !== 'boolean') {
+      errors.push('v13Engine deve ser boolean.');
+    } else {
+      sanitized.v13Engine = input.v13Engine;
+    }
+  }
+
   const parsedFingerSpecs = parseAndValidateFingerSpecsInput(
     input.fingerSpecs,
     input.fingerSpecsJson,
@@ -1751,12 +1940,22 @@ export function validateUpdateNailDesignDTO(
       ? sanitized.fidelityScore
       : parsedFingerSpecs.envelopeFidelityScore;
 
-  if (parsedFingerSpecs.provided || parsedHandSpecsBySide.provided) {
+  const resolvedV13Engine =
+    sanitized.v13Engine !== undefined
+      ? sanitized.v13Engine
+      : parsedFingerSpecs.envelopeV13Engine;
+
+  if (
+    parsedFingerSpecs.provided ||
+    parsedHandSpecsBySide.provided ||
+    resolvedV13Engine !== undefined
+  ) {
     const baseFingerSpecs = parsedFingerSpecs.provided ? parsedFingerSpecs.value : null;
     sanitized.fingerSpecs = attachV11SerializationEnvelope(
       baseFingerSpecs,
       resolvedHandSpecsBySide,
-      resolvedFidelityScore
+      resolvedFidelityScore,
+      resolvedV13Engine
     );
   }
   if (resolvedHandSpecsBySide !== undefined) {

@@ -24,10 +24,23 @@ export interface VolumetricNailGeometryOptions {
   profileHalfWidths?: readonly number[];
 }
 
+export const DEFAULT_C_CURVE_DEPTH = 0.145;
+export const DEFAULT_APEX_HEIGHT = 0.056;
+export const V13_C_CURVE_MIN = 0.11;
+export const V13_C_CURVE_MAX = 0.18;
+export const V13_APEX_HEIGHT_MIN = 0.042;
+export const V13_APEX_HEIGHT_MAX = 0.075;
+
+export const V13_NAIL_DORSAL_OFFSET_MULT = 0.84;
+export const V13_DISTAL_CYL_PALMAR_SHIFT = -0.32;
+export const V13_DISTAL_CYL_RADIUS_MULT = 0.66;
+export const V13_DIP_SPHERE_PALMAR_SHIFT = -0.28;
+export const V13_DIP_SPHERE_RADIUS_MULT = 0.72;
+export const V13_PULP_SPHERE_PALMAR_SHIFT = -0.36;
+export const V13_PULP_SPHERE_RADIUS_MULT = 0.76;
+
 const DEFAULT_BED_FRACTION = 0.58;
-const DEFAULT_C_CURVE_DEPTH = 0.22;
-const DEFAULT_APEX_HEIGHT = 0.085;
-const CUTICLE_FRACTION = 0.16;
+const CUTICLE_FRACTION = 0.18;
 const HOLLOW_START_V = 0.40;
 const MIN_TIP_FLOOR = 0.085;
 const ELLIPSE_OVAL_K = 0.985;
@@ -62,8 +75,8 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
  * Evaluates clean, strictly monotonic parametric half-width profile (`0 .. 0.5`) along
  * longitudinal parameter `v ∈ [0, 1]` (`v = 0` is proximal cuticle, `v = 1` is distal free edge):
  *
- * - `v ∈ [0, 0.16]`: smooth convex parabolic cuticle emergence hugging the eponychium.
- * - `v ∈ [0.16, bedFraction]`: strictly parallel (`0.5`) covering 100% of the client's natural nail bed.
+ * - `v ∈ [0, 0.18]`: continuous convex elliptical cuticle arc from `0.24` (`v = 0`) to `0.50` (`v = 0.18`).
+ * - `v ∈ [0.18, bedFraction]`: strictly parallel (`0.50`) covering 100% of the client's natural nail bed.
  * - `v > bedFraction`: purely analytical, convex, strictly monotonic salon equations for all 6 shapes
  *   (raw `profileHalfWidths` pixel noise is ignored completely).
  */
@@ -78,14 +91,14 @@ export function evalNailHalfWidth(
     options?.tipRoundness !== undefined ? clamp01(options.tipRoundness) : 0.5;
   const minFloor = Math.max(MIN_TIP_FLOOR, TIP_MIN_HALF_W[shape] ?? TIP_MIN_HALF_W.almond);
 
-  // 1) Proximal cuticle zone (v ∈ [0, 0.16]): smooth parabolic curve hugging the eponychium
+  // 1) Proximal cuticle zone (v ∈ [0, 0.18]): continuous convex elliptical arc (0.24 -> 0.50, C1 at v=0.18)
   if (vc < CUTICLE_FRACTION) {
-    const t = vc / CUTICLE_FRACTION;
-    const parabolic = 1 - (1 - t) * (1 - t);
-    return 0.28 + 0.22 * parabolic;
+    const t = clamp01(vc / CUTICLE_FRACTION);
+    const elliptical = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
+    return 0.24 + 0.26 * elliptical;
   }
 
-  // 2) Parallel nail bed sidewalls (v ∈ [0.16, bedFraction]): 100% parallel (halfW = 0.5)
+  // 2) Parallel nail bed sidewalls (v ∈ [0.18, bedFraction]): 100% parallel (halfW = 0.5)
   if (vc <= bedFraction) {
     return 0.5;
   }
@@ -161,7 +174,8 @@ function evalGelApexZ(
 ): number {
   const apexPeak = 0.44;
   const apexHeight =
-    clamp(baseApexHeight, 0.06, 0.11) * Math.min(1.30, Math.max(0.85, lengthRatio));
+    clamp(baseApexHeight, V13_APEX_HEIGHT_MIN, V13_APEX_HEIGHT_MAX) *
+    Math.min(1.30, Math.max(0.85, lengthRatio));
 
   if (v <= apexPeak) {
     const t = clamp01(v / apexPeak);
@@ -174,20 +188,19 @@ function evalGelApexZ(
 }
 
 /**
- * Evaluates sculpted gel thickness (between dorsal and ventral shells).
- * Tapers smoothly down to 0.012 at proximal cuticle border (v = 0)
- * for an invisible transition with the eponychium skin.
+ * Evaluates thin sculpted salon gel thickness (between dorsal and ventral shells).
+ * Smooth C1 transition: `0.008` at proximal cuticle (`v = 0`) -> `0.026` at apex (`v = 0.44`)
+ * -> `0.020` at distal free edge (`v = 1.0`).
  */
-function evalShellThickness(v: number): number {
-  if (v < CUTICLE_FRACTION) {
-    const t = smoothstep(0, CUTICLE_FRACTION, v);
-    return 0.012 + 0.036 * t;
+export function evalShellThickness(v: number): number {
+  const vc = clamp01(v);
+  const apexV = 0.44;
+  if (vc <= apexV) {
+    const s = smoothstep(0, apexV, vc);
+    return 0.008 + (0.026 - 0.008) * s;
   }
-  if (v <= 0.46) {
-    return 0.048;
-  }
-  const t = clamp01((v - 0.46) / 0.54);
-  return 0.048 - 0.013 * t;
+  const s = smoothstep(apexV, 1.0, vc);
+  return 0.026 - (0.026 - 0.020) * s;
 }
 
 // Reusable scratch objects for zero-allocation surface queries when `out` is provided
@@ -240,8 +253,16 @@ export function evaluateNailSurfacePointAndNormal(
   const bedFraction = clamp(options?.bedFraction ?? DEFAULT_BED_FRACTION, 0.38, 0.92);
   const tipRoundness =
     options?.tipRoundness !== undefined ? clamp01(options.tipRoundness) : 0.5;
-  const cCurveDepth = clamp(options?.cCurveDepth ?? DEFAULT_C_CURVE_DEPTH, 0.16, 0.28);
-  const apexHeight = clamp(options?.apexHeight ?? DEFAULT_APEX_HEIGHT, 0.06, 0.11);
+  const cCurveDepth = clamp(
+    options?.cCurveDepth ?? DEFAULT_C_CURVE_DEPTH,
+    V13_C_CURVE_MIN,
+    V13_C_CURVE_MAX
+  );
+  const apexHeight = clamp(
+    options?.apexHeight ?? DEFAULT_APEX_HEIGHT,
+    V13_APEX_HEIGHT_MIN,
+    V13_APEX_HEIGHT_MAX
+  );
 
   const uc = clamp01(u);
   const vc = clamp01(v);
@@ -332,7 +353,7 @@ export function evaluateNailSurfacePointAndNormal(
  * Returns a closed multi-material `THREE.BufferGeometry` with 2 clean geometry groups:
  * - **Group 0** (`materialIndex: 0`): Dorsal sculpted gel shell + smooth lateral, proximal & free-edge rims.
  * - **Group 1** (`materialIndex: 1`): Concave hollowed ventral cavity (`v >= 0.40`) showcasing the transverse
- *   C-curve tunnel (`cCurveDepth ∈ [0.16, 0.28]`) with dedicated UVs `u ∈ [0, 1], v ∈ [0, 1]`.
+ *   C-curve tunnel (`cCurveDepth ∈ [0.11, 0.18]`) with dedicated UVs `u ∈ [0, 1], v ∈ [0, 1]`.
  *
  * Local coordinate convention:
  * - Origin `(0, 0, 0)` is anchored strictly on the proximal cuticle midline (`u = 0.5, v = 0, z = 0`)
@@ -348,8 +369,16 @@ export function createVolumetricNailGeometry(
     typeof options === 'number' ? undefined : options;
   const lengthRatio = typeof options === 'number' ? options : 1.0;
 
-  const cCurveDepth = clamp(resolvedOptions?.cCurveDepth ?? DEFAULT_C_CURVE_DEPTH, 0.16, 0.28);
-  const apexHeight = clamp(resolvedOptions?.apexHeight ?? DEFAULT_APEX_HEIGHT, 0.06, 0.11);
+  const cCurveDepth = clamp(
+    resolvedOptions?.cCurveDepth ?? DEFAULT_C_CURVE_DEPTH,
+    V13_C_CURVE_MIN,
+    V13_C_CURVE_MAX
+  );
+  const apexHeight = clamp(
+    resolvedOptions?.apexHeight ?? DEFAULT_APEX_HEIGHT,
+    V13_APEX_HEIGHT_MIN,
+    V13_APEX_HEIGHT_MAX
+  );
 
   const cols = COLS;
   const rows = ROWS;
@@ -391,7 +420,7 @@ export function createVolumetricNailGeometry(
       const lateralTaper =
         edgeMin + (1 - edgeMin) * Math.pow(Math.max(0, Math.sin(Math.PI * uParam)), 0.55);
 
-      const centerConcavity = (1 - s * s) * 0.018 * hollowProgress;
+      const centerConcavity = (1 - s * s) * 0.007 * hollowProgress;
       const zBot = zTop - thickness * lateralTaper + centerConcavity;
 
       const uTop = clamp01(0.5 + x * 0.96);
@@ -514,8 +543,8 @@ export function createCuticleContactSkirtGeometry(
 
   const vStart = -0.04;
   const vEnd = clamp(bedFraction, 0.38, 0.92);
-  const clampedCCurve = clamp(cCurveDepth, 0.16, 0.28);
-  const clampedApex = clamp(apexHeight, 0.06, 0.11);
+  const clampedCCurve = clamp(cCurveDepth, V13_C_CURVE_MIN, V13_C_CURVE_MAX);
+  const clampedApex = clamp(apexHeight, V13_APEX_HEIGHT_MIN, V13_APEX_HEIGHT_MAX);
 
   const positions: number[] = [];
   const uvs: number[] = [];

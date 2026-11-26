@@ -1,4 +1,5 @@
 import { detectHandsOnImageWithSingleton } from './handTrackingWorker';
+import { evalNailHalfWidth } from './nail3DGeometry';
 import type {
   ArtisticPattern,
   FingerId,
@@ -2681,41 +2682,28 @@ export function createPinTargetFromLandmarks(
 }
 
 /**
- * V12 `TrueUVExtractor`: Direct high-resolution bilinear inverse warping (`512×512`)
- * strictly from the safe 88% inner nail plate (`u ∈ [0.06, 0.94]`, `v ∈ [0.06, 0.94]`)
- * with ultra-gentle linear shadow ramp leveling (`[0.92, 1.08]`) preserving 100% of
- * chrome mirror reflections, 3D metal studs, gems, gradients, and deep wine/black pigments.
- * Uses `HTMLCanvasElement` for full iOS Safari + Android Chrome WebGL2 compatibility.
+ * V13 Pure Node-Testable Silhouette-Conformed `TrueUVExtractor`:
+ * - Contracts longitudinal & lateral coordinates strictly inside the anatomical silhouette (`evalNailHalfWidth`)
+ *   so almond/stiletto tips NEVER sample background, green shirt, or finger skin at tip corners.
+ * - Performs UV perimeter edge-bleed (`u ∈ [0.03, 0.97]`, `v ∈ [0.03, 0.97]`) so WebGL2 mipmapping
+ *   never leaks border seams.
+ * - Performs lightweight CPU specular glare delighting (`luma > 0.92 && saturation < 0.08`, unless > 45% of plate is white)
+ *   blending gently with local non-specular neighbors so HDRI + clearcoat generate real reflections.
+ * - Retains ultra-gentle linear shadow ramp leveling (`[0.92, 1.08]`).
  */
-export function extractTrueUVNailTexture(
-  img: HTMLImageElement | HTMLCanvasElement,
+export function extractTrueUVPixelsFromBuffer(
+  srcPixels: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
   target: NailUvPinTarget,
-  outSize = 512
-): string {
-  if (typeof document === 'undefined') return '';
-
-  const srcW =
-    img instanceof HTMLImageElement ? img.naturalWidth || img.width : img.width;
-  const srcH =
-    img instanceof HTMLImageElement ? img.naturalHeight || img.height : img.height;
-  if (srcW < 8 || srcH < 8) return '';
-
-  // Read full-res source pixels once onto an HTMLCanvasElement (iOS Safari safe)
-  const srcCanvas = document.createElement('canvas');
-  srcCanvas.width = srcW;
-  srcCanvas.height = srcH;
-  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
-  if (!srcCtx) return '';
-  srcCtx.drawImage(img, 0, 0, srcW, srcH);
-  const srcPixels = srcCtx.getImageData(0, 0, srcW, srcH).data;
-
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = outSize;
-  outCanvas.height = outSize;
-  const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
-  if (!outCtx) return '';
-  const outImg = outCtx.createImageData(outSize, outSize);
-  const dst = outImg.data;
+  outSize = 512,
+  shape: NailShape = 'almond'
+): Uint8ClampedArray {
+  const safeOutSize = Math.max(8, Math.round(outSize));
+  const dst = new Uint8ClampedArray(safeOutSize * safeOutSize * 4);
+  if (srcW < 8 || srcH < 8 || srcPixels.length < srcW * srcH * 4) {
+    return dst;
+  }
 
   // Longitudinal axis along DIP -> TIP and perpendicular lateral axis
   const axisYx = Math.cos(target.angleRad);
@@ -2728,31 +2716,41 @@ export function extractTrueUVNailTexture(
   const fullW = Math.max(8, target.widthNorm * srcW);
   const fullH = Math.max(8, target.heightNorm * srcH);
 
-  // Strictly contract to 88% inner safe polygon (u ∈ [0.06, 0.94], v ∈ [0.06, 0.94])
-  // excluding 100% of lateral skin, cuticle skin, rings, and background!
+  // Strictly contract longitudinally to safe inner plate (`v ∈ [0.06, 0.94]`)
   const safeMin = 0.06;
   const safeSpan = 0.88;
 
   const maxX = srcW - 1;
   const maxY = srcH - 1;
 
-  // Pass 1: Direct bilinear inverse unwarping into outSize x outSize
-  // Three.js UV convention: y = outSize - 1 -> v = 0 (cuticle), y = 0 -> v = 1 (tip)
+  // Pass 1: Silhouette-conformed bilinear inverse unwarping into safeOutSize × safeOutSize
+  // Three.js UV convention: py = safeOutSize - 1 -> v = 0 (cuticle), py = 0 -> v = 1 (tip)
   let sumTop = 0;
   let sumBot = 0;
   let sumLeft = 0;
   let sumRight = 0;
   let cntHalf = 0;
 
-  for (let py = 0; py < outSize; py++) {
-    const vNorm = 1 - py / Math.max(1, outSize - 1);
+  let whiteSampleCount = 0;
+  let totalStridedSamples = 0;
+
+  const edgeBleedMin = 0.03;
+  const edgeBleedMax = 0.97;
+  const lastIdx = safeOutSize - 1;
+
+  for (let py = 0; py < safeOutSize; py++) {
+    const rawVNorm = 1 - py / Math.max(1, lastIdx);
+    const vNorm = clamp(rawVNorm, edgeBleedMin, edgeBleedMax);
     const vSafe = safeMin + vNorm * safeSpan;
     const localY = (vSafe - 0.5) * fullH;
+    const shapeHalfW = evalNailHalfWidth(vNorm, shape, { bedFraction: 0.58 });
+    const rowWidthScale = fullW * (shapeHalfW * 2.0) * 0.90;
 
-    for (let px = 0; px < outSize; px++) {
-      const uNorm = px / Math.max(1, outSize - 1);
+    for (let px = 0; px < safeOutSize; px++) {
+      const rawUNorm = px / Math.max(1, lastIdx);
+      const uNorm = clamp(rawUNorm, edgeBleedMin, edgeBleedMax);
       const uSafe = safeMin + uNorm * safeSpan;
-      const localX = (uSafe - 0.5) * fullW;
+      const localX = (uSafe - 0.5) * rowWidthScale;
 
       const sx = clamp(cx + axisXx * localX + axisYx * localY, 0, maxX);
       const sy = clamp(cy + axisXy * localX + axisYy * localY, 0, maxY);
@@ -2778,25 +2776,120 @@ export function extractTrueUVNailTexture(
       const g = srcPixels[i00 + 1] * w00 + srcPixels[i10 + 1] * w10 + srcPixels[i01 + 1] * w01 + srcPixels[i11 + 1] * w11;
       const b = srcPixels[i00 + 2] * w00 + srcPixels[i10 + 2] * w10 + srcPixels[i01 + 2] * w01 + srcPixels[i11 + 2] * w11;
 
-      const di = (py * outSize + px) * 4;
+      const di = (py * safeOutSize + px) * 4;
       dst[di] = r;
       dst[di + 1] = g;
       dst[di + 2] = b;
       dst[di + 3] = 255;
 
-      // Accumulate linear ramp stats (strided by 4x4 for speed)
+      // Accumulate linear ramp & white-plate coverage stats (strided by 4×4 for speed)
       if ((px & 3) === 0 && (py & 3) === 0) {
-        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (vNorm >= 0.5) sumTop += luma;
-        else sumBot += luma;
-        if (uNorm < 0.5) sumLeft += luma;
-        else sumRight += luma;
+        const lumaNorm = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        const luma255 = lumaNorm * 255;
+        const maxC = r > g ? (r > b ? r : b) : g > b ? g : b;
+        const minC = r < g ? (r < b ? r : b) : g < b ? g : b;
+        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+
+        totalStridedSamples++;
+        if (lumaNorm > 0.85 && sat < 0.14) {
+          whiteSampleCount++;
+        }
+
+        if (vNorm >= 0.5) sumTop += luma255;
+        else sumBot += luma255;
+        if (uNorm < 0.5) sumLeft += luma255;
+        else sumRight += luma255;
         cntHalf++;
       }
     }
   }
 
-  // Pass 2: Ultra-gentle linear shadow ramp leveling clamped strictly to [0.92, 1.08]
+  // Pass 2: Explicit UV perimeter edge-bleed from inner safe rim so WebGL2 mipmaps never bleed dark/skin borders
+  const bleedMarginPx = Math.max(2, Math.round(safeOutSize * edgeBleedMin));
+  const minInterior = Math.min(safeOutSize - 1, bleedMarginPx);
+  const maxInterior = Math.max(0, safeOutSize - 1 - bleedMarginPx);
+  if (maxInterior > minInterior) {
+    for (let py = 0; py < safeOutSize; py++) {
+      const sy = py < minInterior ? minInterior : py > maxInterior ? maxInterior : py;
+      for (let px = 0; px < safeOutSize; px++) {
+        const sx = px < minInterior ? minInterior : px > maxInterior ? maxInterior : px;
+        if (sx === px && sy === py) continue;
+        const si = (sy * safeOutSize + sx) * 4;
+        const di = (py * safeOutSize + px) * 4;
+        dst[di] = dst[si];
+        dst[di + 1] = dst[si + 1];
+        dst[di + 2] = dst[si + 2];
+        dst[di + 3] = 255;
+      }
+    }
+  }
+
+  // Pass 3: Lightweight CPU Specular Glare Delighting
+  // Attenuate burnt achromatic specular highlights (luma > 0.92 && saturation < 0.08)
+  // unless > 45% of the plate is intentionally white (e.g. milky white / French manicure).
+  const whiteFraction = whiteSampleCount / Math.max(1, totalStridedSamples);
+  if (whiteFraction <= 0.45) {
+    const srcCopy = new Uint8ClampedArray(dst);
+    const radius = Math.max(4, Math.round(safeOutSize * 0.032));
+    const step = Math.max(2, Math.round(radius * 0.5));
+
+    for (let py = 0; py < safeOutSize; py++) {
+      for (let px = 0; px < safeOutSize; px++) {
+        const di = (py * safeOutSize + px) * 4;
+        const r = srcCopy[di];
+        const g = srcCopy[di + 1];
+        const b = srcCopy[di + 2];
+        const lumaNorm = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        const maxC = r > g ? (r > b ? r : b) : g > b ? g : b;
+        const minC = r < g ? (r < b ? r : b) : g < b ? g : b;
+        const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
+
+        if (lumaNorm > 0.92 && sat < 0.08) {
+          let sumR = 0;
+          let sumG = 0;
+          let sumB = 0;
+          let nCnt = 0;
+
+          const yMin = Math.max(0, py - radius);
+          const yMax = Math.min(lastIdx, py + radius);
+          const xMin = Math.max(0, px - radius);
+          const xMax = Math.min(lastIdx, px + radius);
+
+          for (let ny = yMin; ny <= yMax; ny += step) {
+            const rowOff = ny * safeOutSize;
+            for (let nx = xMin; nx <= xMax; nx += step) {
+              const ni = (rowOff + nx) * 4;
+              const nr = srcCopy[ni];
+              const ng = srcCopy[ni + 1];
+              const nb = srcCopy[ni + 2];
+              const nLuma = (0.299 * nr + 0.587 * ng + 0.114 * nb) / 255;
+              const nMax = nr > ng ? (nr > nb ? nr : nb) : ng > nb ? ng : nb;
+              const nMin = nr < ng ? (nr < nb ? nr : nb) : ng < nb ? ng : nb;
+              const nSat = nMax > 0 ? (nMax - nMin) / nMax : 0;
+              if (!(nLuma > 0.92 && nSat < 0.08)) {
+                sumR += nr;
+                sumG += ng;
+                sumB += nb;
+                nCnt++;
+              }
+            }
+          }
+
+          if (nCnt > 0) {
+            const avgR = sumR / nCnt;
+            const avgG = sumG / nCnt;
+            const avgB = sumB / nCnt;
+            const blend = clamp01(((lumaNorm - 0.90) / 0.10) * 0.78);
+            dst[di] = Math.round(r * (1 - blend) + avgR * blend);
+            dst[di + 1] = Math.round(g * (1 - blend) + avgG * blend);
+            dst[di + 2] = Math.round(b * (1 - blend) + avgB * blend);
+          }
+        }
+      }
+    }
+  }
+
+  // Pass 4: Ultra-gentle linear shadow ramp leveling clamped strictly to [0.92, 1.08]
   // NEVER touches chrome speculars, 3D beads, or deep wine/black pigments!
   const halfSamples = Math.max(1, cntHalf * 0.5);
   const avgTop = sumTop / halfSamples;
@@ -2809,12 +2902,12 @@ export function extractTrueUVNailTexture(
   const slopeU = clamp((avgLeft - avgRight) / avgAll, -0.14, 0.14) * 0.35;
 
   if (Math.abs(slopeV) > 0.005 || Math.abs(slopeU) > 0.005) {
-    for (let py = 0; py < outSize; py++) {
-      const dv = 0.5 - py / Math.max(1, outSize - 1); // +0.5 tip, -0.5 cuticle
-      for (let px = 0; px < outSize; px++) {
-        const du = px / Math.max(1, outSize - 1) - 0.5;
+    for (let py = 0; py < safeOutSize; py++) {
+      const dv = 0.5 - py / Math.max(1, lastIdx); // +0.5 tip, -0.5 cuticle
+      for (let px = 0; px < safeOutSize; px++) {
+        const du = px / Math.max(1, lastIdx) - 0.5;
         const gain = clamp(1 + slopeV * dv + slopeU * du, 0.92, 1.08);
-        const di = (py * outSize + px) * 4;
+        const di = (py * safeOutSize + px) * 4;
         dst[di] = Math.min(255, Math.round(dst[di] * gain));
         dst[di + 1] = Math.min(255, Math.round(dst[di + 1] * gain));
         dst[di + 2] = Math.min(255, Math.round(dst[di + 2] * gain));
@@ -2822,6 +2915,47 @@ export function extractTrueUVNailTexture(
     }
   }
 
+  return dst;
+}
+
+/**
+ * V13 Silhouette-Conformed `TrueUVExtractor`: Direct high-resolution bilinear inverse warping (`512×512`)
+ * conformed to the parametric nail silhouette (`evalNailHalfWidth(vNorm, shape)`), with UV edge-bleed,
+ * lightweight specular glare delighting, and gentle linear shadow ramp leveling (`[0.92, 1.08]`).
+ * Uses `HTMLCanvasElement` for full iOS Safari + Android Chrome WebGL2 compatibility.
+ */
+export function extractTrueUVNailTexture(
+  img: HTMLImageElement | HTMLCanvasElement,
+  target: NailUvPinTarget,
+  outSize = 512,
+  shape: NailShape = 'almond'
+): string {
+  if (typeof document === 'undefined') return '';
+
+  const srcW =
+    img instanceof HTMLImageElement ? img.naturalWidth || img.width : img.width;
+  const srcH =
+    img instanceof HTMLImageElement ? img.naturalHeight || img.height : img.height;
+  if (srcW < 8 || srcH < 8) return '';
+
+  // Read full-res source pixels once onto an HTMLCanvasElement (iOS Safari safe)
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = srcW;
+  srcCanvas.height = srcH;
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  if (!srcCtx) return '';
+  srcCtx.drawImage(img, 0, 0, srcW, srcH);
+  const srcPixels = srcCtx.getImageData(0, 0, srcW, srcH).data;
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outSize;
+  outCanvas.height = outSize;
+  const outCtx = outCanvas.getContext('2d', { willReadFrequently: true });
+  if (!outCtx) return '';
+
+  const dst = extractTrueUVPixelsFromBuffer(srcPixels, srcW, srcH, target, outSize, shape);
+  const outImg = outCtx.createImageData(outSize, outSize);
+  outImg.data.set(dst);
   outCtx.putImageData(outImg, 0, 0);
 
   // Encode WebP 0.92 with automatic PNG fallback (e.g. older iOS Safari)
@@ -2851,7 +2985,7 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
     const spec = analyzeSingleNailROI(img, t.fingerId, pip, dip, tip, true).spec;
     const pinTarget = createPinTargetFromLandmarks(dip, tip, w, h, t.fingerId, true);
     spec.uvExtractionTarget = pinTarget;
-    spec.trueUvDataUrl = extractTrueUVNailTexture(img, pinTarget, 512);
+    spec.trueUvDataUrl = extractTrueUVNailTexture(img, pinTarget, 512, spec.shape);
     partial[t.fingerId] = spec;
   }
 
@@ -2874,10 +3008,10 @@ function analyzeMacroZonesFallback(img: HTMLImageElement): PerFingerAnalysisResu
 }
 
 /**
- * V12 100% Client-Side Photorealistic True UV Texture Transfer (`< 300ms` total, R$ 0,00):
+ * V12/V13 100% Client-Side Photorealistic True UV Texture Transfer (`< 300ms` total, R$ 0,00):
  * - Uses shared MediaPipe `HandLandmarker` singleton (`detectHandsOnImageWithSingleton(img, 2)`).
  * - Picks the highest-quality specimen for each finger across up to 2 hands.
- * - Extracts direct `512×512` bilinear True UV textures from the safe 88% inner nail plate
+ * - Extracts direct `512×512` silhouette-conformed bilinear True UV textures
  *   (`extractTrueUVNailTexture`) + interactive `NailUvPinTarget` for the 4× UV Pincher Loupe.
  */
 export async function analyzeReferencePhotoPerFinger(
@@ -2936,7 +3070,7 @@ export async function analyzeReferencePhotoPerFinger(
       if (chosen) {
         const spec = chosen.spec;
         spec.uvExtractionTarget = chosen.pinTarget;
-        spec.trueUvDataUrl = extractTrueUVNailTexture(img, chosen.pinTarget, 512);
+        spec.trueUvDataUrl = extractTrueUVNailTexture(img, chosen.pinTarget, 512, spec.shape);
         partial[id] = spec;
         detectedFingerIds.push(id);
       }

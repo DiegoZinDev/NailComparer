@@ -151,14 +151,32 @@ export type Nail3DBorderType =
   | 'micro_french'
   | 'deep_v_french';
 
+export type NailRenderStrategy =
+  | 'procedural_pbr_3d'
+  | 'canonical_uv_delighted'
+  | 'hybrid_uv_plus_pbr_3d';
+
+export interface NailUvPinTarget {
+  cxNorm: number;
+  cyNorm: number;
+  widthNorm: number;
+  heightNorm: number;
+  angleRad: number;
+  detectedFromPhoto: boolean;
+}
+
 export interface Nail3DManufacturingSpec {
   fingerId: FingerId;
   handSide?: HandSide;
+  /** V13 OmniFabric-Nail Dual-Path Strategy */
+  renderStrategy?: NailRenderStrategy;
+  /** Optional VLM-guided bounding box [xMin, yMin, xMax, yMax] inside finger zoom crop */
+  nailBoundingBox?: [number, number, number, number];
   shape: NailShape;
   freeEdgeRatio: number;
   tipRoundness: number;
-  cCurveDepth: number;
-  apexHeight: number;
+  cCurveDepth: number; // 0.11..0.18 (V13 thin salon gel shell)
+  apexHeight: number; // 0.042..0.075 (V13 refined gel apex)
   substrateType: Nail3DSubstrateType;
   finishType: Nail3DFinishType;
   trueBaseColorHex: string;
@@ -296,6 +314,10 @@ export interface NailFingerDesignSpec {
   strokeAnchors: StrokeAnchor[];
   metallicIntensity: number;
   glossIntensity: number;
+  // V12/V13 Photorealistic True UV Texture Transfer + Dual-Path Routing
+  renderStrategy?: NailRenderStrategy;
+  trueUvDataUrl?: string;
+  uvExtractionTarget?: NailUvPinTarget;
   // V11 Primary 3D Manufacturing Spec + Real 3D Offscreen Render Preview
   manufacturingSpec?: Nail3DManufacturingSpec;
   preview3DDataUrl?: string;
@@ -329,6 +351,7 @@ export interface NailFingerSpecsEnvelopeV11 {
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
   fidelityScore?: number | null;
+  v13Engine?: boolean;
 }
 
 export interface NailDesignRow {
@@ -372,6 +395,7 @@ export interface NailDesign {
   detectedShape: NailShape | null;
   detectedLength: number | null;
   fidelityScore?: number | null;
+  v13Engine?: boolean;
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide?: NailHandSpecsBySide | null;
   createdAt: string;
@@ -411,18 +435,38 @@ function computeFidelityScoreFromSpecs(
   return Math.round(Math.max(0, Math.min(100, avg)));
 }
 
+function hasV13IndicatorsInMap(map: NailFingerSpecsMap | null | undefined): boolean {
+  if (!map) return false;
+  for (const key of Object.keys(map) as FingerId[]) {
+    const spec = map[key];
+    if (!spec) continue;
+    if (
+      spec.renderStrategy !== undefined ||
+      spec.trueUvDataUrl !== undefined ||
+      spec.uvExtractionTarget !== undefined ||
+      spec.manufacturingSpec?.renderStrategy !== undefined ||
+      spec.manufacturingSpec?.nailBoundingBox !== undefined
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function attachV11SerializationEnvelope(
   fingerSpecs: NailFingerSpecsMap | null,
   handSpecsBySide?: NailHandSpecsBySide | null,
-  fidelityScore?: number | null
+  fidelityScore?: number | null,
+  v13Engine?: boolean
 ): NailFingerSpecsMap | null {
   const hasSideData = Boolean(
     handSpecsBySide && (handSpecsBySide.Left || handSpecsBySide.Right)
   );
   const hasFidelity =
     typeof fidelityScore === 'number' && Number.isFinite(fidelityScore);
+  const hasV13Flag = typeof v13Engine === 'boolean';
 
-  if (!hasSideData && !hasFidelity) {
+  if (!hasSideData && !hasFidelity && !hasV13Flag) {
     return fingerSpecs;
   }
 
@@ -433,6 +477,7 @@ export function attachV11SerializationEnvelope(
       fingerSpecs: plainSnapshot,
       ...(hasSideData ? { handSpecsBySide } : {}),
       ...(hasFidelity ? { fidelityScore } : {}),
+      ...(hasV13Flag ? { v13Engine } : {}),
     };
     Object.defineProperty(fingerSpecs, 'toJSON', {
       value: () => envelope,
@@ -452,6 +497,7 @@ export function attachV11SerializationEnvelope(
       fingerSpecs: plainSnapshot,
       ...(hasSideData ? { handSpecsBySide } : {}),
       ...(hasFidelity ? { fidelityScore } : {}),
+      ...(hasV13Flag ? { v13Engine } : {}),
     };
     Object.defineProperty(wrapperSpecs, 'toJSON', {
       value: () => envelope,
@@ -462,6 +508,23 @@ export function attachV11SerializationEnvelope(
     return wrapperSpecs;
   }
 
+  if (hasV13Flag || hasFidelity) {
+    const emptyWrapper = {} as NailFingerSpecsMap;
+    const envelope: NailFingerSpecsEnvelopeV11 = {
+      __v11Envelope: true,
+      fingerSpecs: null,
+      ...(hasFidelity ? { fidelityScore } : {}),
+      ...(hasV13Flag ? { v13Engine } : {}),
+    };
+    Object.defineProperty(emptyWrapper, 'toJSON', {
+      value: () => envelope,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+    return emptyWrapper;
+  }
+
   return null;
 }
 
@@ -469,6 +532,7 @@ interface ParsedFingerSpecsBlob {
   fingerSpecs: NailFingerSpecsMap | null;
   handSpecsBySide: NailHandSpecsBySide | null;
   fidelityScore: number | null;
+  v13Engine?: boolean;
 }
 
 function parseFingerSpecsJson(rawJson: string | null): ParsedFingerSpecsBlob {
@@ -487,8 +551,13 @@ function parseFingerSpecsJson(rawJson: string | null): ParsedFingerSpecsBlob {
 
     const record = parsed as Record<string, unknown>;
 
-    // V11 Envelope format
-    if (record.__v11Envelope === true || 'fingerSpecs' in record || 'handSpecsBySide' in record) {
+    // V11/V13 Envelope format
+    if (
+      record.__v11Envelope === true ||
+      'fingerSpecs' in record ||
+      'handSpecsBySide' in record ||
+      'v13Engine' in record
+    ) {
       const innerSpecs =
         record.fingerSpecs &&
         typeof record.fingerSpecs === 'object' &&
@@ -522,10 +591,20 @@ function parseFingerSpecsJson(rawJson: string | null): ParsedFingerSpecsBlob {
       const resolvedFingerSpecs =
         innerSpecs ?? handSpecsBySide?.Right ?? handSpecsBySide?.Left ?? null;
 
+      const v13Engine =
+        typeof record.v13Engine === 'boolean'
+          ? record.v13Engine
+          : hasV13IndicatorsInMap(resolvedFingerSpecs) ||
+              hasV13IndicatorsInMap(handSpecsBySide?.Left) ||
+              hasV13IndicatorsInMap(handSpecsBySide?.Right)
+            ? true
+            : undefined;
+
       return {
         fingerSpecs: resolvedFingerSpecs,
         handSpecsBySide,
         fidelityScore: derivedScore,
+        ...(v13Engine !== undefined ? { v13Engine } : {}),
       };
     }
 
@@ -540,11 +619,13 @@ function parseFingerSpecsJson(rawJson: string | null): ParsedFingerSpecsBlob {
     const fingerSpecs =
       Object.keys(cleanSpecs).length > 0 ? (cleanSpecs as NailFingerSpecsMap) : null;
     const derivedScore = computeFidelityScoreFromSpecs(fingerSpecs, null);
+    const v13Engine = hasV13IndicatorsInMap(fingerSpecs) ? true : undefined;
 
     return {
       fingerSpecs,
       handSpecsBySide: null,
       fidelityScore: derivedScore,
+      ...(v13Engine !== undefined ? { v13Engine } : {}),
     };
   } catch {
     return { fingerSpecs: null, handSpecsBySide: null, fidelityScore: null };
@@ -590,6 +671,7 @@ export function mapNailDesignRowToEntity(row: NailDesignRow): NailDesign {
     detectedShape,
     detectedLength,
     ...(parsedBlob.fidelityScore !== null ? { fidelityScore: parsedBlob.fidelityScore } : {}),
+    ...(parsedBlob.v13Engine !== undefined ? { v13Engine: parsedBlob.v13Engine } : {}),
     fingerSpecs: parsedBlob.fingerSpecs,
     ...(parsedBlob.handSpecsBySide ? { handSpecsBySide: parsedBlob.handSpecsBySide } : {}),
     createdAt: row.created_at,

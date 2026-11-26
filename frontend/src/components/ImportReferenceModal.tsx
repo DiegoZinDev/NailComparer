@@ -4,19 +4,27 @@ import {
   Camera,
   Check,
   Crosshair,
+  ExternalLink,
+  KeyRound,
   Loader2,
   Minus,
   Plus,
   RotateCcw,
+  ShieldCheck,
   Sparkles,
   Upload,
   X,
 } from 'lucide-react';
 import {
+  type DeepReconstructionProgress,
+  type DeepReconstructionResult,
+  getSavedGeminiApiKey,
+  runDeepPerFingerReconstruction,
+} from '../lib/deepNailReconstructor';
+import {
   FINGER_LABELS_PT,
   ORDERED_FINGERS,
   PATTERN_LABELS_PT,
-  type PerFingerAnalysisResult,
   analyzeReferencePhotoPerFinger,
   extractTrueUVNailTexture,
 } from '../lib/perFingerVisionAnalyzer';
@@ -24,12 +32,23 @@ import { generateNailSwatchDataUrl } from '../lib/swatchPreview';
 import type {
   ArtisticPattern,
   FingerId,
+  Nail3DFinishType,
   NailDesign,
   NailFingerDesignSpec,
+  NailHandSpecsBySide,
   NailPatternType,
   NailShape,
   NailUvPinTarget,
 } from '../types/nail';
+
+const SHAPE_OPTIONS: Array<{ id: NailShape; label: string }> = [
+  { id: 'almond', label: 'Amendoada' },
+  { id: 'coffin', label: 'Bailarina' },
+  { id: 'stiletto', label: 'Stiletto' },
+  { id: 'oval', label: 'Oval' },
+  { id: 'square', label: 'Quadrada' },
+  { id: 'natural', label: 'Natural' },
+];
 
 const SHAPE_LABELS: Record<NailShape, string> = {
   natural: 'Natural',
@@ -38,6 +57,28 @@ const SHAPE_LABELS: Record<NailShape, string> = {
   square: 'Quadrada',
   coffin: 'Bailarina',
   stiletto: 'Stiletto',
+};
+
+const FINISH_OPTIONS: Array<{
+  id: 'chrome' | 'glossy' | 'pearl' | 'velvet';
+  label: string;
+  finishType: Nail3DFinishType;
+  designFinish: NailDesign['finish'];
+}> = [
+  { id: 'chrome', label: 'Cromo Espelhado', finishType: 'mirror_chrome', designFinish: 'chrome' },
+  { id: 'glossy', label: 'Gel Brilho', finishType: 'solid_gloss_gel', designFinish: 'glossy' },
+  { id: 'pearl', label: 'Pérola', finishType: 'glazed_pearl', designFinish: 'chrome' },
+  { id: 'velvet', label: 'Matte', finishType: 'velvet_matte', designFinish: 'velvet' },
+];
+
+const FINISH_LABELS: Record<Nail3DFinishType, string> = {
+  mirror_chrome: 'Cromado Espelho',
+  glazed_pearl: 'Perolado Glaze',
+  solid_gloss_gel: 'Gel Brilho',
+  jelly_translucent: 'Jelly Translúcido',
+  cat_eye_magnetic: 'Cat-Eye Magnético',
+  velvet_matte: 'Veludo Fosco',
+  glitter_suspension: 'Glitter Gel',
 };
 
 function mapArtisticToDesignPattern(pattern: ArtisticPattern): NailPatternType {
@@ -98,6 +139,18 @@ function clamp(v: number, min: number, max: number): number {
   return v < min ? min : v > max ? max : v;
 }
 
+function stripTransientZoom(
+  specs: Record<FingerId, NailFingerDesignSpec>
+): Record<FingerId, NailFingerDesignSpec> {
+  const out = {} as Record<FingerId, NailFingerDesignSpec>;
+  for (const id of ORDERED_FINGERS) {
+    const clean: NailFingerDesignSpec = { ...specs[id] };
+    delete clean.referenceZoomDataUrl;
+    out[id] = clean;
+  }
+  return out;
+}
+
 const DEFAULT_PIN_TARGET: NailUvPinTarget = {
   cxNorm: 0.5,
   cyNorm: 0.5,
@@ -107,7 +160,7 @@ const DEFAULT_PIN_TARGET: NailUvPinTarget = {
   detectedFromPhoto: false,
 };
 
-const LOUPE_SIZE = 220;
+const LOUPE_SIZE = 216;
 const LOUPE_ZOOM = 4.0;
 
 interface ImportReferenceModalProps {
@@ -123,19 +176,31 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   targetMode = 'client',
   onClose,
   onCreateDesign,
+  onOpenSettings,
 }) => {
   const [name, setName] = useState('');
+  const [engineMode, setEngineMode] = useState<'unknown' | 'ai_vlm' | 'offline_loupe'>('unknown');
   const [sourceImage, setSourceImage] = useState<HTMLImageElement | null>(null);
-  const [analysis, setAnalysis] = useState<PerFingerAnalysisResult | null>(null);
+  const [deepResult, setDeepResult] = useState<DeepReconstructionResult | null>(null);
   const [fingerSpecs, setFingerSpecs] = useState<Record<FingerId, NailFingerDesignSpec> | null>(
     null
   );
+  const [handSpecsBySide, setHandSpecsBySide] = useState<NailHandSpecsBySide | undefined>(
+    undefined
+  );
+  const [activeHandSide, setActiveHandSide] = useState<'Right' | 'Left'>('Right');
   const [selectedFinger, setSelectedFinger] = useState<FingerId>('ring');
+  const [offlineShape, setOfflineShape] = useState<NailShape>('almond');
+  const [offlineFinishId, setOfflineFinishId] = useState<'chrome' | 'glossy' | 'pearl' | 'velvet'>(
+    'glossy'
+  );
   const [angleOffsetDeg, setAngleOffsetDeg] = useState<number>(0);
   const [analyzing, setAnalyzing] = useState(false);
+  const [progress, setProgress] = useState<DeepReconstructionProgress | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
   const loupeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragStateRef = useRef<{
     active: boolean;
@@ -157,30 +222,43 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
   useEffect(() => {
     if (!open) {
+      abortControllerRef.current?.abort();
+      abortControllerRef.current = null;
       if (pendingExtractRafRef.current !== null) {
         cancelAnimationFrame(pendingExtractRafRef.current);
         pendingExtractRafRef.current = null;
       }
       setError(null);
+      setProgress(null);
       setAnalyzing(false);
+    } else {
+      // Show initial transparent engine status hint based on saved local key
+      setEngineMode(getSavedGeminiApiKey() ? 'ai_vlm' : 'unknown');
     }
   }, [open]);
 
-  const activeSpec = fingerSpecs ? fingerSpecs[selectedFinger] : null;
+  const currentHandSpecs = useMemo(() => {
+    if (handSpecsBySide?.[activeHandSide]) {
+      return handSpecsBySide[activeHandSide]!;
+    }
+    return fingerSpecs;
+  }, [handSpecsBySide, activeHandSide, fingerSpecs]);
+
+  const activeSpec = currentHandSpecs ? currentHandSpecs[selectedFinger] : null;
   const activeTarget: NailUvPinTarget = activeSpec?.uvExtractionTarget ?? DEFAULT_PIN_TARGET;
 
   const fingerPreviews = useMemo(() => {
-    if (!fingerSpecs) return null;
+    if (!currentHandSpecs) return null;
     const previews = {} as Record<FingerId, string>;
     for (const id of ORDERED_FINGERS) {
-      previews[id] = generateNailSwatchDataUrl(fingerSpecs[id], 180, 260);
+      previews[id] = generateNailSwatchDataUrl(currentHandSpecs[id], 180, 260);
     }
     return previews;
-  }, [fingerSpecs]);
+  }, [currentHandSpecs]);
 
   const activePreviewUrl = fingerPreviews ? fingerPreviews[selectedFinger] : null;
 
-  // Draw the 4x Zoom Interactive UV Pincher Loupe canvas
+  // Draw the 4x Zoom Interactive UV Pincher Loupe canvas (Offline / Manual UV mode)
   const drawLoupeCanvas = useCallback(
     (img: HTMLImageElement | null, target: NailUvPinTarget) => {
       const canvas = loupeCanvasRef.current;
@@ -199,7 +277,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       ctx.scale(dpr, dpr);
       ctx.fillStyle = '#141116';
       ctx.fillRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
-
       if (!img) {
         ctx.restore();
         return;
@@ -211,8 +288,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       const cyPx = target.cyNorm * srcH;
       const baseScale = LOUPE_SIZE / Math.max(1, Math.min(srcW, srcH));
       const zoomScale = baseScale * LOUPE_ZOOM;
-
-      // Rotate view so the nail DIP->TIP axis points straight UP in the loupe
       const rotToUp = -Math.PI / 2 - target.angleRad;
 
       ctx.save();
@@ -223,7 +298,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       ctx.drawImage(img, 0, 0, srcW, srcH);
       ctx.restore();
 
-      // Overlay the exact 88% inner safe extraction nail silhouette
+      // Overlay the anatomical silhouette extraction guide
       const boxW = clamp(target.widthNorm * srcW * zoomScale * 0.88, 22, LOUPE_SIZE * 0.82);
       const boxH = clamp(target.heightNorm * srcH * zoomScale * 0.88, 30, LOUPE_SIZE * 0.86);
       const x0 = (LOUPE_SIZE - boxW) * 0.5;
@@ -252,7 +327,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Center crosshair
       const mid = LOUPE_SIZE * 0.5;
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.72)';
       ctx.lineWidth = 1;
@@ -270,20 +344,20 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   );
 
   useEffect(() => {
-    if (sourceImage && activeTarget) {
+    if (engineMode === 'offline_loupe' && sourceImage && activeTarget) {
       drawLoupeCanvas(sourceImage, activeTarget);
     }
-  }, [sourceImage, activeTarget, drawLoupeCanvas]);
+  }, [engineMode, sourceImage, activeTarget, drawLoupeCanvas]);
 
-  // Throttled real-time UV re-extraction (~40ms via requestAnimationFrame)
   const scheduleUvReExtraction = useCallback(
-    (fid: FingerId, nextTarget: NailUvPinTarget) => {
+    (fid: FingerId, nextTarget: NailUvPinTarget, shapeOverride?: NailShape) => {
       if (!sourceImage) return;
+      const targetShape = shapeOverride ?? offlineShape;
 
       const runExtract = () => {
         pendingExtractRafRef.current = null;
         lastExtractTimeRef.current = performance.now();
-        const trueUvDataUrl = extractTrueUVNailTexture(sourceImage, nextTarget, 512);
+        const trueUvDataUrl = extractTrueUVNailTexture(sourceImage, nextTarget, 512, targetShape);
         if (!trueUvDataUrl) return;
         setFingerSpecs((prev) => {
           if (!prev) return prev;
@@ -291,6 +365,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
             ...prev,
             [fid]: {
               ...prev[fid],
+              shape: targetShape,
+              renderStrategy: 'canonical_uv_delighted',
               uvExtractionTarget: nextTarget,
               trueUvDataUrl,
             },
@@ -310,7 +386,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         });
       }
     },
-    [sourceImage]
+    [sourceImage, offlineShape]
   );
 
   const updateActivePinTarget = useCallback(
@@ -367,7 +443,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     const baseScale = LOUPE_SIZE / Math.max(1, Math.min(srcW, srcH));
     const zoomScale = baseScale * LOUPE_ZOOM;
 
-    // Dragging the image inside the loupe moves the extraction target in the opposite direction
     const rotToUp = -Math.PI / 2 - activeTarget.angleRad;
     const cosR = Math.cos(-rotToUp);
     const sinR = Math.sin(-rotToUp);
@@ -387,15 +462,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     }
   };
 
-  const handleSelectFinger = (fid: FingerId) => {
-    setSelectedFinger(fid);
-    const target = fingerSpecs?.[fid]?.uvExtractionTarget;
-    if (target) {
-      const diffRad = target.angleRad - baseAngleRef.current[fid];
-      setAngleOffsetDeg(Math.round(clamp((diffRad * 180) / Math.PI, -30, 30)));
-    } else {
-      setAngleOffsetDeg(0);
-    }
+  const handleCancelAnalysis = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setAnalyzing(false);
+    setProgress(null);
   };
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -403,45 +474,134 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     if (!file) return;
     setError(null);
     setAnalyzing(true);
+    setProgress({
+      stage: 'detecting_hands',
+      message: 'Analisando foto de referência...',
+      currentFingerIndex: 0,
+      totalFingers: 5,
+      percent: 8,
+    });
+
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const dataUrl = await readFileAsDataUrl(file);
-      const [img, result] = await Promise.all([
-        loadHtmlImage(dataUrl),
-        analyzeReferencePhotoPerFinger(dataUrl),
-      ]);
-
+      const img = await loadHtmlImage(dataUrl);
       setSourceImage(img);
-      setAnalysis(result);
-      setFingerSpecs(result.fingerSpecs);
 
-      for (const id of ORDERED_FINGERS) {
-        baseAngleRef.current[id] =
-          result.fingerSpecs[id].uvExtractionTarget?.angleRad ?? -Math.PI / 2;
+      // Try V13 OmniFabric Deep VLM first (uses server GEMINI_API_KEY or saved local free key)
+      const res = await runDeepPerFingerReconstruction(dataUrl, {
+        signal: controller.signal,
+        onProgress: (p) => setProgress(p),
+      });
+
+      if (res.mode === 'deep_vlm') {
+        // AI Vision succeeded! Use verified 3D renders + side-by-side comparison
+        setEngineMode('ai_vlm');
+        setDeepResult(res);
+        setFingerSpecs(res.fingerSpecs);
+        setHandSpecsBySide(res.handSpecsBySide);
+        setActiveHandSide(res.handSpecsBySide?.Right ? 'Right' : 'Left');
+
+        const richFinger =
+          ORDERED_FINGERS.find(
+            (id) =>
+              (res.fingerSpecs[id].manufacturingSpec?.accessories3D.length ?? 0) > 0 ||
+              res.fingerSpecs[id].manufacturingSpec?.finishType === 'mirror_chrome'
+          ) ?? 'ring';
+        setSelectedFinger(richFinger);
+      } else {
+        // Offline / missing API key: NEVER show hallucinated 76% vector fallback!
+        // Switch transparently to the clean silhouette-conformed 4x UV Loupe + Shape/Finish controls
+        setEngineMode('offline_loupe');
+        setDeepResult(null);
+        setHandSpecsBySide(undefined);
+
+        const localUv = await analyzeReferencePhotoPerFinger(dataUrl);
+        const cleanUvSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
+        for (const id of ORDERED_FINGERS) {
+          const s = localUv.fingerSpecs[id];
+          baseAngleRef.current[id] = s.uvExtractionTarget?.angleRad ?? -Math.PI / 2;
+          cleanUvSpecs[id] = {
+            ...s,
+            renderStrategy: 'canonical_uv_delighted',
+            manufacturingSpec: undefined,
+            preview3DDataUrl: undefined,
+            fidelityScore: undefined,
+          };
+        }
+        setFingerSpecs(cleanUvSpecs);
+        setOfflineShape(localUv.primaryShape);
+        setOfflineFinishId(localUv.primaryPattern === 'chrome_mirror' ? 'chrome' : 'glossy');
+        setSelectedFinger(
+          localUv.detectedFingerIds.includes('middle')
+            ? 'middle'
+            : localUv.detectedFingerIds[0] ?? 'middle'
+        );
+        setAngleOffsetDeg(0);
       }
-
-      const preferred =
-        result.detectedFingerIds.includes('middle')
-          ? 'middle'
-          : result.detectedFingerIds.includes('ring')
-            ? 'ring'
-            : result.detectedFingerIds[0] ?? 'middle';
-      setSelectedFinger(preferred);
-      setAngleOffsetDeg(0);
 
       if (!name.trim()) {
         const cleanFile = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
         setName(
           cleanFile.length > 2
             ? cleanFile.slice(0, 26)
-            : `${SHAPE_LABELS[result.primaryShape]} UV 3D`
+            : `${SHAPE_LABELS[res.primaryShape]} 3D`
         );
       }
-    } catch {
-      setError('Não foi possível extrair a textura desta foto. Tente outra imagem nítida.');
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError('Análise cancelada.');
+      } else {
+        setError('Não foi possível processar esta foto. Tente outra imagem nítida.');
+      }
     } finally {
+      abortControllerRef.current = null;
       setAnalyzing(false);
       e.target.value = '';
     }
+  };
+
+  const handleOfflineShapeChange = (shape: NailShape) => {
+    setOfflineShape(shape);
+    if (!fingerSpecs || !sourceImage) return;
+    const next = {} as Record<FingerId, NailFingerDesignSpec>;
+    for (const id of ORDERED_FINGERS) {
+      const target = fingerSpecs[id].uvExtractionTarget ?? DEFAULT_PIN_TARGET;
+      const reExtracted = extractTrueUVNailTexture(sourceImage, target, 512, shape);
+      next[id] = {
+        ...fingerSpecs[id],
+        shape,
+        trueUvDataUrl: reExtracted || fingerSpecs[id].trueUvDataUrl,
+      };
+    }
+    setFingerSpecs(next);
+  };
+
+  const handleOfflineFinishChange = (finishId: 'chrome' | 'glossy' | 'pearl' | 'velvet') => {
+    setOfflineFinishId(finishId);
+    const opt = FINISH_OPTIONS.find((f) => f.id === finishId);
+    if (!fingerSpecs || !opt) return;
+    const next = {} as Record<FingerId, NailFingerDesignSpec>;
+    for (const id of ORDERED_FINGERS) {
+      next[id] = {
+        ...fingerSpecs[id],
+        pattern: finishId === 'chrome' ? 'chrome_mirror' : 'solid_gloss',
+        finishStyle:
+          finishId === 'chrome'
+            ? 'chrome_mirror'
+            : finishId === 'pearl'
+              ? 'pearl_glazed'
+              : finishId === 'velvet'
+                ? 'velvet_matte'
+                : 'glossy_gel',
+        metallicIntensity: finishId === 'chrome' ? 0.92 : finishId === 'pearl' ? 0.38 : 0.08,
+        glossIntensity: finishId === 'velvet' ? 0.55 : 0.98,
+      };
+    }
+    setFingerSpecs(next);
   };
 
   const applySelectedTextureToAll5 = () => {
@@ -456,7 +616,12 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         secondaryColor: source.secondaryColor,
         accentColor: source.accentColor,
         pattern: source.pattern,
+        renderStrategy: source.renderStrategy,
         trueUvDataUrl: source.trueUvDataUrl,
+        preview3DDataUrl: source.preview3DDataUrl,
+        manufacturingSpec: source.manufacturingSpec
+          ? { ...source.manufacturingSpec, fingerId: id }
+          : undefined,
         uvExtractionTarget: source.uvExtractionTarget
           ? { ...source.uvExtractionTarget }
           : fingerSpecs[id].uvExtractionTarget,
@@ -480,16 +645,20 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   };
 
   const resetAndClose = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
     if (pendingExtractRafRef.current !== null) {
       cancelAnimationFrame(pendingExtractRafRef.current);
       pendingExtractRafRef.current = null;
     }
     setName('');
     setSourceImage(null);
-    setAnalysis(null);
+    setDeepResult(null);
     setFingerSpecs(null);
+    setHandSpecsBySide(undefined);
     setSelectedFinger('ring');
     setAngleOffsetDeg(0);
+    setProgress(null);
     setAnalyzing(false);
     setError(null);
     onClose();
@@ -498,20 +667,31 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!fingerSpecs || !activeSpec) {
-      setError('Envie ou fotografe uma referência primeiro para extrair a textura UV.');
+      setError('Envie ou fotografe uma referência primeiro.');
       return;
     }
     setSaving(true);
     try {
       const middleSpec = fingerSpecs.middle ?? activeSpec;
+      const finalizedSpecs = stripTransientZoom(fingerSpecs);
+      const finalizedBySide: NailHandSpecsBySide | undefined = handSpecsBySide
+        ? {
+            Left: handSpecsBySide.Left ? stripTransientZoom(handSpecsBySide.Left) : undefined,
+            Right: handSpecsBySide.Right ? stripTransientZoom(handSpecsBySide.Right) : undefined,
+          }
+        : undefined;
+
       const swatchDataUrl = generateNailSwatchDataUrl(activeSpec, 180, 260);
-      const finalizedSpecs = {} as Record<FingerId, NailFingerDesignSpec>;
-      for (const id of ORDERED_FINGERS) {
-        finalizedSpecs[id] = {
-          ...fingerSpecs[id],
-          glossIntensity: 0.98,
-        };
-      }
+      const offlineOpt = FINISH_OPTIONS.find((f) => f.id === offlineFinishId);
+      const finalFinish: NailDesign['finish'] =
+        engineMode === 'offline_loupe'
+          ? offlineOpt?.designFinish ?? 'glossy'
+          : middleSpec.manufacturingSpec?.finishType === 'mirror_chrome' ||
+              middleSpec.manufacturingSpec?.finishType === 'glazed_pearl'
+            ? 'chrome'
+            : middleSpec.manufacturingSpec?.finishType === 'velvet_matte'
+              ? 'velvet'
+              : 'glossy';
 
       await onCreateDesign({
         name: name.trim() || `${PATTERN_LABELS_PT[middleSpec.pattern]} 3D`,
@@ -520,19 +700,24 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
         baseColor: middleSpec.baseColor,
         secondaryColor: middleSpec.secondaryColor,
         accentColor: middleSpec.accentColor,
-        finish: middleSpec.pattern === 'chrome_mirror' ? 'chrome' : 'glossy',
+        finish: finalFinish,
         imageDataUrl: swatchDataUrl,
         isCustom: !isStudioMode,
         isStudioCatalog: isStudioMode,
-        detectedShape: middleSpec.shape,
+        detectedShape: engineMode === 'offline_loupe' ? offlineShape : middleSpec.shape,
         detectedLength: middleSpec.relativeLength,
+        fidelityScore: deepResult?.averageFidelityScore,
+        v13Engine: true,
         fingerSpecs: finalizedSpecs,
+        handSpecsBySide: finalizedBySide,
       });
       resetAndClose();
     } finally {
       setSaving(false);
     }
   };
+
+  const activeMSpec = activeSpec?.manufacturingSpec;
 
   return (
     <AnimatePresence>
@@ -561,13 +746,13 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
               <div>
                 <span className="modal-eyebrow">
                   {isStudioMode
-                    ? 'Catálogo do Estúdio • Transferência UV 512px'
-                    : 'Referência da Cliente • Lupa UV Fotorrealista'}
+                    ? 'Catálogo do Estúdio • OmniFabric V13'
+                    : 'Referência da Cliente • OmniFabric V13'}
                 </span>
                 <h2 id="import-title" className="modal-title">
                   {isStudioMode
                     ? 'Cadastrar Modelo no Catálogo'
-                    : 'Extrair Textura Real da Unha'}
+                    : 'Reconstruir Unhas em 3D'}
                 </h2>
               </div>
               <button
@@ -581,12 +766,52 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
             </div>
 
             <form onSubmit={handleSubmit} className="modal-body">
+              {/* V13 Transparent Engine Status Badge */}
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  flexWrap: 'wrap',
+                }}
+              >
+                {engineMode === 'ai_vlm' ? (
+                  <span className="fidelity-badge">
+                    <ShieldCheck size={12} />
+                    <span>Motor IA 3D Ativo (Gemini Vision)</span>
+                  </span>
+                ) : (
+                  <span className="fidelity-badge is-local">
+                    <KeyRound size={12} />
+                    <span>
+                      {engineMode === 'offline_loupe'
+                        ? 'Modo Local Offline — Configure sua Chave Gratuita IA'
+                        : 'Gemini Vision (R$ 0,00) ou Lupa UV Offline'}
+                    </span>
+                  </span>
+                )}
+
+                {engineMode !== 'ai_vlm' && onOpenSettings && (
+                  <button
+                    type="button"
+                    className="missing-key-link"
+                    onClick={() => {
+                      onClose();
+                      onOpenSettings();
+                    }}
+                  >
+                    Configurar Chave Gratuita (30s)
+                  </button>
+                )}
+              </div>
+
               {/* Upload / Camera Buttons */}
               <div className="import-upload-buttons">
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                   <label className="upload-action-btn">
                     <Upload size={16} />
-                    <span>{analyzing ? 'Extraindo UV...' : 'Foto da Galeria'}</span>
+                    <span>{analyzing ? 'Processando...' : 'Foto da Galeria'}</span>
                     <input
                       type="file"
                       accept="image/*"
@@ -613,29 +838,176 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 </div>
               </div>
 
-              {analyzing && (
-                <div className="extractor-status-note" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <Loader2 size={15} className="spin-icon" />
-                  <span>Detectando unhas e extraindo textura UV 512×512 em tempo real...</span>
+              {/* Live Deep Reconstruction Progress */}
+              {analyzing && progress && (
+                <div className="deep-progress-panel" role="status" aria-live="polite">
+                  <div className="deep-progress-head">
+                    <span className="deep-progress-title">
+                      <Loader2 size={15} className="spin-icon" />
+                      <span>Reconstrução 3D OmniFabric</span>
+                    </span>
+                    <span className="deep-progress-pct">{progress.percent}%</span>
+                  </div>
+                  <div className="deep-progress-bar">
+                    <div
+                      className="deep-progress-bar-fill"
+                      style={{ width: `${Math.max(5, progress.percent)}%` }}
+                    />
+                  </div>
+                  <p className="deep-progress-msg">{progress.message}</p>
+                  <div className="deep-progress-footer">
+                    <span className="deep-progress-hint">
+                      Análise óptica por dedo com auto-verificação visual.
+                    </span>
+                    <button
+                      type="button"
+                      className="deep-cancel-btn"
+                      onClick={handleCancelAnalysis}
+                    >
+                      Cancelar
+                    </button>
+                  </div>
                 </div>
               )}
 
-              {/* V12 4x Interactive UV Pincher Loupe + Real-Time Extracted Nail Preview */}
-              {sourceImage && activeSpec && (
+              {/* Offline Transparent Banner */}
+              {engineMode === 'offline_loupe' && (
+                <div className="missing-key-banner">
+                  <span>
+                    <strong>Modo Local Offline (Lupa UV 4×).</strong> Para ativar a reconstrução
+                    IA 3D com acessórios 3D reais e ~95–99% de fidelidade (100% gratuito no Free
+                    Tier do Google AI Studio), configure sua chave gratuita em 30s.
+                  </span>
+                  <div className="missing-key-actions">
+                    {onOpenSettings && (
+                      <button
+                        type="button"
+                        className="missing-key-link"
+                        onClick={() => {
+                          onClose();
+                          onOpenSettings();
+                        }}
+                      >
+                        Configurar Chave Gratuita (30s)
+                      </button>
+                    )}
+                    <a
+                      href="https://aistudio.google.com/apikey"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="missing-key-link"
+                    >
+                      <span>Gerar chave grátis</span>
+                      <ExternalLink size={11} />
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* MODE A: AI VLM Side-by-Side Real Comparison (Reference Zoom vs Real 3D WebGL Render) */}
+              {engineMode === 'ai_vlm' && activeSpec && activePreviewUrl && (
                 <div className="v5-five-finger-section">
                   <div className="v5-section-head">
-                    <span className="field-label" style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                      <Crosshair size={12} /> Lupa de Pinça UV 4× — Arraste para ajustar
+                    <span className="field-label">
+                      Comparativo Real: {FINGER_LABELS_PT[selectedFinger]}
+                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {deepResult?.handsCount === 2 && handSpecsBySide && (
+                        <div className="hand-side-tabs" role="tablist" aria-label="Mão">
+                          {(['Right', 'Left'] as const).map((side) => (
+                            <button
+                              key={side}
+                              type="button"
+                              role="tab"
+                              aria-selected={activeHandSide === side}
+                              className={`hand-side-tab ${activeHandSide === side ? 'is-active' : ''}`}
+                              onClick={() => setActiveHandSide(side)}
+                            >
+                              {side === 'Right' ? 'Mão Dir.' : 'Mão Esq.'}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {typeof (activeSpec.fidelityScore ?? deepResult?.averageFidelityScore) ===
+                        'number' && (
+                        <span className="fidelity-badge">
+                          <ShieldCheck size={12} />
+                          <span>
+                            {activeSpec.fidelityScore ?? deepResult?.averageFidelityScore}% fiel
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="side-by-side-compare">
+                    <div className="compare-pane">
+                      {activeSpec.referenceZoomDataUrl ? (
+                        <img
+                          src={activeSpec.referenceZoomDataUrl}
+                          alt={`Referência real ${FINGER_LABELS_PT[selectedFinger]}`}
+                          draggable={false}
+                        />
+                      ) : (
+                        <div className="nail-crop-placeholder">
+                          <Sparkles size={18} />
+                          <span>Harmonia automática</span>
+                        </div>
+                      )}
+                      <span className="compare-pane-label">Referência Real</span>
+                    </div>
+
+                    <div className="compare-pane">
+                      <img
+                        src={activePreviewUrl}
+                        alt={`Render 3D ${FINGER_LABELS_PT[selectedFinger]}`}
+                        draggable={false}
+                      />
+                      <span className="compare-pane-label">Render 3D WebGL</span>
+                    </div>
+                  </div>
+
+                  {activeMSpec && (
+                    <div className="blueprint-meta-pills">
+                      <span className="blueprint-meta-pill">
+                        <span
+                          className="blueprint-color-dot"
+                          style={{ background: activeMSpec.trueBaseColorHex }}
+                        />
+                        {FINISH_LABELS[activeMSpec.finishType]}
+                      </span>
+                      <span className="blueprint-meta-pill">
+                        {SHAPE_LABELS[activeMSpec.shape]}
+                      </span>
+                      {activeMSpec.accessories3D.length > 0 && (
+                        <span className="blueprint-meta-pill">
+                          {activeMSpec.accessories3D.length} acessório(s) 3D
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* MODE B: Offline Clean 4x Interactive UV Loupe + Shape & Finish Selectors */}
+              {engineMode === 'offline_loupe' && sourceImage && activeSpec && (
+                <div className="v5-five-finger-section">
+                  <div className="v5-section-head">
+                    <span
+                      className="field-label"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}
+                    >
+                      <Crosshair size={12} /> Lupa UV 4× — Arraste para enquadrar
                     </span>
                     <span className="v5-source-pill">
-                      {FINGER_LABELS_PT[selectedFinger]} • 88% interno
+                      {FINGER_LABELS_PT[selectedFinger]} • Silhueta {SHAPE_LABELS[offlineShape]}
                     </span>
                   </div>
 
                   <div
                     style={{
                       display: 'grid',
-                      gridTemplateColumns: '1fr 118px',
+                      gridTemplateColumns: '1fr 114px',
                       gap: 10,
                       alignItems: 'center',
                     }}
@@ -648,10 +1020,9 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                         border: '1px solid rgba(255,255,255,0.22)',
                         background: '#141116',
                         aspectRatio: '1 / 1',
-                        maxHeight: 210,
-                        margin: '0 auto',
-                        width: '100%',
                         maxWidth: 210,
+                        width: '100%',
+                        margin: '0 auto',
                       }}
                     >
                       <canvas
@@ -671,7 +1042,6 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                       />
                     </div>
 
-                    {/* Live Extracted Photorealistic Nail Preview */}
                     <div
                       style={{
                         display: 'flex',
@@ -682,11 +1052,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                     >
                       <div
                         style={{
-                          width: 108,
-                          height: 156,
+                          width: 104,
+                          height: 152,
                           borderRadius: 16,
                           border: '1px solid rgba(255,255,255,0.18)',
-                          background: 'radial-gradient(circle at 40% 30%, rgba(255,255,255,0.08), #131015)',
+                          background: '#131015',
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'center',
@@ -694,28 +1064,22 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                           padding: 6,
                         }}
                       >
-                        {activePreviewUrl ? (
+                        {activePreviewUrl && (
                           <img
                             src={activePreviewUrl}
-                            alt={`Textura UV ${FINGER_LABELS_PT[selectedFinger]}`}
+                            alt={`Prévia UV ${FINGER_LABELS_PT[selectedFinger]}`}
                             draggable={false}
                             style={{ width: '100%', height: '100%', objectFit: 'contain' }}
                           />
-                        ) : (
-                          <Sparkles size={18} />
                         )}
                       </div>
-                      <span style={{ fontSize: '0.66rem', color: 'var(--glass-muted)', textAlign: 'center' }}>
-                        Textura UV 3D Real
+                      <span style={{ fontSize: '0.64rem', color: 'var(--glass-muted)' }}>
+                        UV Conformado 3D
                       </span>
                     </div>
                   </div>
 
-                  {/* Compact Pincher Size & Angle Controls */}
-                  <div
-                    className="extractor-refine-box"
-                    style={{ gap: 8, padding: '9px 11px' }}
-                  >
+                  <div className="extractor-refine-box" style={{ gap: 8, padding: '9px 11px' }}>
                     <div
                       style={{
                         display: 'flex',
@@ -725,15 +1089,14 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                       }}
                     >
                       <span style={{ fontSize: '0.68rem', color: 'var(--glass-muted)', fontWeight: 600 }}>
-                        Tamanho da Pinça
+                        Pinça & Ângulo ({angleOffsetDeg}°)
                       </span>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <button
                           type="button"
                           className="icon-mini-btn"
                           onClick={() => adjustPincherSize(0.9)}
-                          aria-label="Diminuir área da pinça"
-                          title="Diminuir pinça"
+                          aria-label="Diminuir pinça"
                         >
                           <Minus size={14} />
                         </button>
@@ -741,8 +1104,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                           type="button"
                           className="icon-mini-btn"
                           onClick={() => adjustPincherSize(1.1)}
-                          aria-label="Aumentar área da pinça"
-                          title="Aumentar pinça"
+                          aria-label="Aumentar pinça"
                         >
                           <Plus size={14} />
                         </button>
@@ -751,49 +1113,59 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                           className="icon-mini-btn"
                           onClick={() => handleAngleChange(0)}
                           aria-label="Resetar ângulo"
-                          title="Resetar ângulo"
                         >
                           <RotateCcw size={13} />
                         </button>
                       </div>
                     </div>
 
-                    <label
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 10,
-                        fontSize: '0.68rem',
-                        color: 'var(--glass-muted)',
-                      }}
-                    >
-                      <span style={{ minWidth: 66 }}>Ângulo ({angleOffsetDeg}°)</span>
-                      <input
-                        type="range"
-                        min={-30}
-                        max={30}
-                        step={1}
-                        value={angleOffsetDeg}
-                        onChange={(e) => handleAngleChange(Number(e.target.value))}
-                        style={{ flex: 1 }}
-                      />
-                    </label>
+                    <input
+                      type="range"
+                      min={-30}
+                      max={30}
+                      step={1}
+                      value={angleOffsetDeg}
+                      onChange={(e) => handleAngleChange(Number(e.target.value))}
+                      style={{ width: '100%' }}
+                    />
+
+                    <div className="shape-selector">
+                      {SHAPE_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => handleOfflineShapeChange(opt.id)}
+                          className={`shape-chip ${offlineShape === opt.id ? 'is-active' : ''}`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="shape-selector">
+                      {FINISH_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => handleOfflineFinishChange(opt.id)}
+                          className={`shape-chip ${offlineFinishId === opt.id ? 'is-active' : ''}`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}
 
-              {/* 5-Finger Clickable Strip + Uniformize CTA */}
-              {fingerSpecs && (
-                <div
-                  className="v5-five-finger-section"
-                  role="group"
-                  aria-label="Unhas extraídas"
-                >
+              {/* 5-Finger Strip */}
+              {currentHandSpecs && (
+                <div className="v5-five-finger-section" role="group" aria-label="Unhas reconstruídas">
                   <div className="v5-section-head">
                     <span className="field-label">
-                      {analysis?.detectedFingerIds.length
-                        ? `${analysis.detectedFingerIds.length} dedo(s) detectados • Toque para pinçar`
-                        : '5 Dedos • Toque para ajustar'}
+                      {deepResult?.handsCount === 2
+                        ? `10 Dedos (${activeHandSide === 'Right' ? 'Mão Direita' : 'Mão Esquerda'})`
+                        : '5 Dedos (toque para inspecionar)'}
                     </span>
                     <button
                       type="button"
@@ -806,7 +1178,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 
                   <div className="v5-five-finger-grid">
                     {ORDERED_FINGERS.map((fid) => {
-                      const spec = fingerSpecs[fid];
+                      const spec = currentHandSpecs[fid];
                       const isActive = fid === selectedFinger;
                       const thumbRadius = getSilhouetteBorderRadius(spec.shape);
                       const swatchSrc = fingerPreviews ? fingerPreviews[fid] : null;
@@ -814,7 +1186,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                         <button
                           key={fid}
                           type="button"
-                          onClick={() => handleSelectFinger(fid)}
+                          onClick={() => setSelectedFinger(fid)}
                           className={`v5-finger-card ${isActive ? 'is-active' : ''}`}
                         >
                           <div
@@ -841,7 +1213,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                           </div>
                           <span className="v5-finger-name">{FINGER_LABELS_PT[fid]}</span>
                           <span className="v5-finger-badge">
-                            {spec.detectedFromPhoto ? 'UV Real' : 'Harmonia'}
+                            {typeof spec.fidelityScore === 'number'
+                              ? `${spec.fidelityScore}%`
+                              : spec.detectedFromPhoto
+                                ? 'UV Real'
+                                : 'Harmonia'}
                           </span>
                         </button>
                       );
@@ -862,7 +1238,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                   placeholder={
                     isStudioMode
                       ? 'Ex: Cromado Ouro Champagne Studs'
-                      : 'Ex: Referência Dourada Cromada'
+                      : 'Ex: Referência Dourada 3D'
                   }
                   className="glass-input"
                 />

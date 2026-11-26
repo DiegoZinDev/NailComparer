@@ -139,6 +139,20 @@ A versão **V12** substitui a vetorização cartunesca na importação por **tra
 
 ---
 
+## 2.5 Arquitetura V13 (`feat/v13-omnifabric-nail-ar-fidelity`) — OmniFabric-Nail 3D Dual-Path, AR Zero-Clipping, Guarda Biomecânica & Suíte Automatizada de Testes
+
+A versão **V13** elimina definitivamente auto-oclusão, aspecto "dedal/bala", unhas desenhadas na palma, vazamento de fundo nos cantos UV e fallbacks silenciosos quebrados:
+
+- **Zero Auto-Oclusão & Casca Fina de Salão (`nail3DGeometry.ts` + `threeNailScene.ts`)**:
+  - Placa ancorada em `lerp(dipPt, tipPt, 0.22)` (`dorsalOffset = +0.84r`), contra oclusores deslocados palmarmente: cilindro distal `-0.32r / raio 0.66r` (teto `+0.34r`), esfera DIP `-0.28r / raio 0.72r` (teto `+0.44r`) e esfera da polpa em `lerp(dip, tip, 0.78)` deslocada `-0.36r / raio 0.76r` (teto `+0.40r`), garantindo margem `>= 0.15r` nos 5 dedos × 6 formatos.
+  - Casca refinada: `cCurveDepth = 0.145` (`[0.11, 0.18]`), `apexHeight = 0.056` (`[0.042, 0.075]`), espessura `0.008 → 0.026 → 0.020`, cutícula elíptica C1 (`0.24 → 0.50` em `v ∈ [0, 0.18]`) e largura realista `0.94 × safeNailWidthMeters`.
+- **Guarda Biomecânica & Ocultação Palmar (`handKinematics.ts` + `threeNailScene.ts`)**: `verifyDorsalSignFromBiomechanics` + `BiomechanicalSignGuard` (histerese 8 frames) corrigem automaticamente lateralidade invertida do MediaPipe quando dedos flexionam `> 18°`; quando a palma vira para a câmera (`axisZ.z < -0.35`), oculta a face dorsal (`Group 0`) e faz fade suave até `opacity = 0` em `axisZ.z < -0.55`.
+- **Roteamento Dual-Path OmniFabric (`reconstruct-nail.ts`, `NailReconstructionService.ts`, `deepNailReconstructor.ts`, `proceduralPBRSynthesizer.ts`, `perFingerVisionAnalyzer.ts`)**:
+  - `procedural_pbr_3d` (cromo espelhado liso `normalScale 0.15`, gel, pearl, cat-eye, french + acessórios 3D `InstancedMesh` reais, com rejeição de `strokes3D` espúrios de reflexo) vs `canonical_uv_delighted` / `hybrid_uv_plus_pbr_3d` (`extractTrueUVPixelsFromBuffer` conformado à silhueta `evalNailHalfWidth` + edge-bleed + specular delighting + suporte opcional a `action: 'generate_canonical_uv'` via `ENABLE_GENERATIVE_UV_ATLAS=true`).
+- **UX Transparente & Migração V13 (`ImportReferenceModal.tsx` + `offlineStore.ts`)**: Badge explícito de motor ativo (**Motor IA 3D Ativo** vs **Modo Local Offline — Lupa UV 4× + Formato/Acabamento**, nunca exibindo fallback alucinado de 76%), migração `DB_VERSION = 2` purgando caches corrompidos legados (`< 80%` sem `v13Engine`) e 4 suítes automatizadas (`npm --prefix frontend test`: `occluderClearance.test.ts`, `handKinematics.test.ts`, `trueUvSilhouette.test.ts`, `reconstructNail.test.ts`).
+
+---
+
 ## 3. Arquitetura em Camadas no Backend (Clean / Spring-Style)
 
 O servidor (`backend/src/`) segue separação estrita de responsabilidades inspirada em **Spring Boot / Clean Architecture**, utilizando Node.js + Express + TypeScript:
