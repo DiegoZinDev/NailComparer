@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeManufacturingSpec } from '../api/reconstruct-nail.ts';
-import { sanitizeManufacturingSpecClient } from '../src/lib/deepNailReconstructor.ts';
+import handler, {
+  executeReconstructNail,
+  sanitizeManufacturingSpec,
+  type VercelReq,
+  type VercelRes,
+} from '../api/reconstruct-nail.ts';
+import {
+  checkServerAiStatus,
+  runDeepPerFingerReconstruction,
+  sanitizeManufacturingSpecClient,
+} from '../src/lib/deepNailReconstructor.ts';
 
 test('V13 Dual-Path API & Sanitizer: preserves renderStrategy, rejects spurious strokes3D on mirror_chrome, preserves real 3D accessories', () => {
   const rawChromeWithStuds = {
@@ -86,3 +95,102 @@ test('V13 Dual-Path API & Sanitizer: preserves renderStrategy, rejects spurious 
   assert.equal(pictorial.renderStrategy, 'canonical_uv_delighted');
   assert.equal(pictorial.accessories3D.length, 1);
 });
+
+test('V13.1 Health Check: GET /api/reconstruct-nail and POST action=status return server_env configured status without leaking key', async () => {
+  const prevKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'secret-test-server-key-never-expose';
+
+  try {
+    let statusCode = 0;
+    let payload: unknown = null;
+    const responseHeaders: Record<string, string> = {};
+
+    const req: VercelReq = {
+      method: 'GET',
+      headers: {},
+    };
+    const res: VercelRes = {
+      status(code: number) {
+        statusCode = code;
+        return this;
+      },
+      json(data: unknown) {
+        payload = data;
+        return this;
+      },
+      setHeader(name: string, value: string) {
+        responseHeaders[name.toLowerCase()] = value;
+      },
+      end() {
+        // noop
+      },
+    };
+
+    await handler(req, res);
+
+    assert.equal(statusCode, 200);
+    assert.match(responseHeaders['access-control-allow-methods'] ?? '', /\bGET\b/);
+    assert.deepEqual(payload, {
+      ok: true,
+      configured: true,
+      source: 'server_env',
+      model: 'gemini-2.5-flash',
+    });
+    assert.ok(!JSON.stringify(payload).includes('secret-test-server-key-never-expose'));
+
+    const postStatus = await executeReconstructNail({ action: 'status' }, {});
+    assert.deepEqual(postStatus, {
+      ok: true,
+      configured: true,
+      source: 'server_env',
+      model: 'gemini-2.5-flash',
+    });
+
+    const clientStatus = await checkServerAiStatus(
+      (async () =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof fetch,
+      { apiKey: '' }
+    );
+    assert.deepEqual(clientStatus, {
+      reachable: true,
+      configured: true,
+      source: 'server_env',
+      status: 200,
+      model: 'gemini-2.5-flash',
+    });
+  } finally {
+    if (prevKey === undefined) {
+      delete process.env.GEMINI_API_KEY;
+    } else {
+      process.env.GEMINI_API_KEY = prevKey;
+    }
+  }
+});
+
+test('V13.1 Error Transparency: HTTP 500 from /api/reconstruct-nail yields local_fallback with missingApiKey=false and real fallbackReason', async () => {
+  const mockFetch500 = (async () =>
+    new Response(JSON.stringify({ error: 'Erro interno simulado na Vercel' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch;
+
+  const result = await runDeepPerFingerReconstruction('data:image/jpeg;base64,AAAA', {
+    apiKey: '',
+    fetchImpl: mockFetch500,
+    pacingDelayMs: 0,
+  });
+
+  assert.equal(result.mode, 'local_fallback');
+  assert.equal(result.missingApiKey, false);
+  assert.equal(result.httpStatus, 500);
+  assert.ok(
+    typeof result.fallbackReason === 'string' &&
+      result.fallbackReason.includes('HTTP 500') &&
+      result.fallbackReason.includes('/api/reconstruct-nail'),
+    `Expected descriptive HTTP 500 fallbackReason, got: ${String(result.fallbackReason)}`
+  );
+});
+

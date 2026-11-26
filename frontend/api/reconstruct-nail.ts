@@ -190,13 +190,24 @@ export interface VerificationBreakdown {
   accessories_3d: number;
 }
 
+export type ApiKeySource = 'header' | 'server_env' | 'none';
+
+export interface ReconstructStatusResponse {
+  ok: true;
+  configured: boolean;
+  source: ApiKeySource;
+  model: string;
+}
+
 export type ReconstructAction =
+  | 'status'
   | 'analyze_global'
   | 'analyze_finger'
   | 'verify_and_refine'
   | 'generate_canonical_uv';
 
 export type ReconstructNailResponse =
+  | ReconstructStatusResponse
   | {
       configured: false;
       mode: 'missing_key';
@@ -252,7 +263,6 @@ const RETRY_DELAYS_MS = [1500, 3500, 7000] as const;
 const GEMINI_REQUEST_TIMEOUT_MS = 22000;
 
 const VALID_FINGERS: readonly FingerId[] = ['thumb', 'index', 'middle', 'ring', 'pinky'];
-const VALID_HAND_SIDES: readonly HandSide[] = ['Left', 'Right'];
 const VALID_SHAPES: readonly NailShape[] = [
   'natural',
   'oval',
@@ -1531,19 +1541,26 @@ function isGenerativeUvAtlasEnabled(ctx?: GeminiExecutionContext): boolean {
   return readEnvFlag('ENABLE_GENERATIVE_UV_ATLAS') === 'true';
 }
 
+export function resolveGeminiApiKeyWithSource(
+  headers: Record<string, string | string[] | undefined>,
+  envApiKey = readEnvGeminiApiKey()
+): { apiKey: string | null; source: ApiKeySource } {
+  const headerRaw = headers['x-gemini-key'] ?? headers['X-Gemini-Key'];
+  const headerKey = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (typeof headerKey === 'string' && headerKey.trim().length > 0) {
+    return { apiKey: headerKey.trim(), source: 'header' };
+  }
+  if (typeof envApiKey === 'string' && envApiKey.trim().length > 0) {
+    return { apiKey: envApiKey.trim(), source: 'server_env' };
+  }
+  return { apiKey: null, source: 'none' };
+}
+
 export function resolveGeminiApiKey(
   headers: Record<string, string | string[] | undefined>,
   envApiKey = readEnvGeminiApiKey()
 ): string | null {
-  const headerRaw = headers['x-gemini-key'] ?? headers['X-Gemini-Key'];
-  const headerKey = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
-  if (typeof headerKey === 'string' && headerKey.trim().length > 0) {
-    return headerKey.trim();
-  }
-  if (typeof envApiKey === 'string' && envApiKey.trim().length > 0) {
-    return envApiKey.trim();
-  }
-  return null;
+  return resolveGeminiApiKeyWithSource(headers, envApiKey).apiKey;
 }
 
 function normalizeHeadersMap(
@@ -1555,6 +1572,21 @@ function normalizeHeadersMap(
     normalized[k.toLowerCase()] = v;
   }
   return normalized;
+}
+
+export function getReconstructApiStatus(
+  headers: Record<string, string | string[] | undefined> = {},
+  ctx?: GeminiExecutionContext
+): ReconstructStatusResponse {
+  const normalizedHeaders = normalizeHeadersMap(headers);
+  const envApiKey = ctx?.envApiKey !== undefined ? ctx.envApiKey : readEnvGeminiApiKey();
+  const { apiKey, source } = resolveGeminiApiKeyWithSource(normalizedHeaders, envApiKey);
+  return {
+    ok: true,
+    configured: Boolean(apiKey),
+    source,
+    model: GEMINI_PRIMARY_MODEL,
+  };
 }
 
 export async function executeReconstructNail(
@@ -1569,6 +1601,10 @@ export async function executeReconstructNail(
   const input = body as Record<string, unknown>;
   const action = input.action;
 
+  if (action === 'status') {
+    return getReconstructApiStatus(headers, ctx);
+  }
+
   if (
     action !== 'analyze_global' &&
     action !== 'analyze_finger' &&
@@ -1577,7 +1613,7 @@ export async function executeReconstructNail(
   ) {
     throw new VisionGatewayError(
       400,
-      'action inválido. Valores aceitos: analyze_global, analyze_finger, verify_and_refine, generate_canonical_uv.'
+      'action inválido. Valores aceitos: status, analyze_global, analyze_finger, verify_and_refine, generate_canonical_uv.'
     );
   }
 
@@ -1815,7 +1851,7 @@ export async function executeReconstructNail(
 
 function setCorsHeaders(res: VercelRes): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-gemini-key');
   res.setHeader('Vary', 'Origin');
 }
@@ -1828,8 +1864,13 @@ export default async function handler(req: VercelReq, res: VercelRes): Promise<v
     return;
   }
 
+  if (req.method === 'GET') {
+    res.status(200).json(getReconstructApiStatus(req.headers));
+    return;
+  }
+
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Método não permitido. Utilize POST.' });
+    res.status(405).json({ error: 'Método não permitido. Utilize GET ou POST.' });
     return;
   }
 

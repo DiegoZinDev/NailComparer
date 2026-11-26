@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
+  AlertTriangle,
   Camera,
   Check,
   Crosshair,
@@ -18,6 +19,8 @@ import {
 import {
   type DeepReconstructionProgress,
   type DeepReconstructionResult,
+  type ServerAiStatus,
+  checkServerAiStatus,
   getSavedGeminiApiKey,
   runDeepPerFingerReconstruction,
 } from '../lib/deepNailReconstructor';
@@ -180,6 +183,9 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
 }) => {
   const [name, setName] = useState('');
   const [engineMode, setEngineMode] = useState<'unknown' | 'ai_vlm' | 'offline_loupe'>('unknown');
+  const [serverAiStatus, setServerAiStatus] = useState<ServerAiStatus | null>(null);
+  const [fallbackReason, setFallbackReason] = useState<string | null>(null);
+  const [isMissingApiKey, setIsMissingApiKey] = useState<boolean>(false);
   const [sourceImage, setSourceImage] = useState<HTMLImageElement | null>(null);
   const [deepResult, setDeepResult] = useState<DeepReconstructionResult | null>(null);
   const [fingerSpecs, setFingerSpecs] = useState<Record<FingerId, NailFingerDesignSpec> | null>(
@@ -231,10 +237,39 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       setError(null);
       setProgress(null);
       setAnalyzing(false);
-    } else {
-      // Show initial transparent engine status hint based on saved local key
-      setEngineMode(getSavedGeminiApiKey() ? 'ai_vlm' : 'unknown');
+      setServerAiStatus(null);
+      setFallbackReason(null);
+      setIsMissingApiKey(false);
+      return;
     }
+
+    const hasLocalKey = Boolean(getSavedGeminiApiKey());
+    setEngineMode(hasLocalKey ? 'ai_vlm' : 'unknown');
+
+    const statusController = new AbortController();
+    void checkServerAiStatus(fetch, { signal: statusController.signal })
+      .then((status) => {
+        if (statusController.signal.aborted) return;
+        setServerAiStatus(status);
+        if (status.configured) {
+          setEngineMode((prev) => (prev === 'offline_loupe' ? prev : 'ai_vlm'));
+          setIsMissingApiKey(false);
+        } else if (status.reachable) {
+          setIsMissingApiKey(true);
+        } else {
+          setIsMissingApiKey(false);
+        }
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        if (!statusController.signal.aborted) {
+          setServerAiStatus({ reachable: false, configured: false, source: 'none' });
+        }
+      });
+
+    return () => {
+      statusController.abort();
+    };
   }, [open]);
 
   const currentHandSpecs = useMemo(() => {
@@ -473,6 +508,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     setError(null);
+    setFallbackReason(null);
+    setIsMissingApiKey(false);
     setAnalyzing(true);
     setProgress({
       stage: 'detecting_hands',
@@ -500,6 +537,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
       if (res.mode === 'deep_vlm') {
         // AI Vision succeeded! Use verified 3D renders + side-by-side comparison
         setEngineMode('ai_vlm');
+        setFallbackReason(null);
+        setIsMissingApiKey(false);
         setDeepResult(res);
         setFingerSpecs(res.fingerSpecs);
         setHandSpecsBySide(res.handSpecsBySide);
@@ -513,9 +552,11 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
           ) ?? 'ring';
         setSelectedFinger(richFinger);
       } else {
-        // Offline / missing API key: NEVER show hallucinated 76% vector fallback!
+        // Offline / server error / missing API key: NEVER show hallucinated 76% vector fallback!
         // Switch transparently to the clean silhouette-conformed 4x UV Loupe + Shape/Finish controls
         setEngineMode('offline_loupe');
+        setFallbackReason(res.fallbackReason ?? null);
+        setIsMissingApiKey(res.missingApiKey === true);
         setDeepResult(null);
         setHandSpecsBySide(undefined);
 
@@ -660,6 +701,8 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
     setAngleOffsetDeg(0);
     setProgress(null);
     setAnalyzing(false);
+    setFallbackReason(null);
+    setIsMissingApiKey(false);
     setError(null);
     onClose();
   };
@@ -766,7 +809,7 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
             </div>
 
             <form onSubmit={handleSubmit} className="modal-body">
-              {/* V13 Transparent Engine Status Badge */}
+              {/* V13.1 Transparent Engine Status Badge */}
               <div
                 style={{
                   display: 'flex',
@@ -779,31 +822,53 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 {engineMode === 'ai_vlm' ? (
                   <span className="fidelity-badge">
                     <ShieldCheck size={12} />
-                    <span>Motor IA 3D Ativo (Gemini Vision)</span>
+                    <span>
+                      {serverAiStatus?.source === 'header' ||
+                      (!serverAiStatus && Boolean(getSavedGeminiApiKey()))
+                        ? 'Motor IA 3D Ativo (Gemini Vision — Chave Local)'
+                        : 'Motor IA 3D Ativo (Gemini Vision — Servidor)'}
+                    </span>
+                  </span>
+                ) : serverAiStatus && !serverAiStatus.reachable && !isMissingApiKey ? (
+                  <span className="fidelity-badge is-local">
+                    <AlertTriangle size={12} />
+                    <span>
+                      {serverAiStatus.status
+                        ? `Erro de conexão com o servidor IA (HTTP ${serverAiStatus.status})`
+                        : 'Erro de conexão com o servidor IA'}
+                    </span>
+                  </span>
+                ) : fallbackReason && !isMissingApiKey ? (
+                  <span className="fidelity-badge is-local">
+                    <AlertTriangle size={12} />
+                    <span>Modo Local Offline — Falha temporária no servidor IA</span>
                   </span>
                 ) : (
                   <span className="fidelity-badge is-local">
                     <KeyRound size={12} />
                     <span>
-                      {engineMode === 'offline_loupe'
+                      {engineMode === 'offline_loupe' || isMissingApiKey
                         ? 'Modo Local Offline — Configure sua Chave Gratuita IA'
-                        : 'Gemini Vision (R$ 0,00) ou Lupa UV Offline'}
+                        : 'Verificando Motor IA 3D no servidor...'}
                     </span>
                   </span>
                 )}
 
-                {engineMode !== 'ai_vlm' && onOpenSettings && (
-                  <button
-                    type="button"
-                    className="missing-key-link"
-                    onClick={() => {
-                      onClose();
-                      onOpenSettings();
-                    }}
-                  >
-                    Configurar Chave Gratuita (30s)
-                  </button>
-                )}
+                {engineMode !== 'ai_vlm' &&
+                  onOpenSettings &&
+                  (isMissingApiKey ||
+                    (serverAiStatus?.reachable === true && !serverAiStatus.configured)) && (
+                    <button
+                      type="button"
+                      className="missing-key-link"
+                      onClick={() => {
+                        onClose();
+                        onOpenSettings();
+                      }}
+                    >
+                      Configurar Chave Gratuita (30s)
+                    </button>
+                  )}
               </div>
 
               {/* Upload / Camera Buttons */}
@@ -870,37 +935,47 @@ export const ImportReferenceModal: React.FC<ImportReferenceModalProps> = ({
                 </div>
               )}
 
-              {/* Offline Transparent Banner */}
+              {/* Offline / Fallback Transparent Banner */}
               {engineMode === 'offline_loupe' && (
                 <div className="missing-key-banner">
-                  <span>
-                    <strong>Modo Local Offline (Lupa UV 4×).</strong> Para ativar a reconstrução
-                    IA 3D com acessórios 3D reais e ~95–99% de fidelidade (100% gratuito no Free
-                    Tier do Google AI Studio), configure sua chave gratuita em 30s.
-                  </span>
-                  <div className="missing-key-actions">
-                    {onOpenSettings && (
-                      <button
-                        type="button"
-                        className="missing-key-link"
-                        onClick={() => {
-                          onClose();
-                          onOpenSettings();
-                        }}
-                      >
-                        Configurar Chave Gratuita (30s)
-                      </button>
-                    )}
-                    <a
-                      href="https://aistudio.google.com/apikey"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="missing-key-link"
-                    >
-                      <span>Gerar chave grátis</span>
-                      <ExternalLink size={11} />
-                    </a>
-                  </div>
+                  {fallbackReason && !isMissingApiKey ? (
+                    <span>
+                      <strong>Modo Local Offline (Lupa UV 4×).</strong> {fallbackReason} Você pode
+                      ajustar a textura pela Lupa UV 4× agora ou tentar novamente em instantes.
+                    </span>
+                  ) : (
+                    <>
+                      <span>
+                        <strong>Modo Local Offline (Lupa UV 4×).</strong> Para ativar a
+                        reconstrução IA 3D com acessórios 3D reais e ~95–99% de fidelidade (100%
+                        gratuito no Free Tier do Google AI Studio), configure sua chave gratuita em
+                        30s.
+                      </span>
+                      <div className="missing-key-actions">
+                        {onOpenSettings && (
+                          <button
+                            type="button"
+                            className="missing-key-link"
+                            onClick={() => {
+                              onClose();
+                              onOpenSettings();
+                            }}
+                          >
+                            Configurar Chave Gratuita (30s)
+                          </button>
+                        )}
+                        <a
+                          href="https://aistudio.google.com/apikey"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="missing-key-link"
+                        >
+                          <span>Gerar chave grátis</span>
+                          <ExternalLink size={11} />
+                        </a>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
